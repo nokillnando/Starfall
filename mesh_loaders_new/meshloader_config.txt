@@ -7,6 +7,10 @@ require("sfex_meshloader_core.txt")
 --[[
 
     Changelog:
+V2.05
+    Proper http request limit for vtf textures, makes it sure to load after it downloads  them
+    Make sure your client http max request is high for faster loading (default 3)
+    sf_http_requests_max_cl 
     
 V2.00
     HOLY MOTHER OF CHANGES, this thing is now core / config based, easier to maintain and update
@@ -15,6 +19,7 @@ V2.00
     Still on beta, so beware
     Removed Mirrors, I dont think anyone really used these, if you did
     contact me, ill try to re-implement it
+    Online Version checker(so you guys can keep it updated)
     
 V1.98
     Fixed Flags, finally, never noticied it not actually working as intended
@@ -175,7 +180,8 @@ local AllowCheckVersion = true  -- Set to false to disable online version checki
 
 -- scale parameters can be added optionally for individual meshes, can leave them out if they aren't used
 local meshes = {
-      {
+                 
+        {
             mdl = "url here",
             texture = "url here",
             BumpMapLink = "url here",
@@ -189,6 +195,7 @@ local meshes = {
             Flags = {2048},   --be careful of the flags, the order matters as well as the type     
         
         },
+ 
 
   
 }
@@ -307,11 +314,14 @@ if CLIENT then
             meshes = meshes,
             downloadStatus = downloadStatus,
             progressData = progressData,
+            purgeOwnerTempFiles = _G.PurgeMeshLoaderTempFiles,
             W = W, R = R, G = G
         })
     else
         print("Error: MeshLoaderCore not loaded. Make sure sfex_meshloader_core.txt is included.")
     end
+    
+    
 
     -- Network handlers for mesh sharing between clients
     net.receive("sendMeshToClient", function()
@@ -338,7 +348,7 @@ if CLIENT then
             end
         end)
     end)
-    
+
 else -- SERVER
     local clientMeshes = {}
 
@@ -366,7 +376,7 @@ else -- SERVER
         end
     end)
 
-    wire.adjustPorts({
+--[[    wire.adjustPorts({
         Base = "entity",
     })
 
@@ -378,6 +388,7 @@ else -- SERVER
         net.writeEntity(base)
         net.send(ply)
     end)
+    ]]--
 
 end
 
@@ -386,3 +397,5 @@ hook.add("removed", "stopStreams", function()
         net.cancelStream()
     end
 end)
+
+

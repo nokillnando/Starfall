@@ -2,7 +2,7 @@
 --@author Original by Cheezus Mod by [C17] Red Fox
 --@shared
 
-local Version = "2.00"
+local Version = "2.05"
 
 if CLIENT then
 
@@ -13,38 +13,51 @@ if CLIENT then
         return "../data/sf_filedatatemp/" .. owner():getSteamID64(false) .. "/" .. name
     end
 
-    local function asyncDownloadVtf(url, callback)
-        if not url:lower():find("%.vtf") then
-            callback(nil)
-            return
-        end
+local function asyncDownloadVtf(url, callback)
+    if not url:lower():find("%.vtf") then
+        callback(nil)
+        return
+    end
 
-        local fileName = url:match("([^/]+%.vtf)") or "unnamed.vtf"
-        local tempPath = vtfTempPath(url)
+    local fileName = url:match("([^/]+%.vtf)") or "unnamed.vtf"
+    local tempPath = vtfTempPath(url)
 
-        if file.existsTemp(fileName) then
-            callback(tempPath)
-            return
-        end
+    if file.existsTemp(fileName) then
+        callback(tempPath)
+        return
+    end
 
-        if vtfDownloads[url] then
-            local tries = 0
-            local poll
-            poll = function()
-                tries = tries + 1
-                if file.existsTemp(fileName) then
-                    callback(tempPath)
-                elseif tries < 30 then
-                    timer.simple(0.25, poll)
-                else
-                    callback(nil)
-                end
+    if vtfDownloads[url] then
+        local tries = 0
+        local poll
+        poll = function()
+            tries = tries + 1
+            if file.existsTemp(fileName) then
+                callback(tempPath)
+            elseif tries < 30 then
+                timer.simple(0.25, poll)
+            else
+                callback(nil)
             end
-            timer.simple(0.1, poll)
+        end
+        timer.simple(0.1, poll)
+        return
+    end
+
+    vtfDownloads[url] = true
+
+    local retriesLeft = 10
+    local function attemptDownload()
+        if not http.canRequest() then
+            retriesLeft = retriesLeft - 1
+            if retriesLeft <= 0 then
+                vtfDownloads[url] = nil
+                callback(nil)
+                return
+            end
+            timer.simple(0.5, attemptDownload)
             return
         end
-
-        vtfDownloads[url] = true
 
         file.deleteTemp(fileName)
         http.get(url,
@@ -62,6 +75,35 @@ if CLIENT then
                 callback(nil)
             end)
     end
+
+    attemptDownload()
+end
+
+local downloadQueue = {}
+
+local function processDownloadQueue()
+    while http.canRequest() and #downloadQueue > 0 do
+        local job = table.remove(downloadQueue, 1)
+        asyncDownloadVtf(job.url, job.callback)
+    end
+
+    -- Keep polling until queue is empty
+    if #downloadQueue > 0 then
+        timer.simple(0.1, processDownloadQueue)
+    end
+end
+
+local function queueVtfDownload(url, callback)
+    table.insert(downloadQueue, {
+        url = url,
+        callback = callback
+    })
+
+    processDownloadQueue()
+end
+
+
+
 
     local base = chip()
 
@@ -262,9 +304,10 @@ if CLIENT then
                         timer.simple(cubemapUpdateInterval, updateCubemap)
                     end
 
+                                        -- ENV MAP MASK
                     if v.EnvMapLink:lower():find("%.vtf") then
                         mat:setUndefined("$envmapmask")
-                        asyncDownloadVtf(v.EnvMapLink, function(path)
+                        queueVtfDownload(v.EnvMapLink, function(path)
                             if path then
                                 mat:setTexture("$envmapmask", path)
                             else
@@ -273,14 +316,13 @@ if CLIENT then
                         end)
                     elseif v.EnvMapLink:sub(1, 4) == "http" then
                         if hasPermission("material.urlcreate", v.EnvMapLink) then
-                            mat:setTextureURL("$envmapmask", v.EnvMapLink, function(_, _, width, height, layout)
-                                if not width or not height then
+                            mat:setTextureURL("$envmapmask", v.EnvMapLink, function(_, _, w, h, layout)
+                                if not (w and h) then
                                     mat:setUndefined("$envmapmask")
                                     return
                                 end
-                                local xScale = 1024 / width
-                                local yScale = 1024 / height
-                                layout(0, 0, width * xScale, height * yScale)
+                                local sx, sy = 1024 / w, 1024 / h
+                                layout(0, 0, w * sx, h * sy)
                             end)
                         else
                             mat:setUndefined("$envmapmask")
@@ -288,10 +330,11 @@ if CLIENT then
                     else
                         mat:setUndefined("$envmapmask")
                     end
-
+                    
+                    -- PHONG EXPONENT TEXTURE
                     if v.PhongExponentTexture:lower():find("%.vtf") then
                         mat:setUndefined("$phongexponenttexture")
-                        asyncDownloadVtf(v.PhongExponentTexture, function(path)
+                        queueVtfDownload(v.PhongExponentTexture, function(path)
                             if path then
                                 mat:setTexture("$phongexponenttexture", path)
                             else
@@ -300,14 +343,13 @@ if CLIENT then
                         end)
                     elseif v.PhongExponentTexture:sub(1, 4) == "http" then
                         if hasPermission("material.urlcreate", v.PhongExponentTexture) then
-                            mat:setTextureURL("$phongexponenttexture", v.PhongExponentTexture, function(_, _, width, height, layout)
-                                if not width or not height then
+                            mat:setTextureURL("$phongexponenttexture", v.PhongExponentTexture, function(_, _, w, h, layout)
+                                if not (w and h) then
                                     mat:setUndefined("$phongexponenttexture")
                                     return
                                 end
-                                local xScale = 1024 / width
-                                local yScale = 1024 / height
-                                layout(0, 0, width * xScale, height * yScale)
+                                local sx, sy = 1024 / w, 1024 / h
+                                layout(0, 0, w * sx, h * sy)
                             end)
                         else
                             mat:setUndefined("$phongexponenttexture")
@@ -315,10 +357,11 @@ if CLIENT then
                     else
                         mat:setUndefined("$phongexponenttexture")
                     end
-
+                    
+                    -- BUMPMAP
                     if v.BumpMapLink:lower():find("%.vtf") then
                         mat:setUndefined("$bumpmap")
-                        asyncDownloadVtf(v.BumpMapLink, function(path)
+                        queueVtfDownload(v.BumpMapLink, function(path)
                             if path then
                                 mat:setTexture("$bumpmap", path)
                             else
@@ -327,60 +370,45 @@ if CLIENT then
                         end)
                     elseif v.BumpMapLink:sub(1, 4) == "http" then
                         if hasPermission("material.urlcreate", v.BumpMapLink) then
-                            mat:setTextureURL("$bumpmap", v.BumpMapLink, function(_, _, width, height, layout)
-                                if not width or not height then
+                            mat:setTextureURL("$bumpmap", v.BumpMapLink, function(_, _, w, h, layout)
+                                if not (w and h) then
                                     mat:setUndefined("$bumpmap")
                                     return
                                 end
-                                local xScale = 1024 / width
-                                local yScale = 1024 / height
-                                layout(0, 0, width * xScale, height * yScale)
+                                local sx, sy = 1024 / w, 1024 / h
+                                layout(0, 0, w * sx, h * sy)
                             end)
                         else
                             mat:setUndefined("$bumpmap")
                         end
                     elseif v.UseIngameBumpMapp then
-                        local Bump = material.load(v.BumpMapTexture)
-                        mat:setTexture("$bumpmap", Bump:getTexture("$bumpmap"))
+                        local bump = material.load(v.BumpMapTexture)
+                        mat:setTexture("$bumpmap", bump:getTexture("$bumpmap"))
                     else
                         mat:setUndefined("$bumpmap")
                     end
-
+                    
+                    -- BASE TEXTURE
                     local vtfUrl = v.texture
                     if vtfUrl:lower():find("%.vtf") then
-                        local triesLeft = 5
-                        local function trySetVtf()
-                            local expected = vtfTempPath(vtfUrl)
-                            if file.existsTemp(vtfUrl:match("([^/]+%.vtf)")) then
-                                mat:setTexture("$basetexture", expected)
-                                return
-                            end
-                            triesLeft = triesLeft - 1
-                            if triesLeft <= 0 then
-                                mat:setTexture("$basetexture", "hunter/myplastic")
-                                return
-                            end
-                            timer.simple(0.25, trySetVtf)
-                        end
                         mat:setTexture("$basetexture", "hunter/myplastic")
-                        asyncDownloadVtf(vtfUrl, function(path)
+                        queueVtfDownload(vtfUrl, function(path)
                             if path then
-                                trySetVtf()
+                                mat:setTexture("$basetexture", path)
                             else
                                 mat:setTexture("$basetexture", "hunter/myplastic")
                             end
                         end)
                     elseif v.texture:sub(1, 4) == "http" then
                         if hasPermission("material.urlcreate", v.texture) then
-                            mat:setTextureURL("$basetexture", v.texture,
-                                function(_, _, w, h, layout)
-                                    if not (w and h) then
-                                        mat:setTexture("$basetexture", "hunter/myplastic")
-                                        return
-                                    end
-                                    local sx, sy = 1024 / w, 1024 / h
-                                    layout(0, 0, w * sx, h * sy)
-                                end)
+                            mat:setTextureURL("$basetexture", v.texture, function(_, _, w, h, layout)
+                                if not (w and h) then
+                                    mat:setTexture("$basetexture", "hunter/myplastic")
+                                    return
+                                end
+                                local sx, sy = 1024 / w, 1024 / h
+                                layout(0, 0, w * sx, h * sy)
+                            end)
                         else
                             mat:setTexture("$basetexture", "hunter/myplastic")
                         end
@@ -388,6 +416,7 @@ if CLIENT then
                         local m = material.load(v.texture)
                         mat:setTexture("$basetexture", m:getTexture("$basetexture"))
                     end
+
 
                     local textureMatrix = Matrix()
                     textureMatrix:setScale(Vector(v.TextureScale, v.TextureScale, 1))
@@ -518,72 +547,80 @@ if CLIENT then
         end)
     end
 
-    local function checkVersionOnSpawn(config)
-        if config.AllowCheckVersion then
-            local githubURL = "https://raw.github.com/nokillnando/Starfall/main/mesh_loaders_new/sfex_meshloader_core.txt"
-            local spawnTime = timer.curtime()
-            local requestSent = false
-            local versionChecked = false
-            
-            timer.simple(1, function()
-                if not requestSent and not versionChecked then
-                    http.get(githubURL, function(data)
-                        if data and data ~= "" then
-                            local versionStart = data:find('Version = "') 
-                            if versionStart then
-                                versionStart = versionStart + 11
-                                local versionEnd = data:find('"', versionStart)
-                                
-                                if versionEnd and versionEnd > versionStart then
-                                    local remoteVersion = data:sub(versionStart, versionEnd - 1)
-                                    local localVersion = Version
-                                    
-                                    local remoteParts = string.explode(".", remoteVersion)
-                                    local localParts = string.explode(".", localVersion)
-                                    
-                                    local remoteMajor = tonumber(remoteParts[1]) or 0
-                                    local remoteMinor = tonumber(remoteParts[2]) or 0
-                                    local localMajor = tonumber(localParts[1]) or 0
-                                    local localMinor = tonumber(localParts[2]) or 0
-                                    
-                                    if remoteMajor > localMajor or (remoteMajor == localMajor and remoteMinor > localMinor) then
-                                        if config.AllowCheckVersion then
-                                            print(config.W, "Check config file for updated default variables")
-                                            print(config.W, "Core MeshLoader Update available! Local: ", config.G, localVersion, config.W, " | Remote: ", config.G, remoteVersion)
-                                            print(config.W, "Check config file for URL")
-                                        end
-                                    else
-                                        if config.AllowCheckVersion then
-                                            print(config.W, "Local Core MeshLoader is up to date or higher than online! Version: ", config.G, localVersion)
-                                        end
-                                    end
-                                else
-                                    if config.AllowCheckVersion then
-                                        print(config.W, "Core MeshLoader version check failed - could not parse remote version")
-                                    end
-                                end
-                            else
-                                if config.AllowCheckVersion then
-                                    print(config.W, "Core MeshLoader version check failed - version string not found")
-                                end
-                            end
-                        else
-                            if config.AllowCheckVersion then
-                                print(config.W, "Core MeshLoader version check failed - no data received")
-                            end
-                        end
-                        versionChecked = true
-                    end, function(err)
-                        if config.AllowCheckVersion then
-                            print(config.W, "Core MeshLoader version check failed - could not connect to remote: ", config.R, err)
-                        end
-                        versionChecked = true
-                    end)
-                    requestSent = true
+local function checkVersionOnSpawn(config)
+    if not config.AllowCheckVersion then return end
+
+    local githubURL = "https://raw.github.com/nokillnando/Starfall/main/mesh_loaders_new/sfex_meshloader_core.txt"
+    local localVersion = Version
+    local maxRetries = 10
+
+    local function doVersionCheck()
+        if not http.canRequest() then
+            maxRetries = maxRetries - 1
+            if maxRetries <= 0 then
+                if config.AllowCheckVersion then
+                    print(config.W, "Version check failed - HTTP requests unavailable after multiple attempts")
                 end
-            end)
+                return
+            end
+            timer.simple(0.5, doVersionCheck)
+            return
         end
+
+        http.get(githubURL,
+            function(data)
+                if not (data and data ~= "") then
+                    if config.AllowCheckVersion then
+                        print(config.W, "Core MeshLoader version check failed - no data received")
+                    end
+                    return
+                end
+
+                local versionStart = data:find('Version = "')
+                if not versionStart then
+                    if config.AllowCheckVersion then
+                        print(config.W, "Core MeshLoader version check failed - version string not found")
+                    end
+                    return
+                end
+
+                versionStart = versionStart + 11
+                local versionEnd = data:find('"', versionStart)
+                if not versionEnd or versionEnd <= versionStart then
+                    if config.AllowCheckVersion then
+                        print(config.W, "Core MeshLoader version check failed - could not parse remote version")
+                    end
+                    return
+                end
+
+                local remoteVersion = data:sub(versionStart, versionEnd - 1)
+                local remoteParts = string.explode(".", remoteVersion)
+                local localParts = string.explode(".", localVersion)
+
+                local remoteMajor = tonumber(remoteParts[1]) or 0
+                local remoteMinor = tonumber(remoteParts[2]) or 0
+                local localMajor = tonumber(localParts[1]) or 0
+                local localMinor = tonumber(localParts[2]) or 0
+
+                if remoteMajor > localMajor or (remoteMajor == localMajor and remoteMinor > localMinor) then
+                    print(config.W, "Check config file for updated default variables")
+                    print(config.W, "Core MeshLoader Update available! Local: ", config.G, localVersion, config.W, " | Remote: ", config.G, remoteVersion)
+                    print(config.W, "Check config file for URL")
+                else
+                    print(config.W, "Local Core MeshLoader is up to date or higher than online! Version: ", config.G, localVersion)
+                end
+            end,
+            function(err)
+                if config.AllowCheckVersion then
+                    print(config.W, "Core MeshLoader version check failed - could not connect to remote: ", config.R, err)
+                end
+            end
+        )
     end
+
+    -- Delay start by 1s just like before
+    timer.simple(1, doVersionCheck)
+end
 
     local function initClient(config)
         checkVersionOnSpawn(config)
