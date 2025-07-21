@@ -5,60 +5,6 @@
 local Version = "2.00"
 
 if CLIENT then
-    local function mirror(netRequestName,netReceiveName,RTName,FPS,X,Y,W,H,FoV)
-        setupPermissionRequest({ "render.renderscene", "render.renderView" }, "See an example of render.renderView.", true)
-        local permissionSatisfied = hasPermission("render.renderView")
-        local Entity = chip()
-        net.start(netRequestName)
-        net.send()
-
-        net.receive(netReceiveName, function()
-            local ent = net.readEntity()
-            Entity = isValid(ent) and ent or chip()
-        end)
-
-        local rtName = RTName
-        render.createRenderTarget(rtName)
-
-        local mat = material.create("VertexLitGeneric")
-
-        local texture_matrix = mat:getMatrix("$basetexturetransform")
-        texture_matrix:setAngles(Angle(0, 0, 0))
-        texture_matrix:setScale(Vector(-1, 1, 1))
-
-        mat:setTextureRenderTarget("$basetexture", rtName)
-        mat:setMatrix("$basetexturetransform", texture_matrix)
-
-        local materialName = mat:getName()
-
-        local lastUpdateTime = 0
-        local updateInterval = 1/FPS
-
-        hook.add("renderscene", "render_view"..rtName, function()
-            if not permissionSatisfied then return end
-
-            local currentTime = timer.curtime()
-            if not render.isInRenderView() and (currentTime - lastUpdateTime) >= updateInterval then
-                local scrW, scrH = render.getGameResolution()
-                lastUpdateTime = currentTime
-                render.selectRenderTarget(rtName)
-
-                render.renderView({
-                    origin = Entity:getPos(),
-                    angles = Entity:getAngles() + Angle(0,0,0),
-                    aspectratio = scrH / scrW,
-                    x = X,
-                    y = Y,
-                    w = W,
-                    h = H,
-                    fov = FoV,
-                    drawviewmodel = false,
-                    drawviewer = true,
-                })
-            end
-        end)
-        return materialName
-    end
 
     local vtfDownloads = vtfDownloads or {}
 
@@ -574,7 +520,7 @@ if CLIENT then
 
     local function checkVersionOnSpawn(config)
         if config.AllowCheckVersion then
-            local githubURL = "https://raw.githubusercontent.com/nokillnando/main/mesh_loaders_new/meshloader_core.txt"
+            local githubURL = "https://raw.github.com/nokillnando/Starfall/main/mesh_loaders_new/sfex_meshloader_core.txt"
             local spawnTime = timer.curtime()
             local requestSent = false
             local versionChecked = false
@@ -756,13 +702,10 @@ else -- SERVER
 
     wire.adjustPorts({
         Base = "entity",
-        MirrorL = "entity",
-        MirrorR = "entity",
     })
 
     local base = wire.ports.Base
-    local mirrorl = wire.ports.MirrorL
-    local mirrorr = wire.ports.MirrorR
+
 
     net.receive("requestBase", function(_, ply)
         if not isValid(base) then return end
@@ -771,19 +714,6 @@ else -- SERVER
         net.send(ply)
     end)
 
-    net.receive("requestmirrorL", function(_, ply)
-        if not isValid(mirrorl) then return end
-        net.start("sendMirrorL")
-        net.writeEntity(mirrorl)
-        net.send(ply)
-    end)
-
-    net.receive("requestmirrorR", function(_, ply)
-        if not isValid(mirrorr) then return end
-        net.start("sendMirrorR")
-        net.writeEntity(mirrorr)
-        net.send(ply)
-    end)
 end
 hook.add("removed", "stopStreams", function()
     if net.isStreaming() then
