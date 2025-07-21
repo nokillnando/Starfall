@@ -1,0 +1,247 @@
+--@name MeshLoader Config
+--@author Original by Cheezus Mod by [C17] Red Fox
+--@shared
+--@include sfex_meshloader_core.txt
+require("sfex_meshloader_core.txt")
+
+--############################################################################################################################################
+--Actual things to change
+local meshName = "Body - Main" --Just the chip name when finished
+local globalScale = Vector(1) -- Scale all meshes added by this amount, or add a scale vector to individual meshes
+local offsetPos = Vector(0, 0, 0) -- Offsets are relative to chip/base
+local offsetAngle = Angle(0, 0, 0)
+local meshSpawnDelay = 0.1 -- Delay in seconds between spawning each mesh, adjust as needed to avoid lag
+local showMeshSpawnProgress = false -- Set to true to show progress in console
+
+local debugPrints = false  -- Set to false to disable most console messages
+local showProgressDisplay = true  -- Set to true to show 3D2D progress display, only useful for the owner, as other players cant see it
+local progressDisplayType = "bar"  -- "bar" or "text" for the display style
+local progressDisplayHeight = 35  -- Height above the chip
+local AllowCheckVersion = true  -- Set to false to disable online version checking
+
+-- scale parameters can be added optionally for individual meshes, can leave them out if they aren't used
+local meshes = {
+    {
+        mdl = "url here",
+        texture = "url here",
+        BumpMapLink = "url here",
+        ColorAndAlpha = Color(255, 255, 255, 255),
+        EnvMapShinyness = Vector(0.015, 0.015, 0.015), --envmaptint
+        PhongTint = Vector(0.5, 0.5, 0.5),
+        PhongBoost = 1.5, --only works with normalmap - Spec Boost
+        PhongExp = 64, --Spec Glossiness 
+        RimLightBoost = 1.25,
+        RimLightExp = 18,   
+        Flags = {2048},   --be careful of the flags, the order matters as well as the type     
+    },
+}
+
+--Default config values
+local function getDefaultConfig()
+    return {
+        texture = "models/debug/debugwhite",
+        Material = "",
+        UseModTexture = true,
+        CubeMapTexture = "models/shiny",
+        ColorAndAlpha = Color(255, 255, 255, 255),
+        UseEnvMapSpecularReflections = true,
+        EnvMapShinyness = Vector(0.2, 0.2, 0.2),
+        EnvMapFresnel = 1,
+        EnvMapLink = "",
+        BumpMapLink = "",
+        UseIngameBumpMapp = false,
+        BumpMapTexture = "phoenix_storms/mat/mat_phx_metallic",
+        TextureScale = 1,
+        BaseMapAlphaPhongMask = false,
+        EnableBaseMapAlphaEnvMask = false,
+        EnableNormalmapAlphaEnvMapMask = false,
+        UsePhong = 1,
+        InvertPhongMask = 0,
+        PhongTint = Vector(1, 1, 1),
+        PhongAlbedoTint = 1,
+        PhongBoost = 1,
+        PhongExp = 128,
+        PhongExponentTexture = "",
+        PhongAlbedoBoost = 512,
+        UseRimLight = 1,
+        RimLightBoost = 0.25,
+        RimLightExp = 18,
+        EnvMapContrast = 1,
+        EnvMapSaturation = 1,
+        PhongFresnelRange = Vector(0.25, 0.50, 1),
+        EnableHalfLambert = false,
+        Flags = {},
+        LowPolyTexture = 0,
+        Color2 = Vector(1, 1, 1),
+        SuppressEngineLighting = false,
+        scale = Vector(1,1,1)
+    }
+end
+
+local function mergeConfig(userConfig)
+    if not userConfig.mdl then
+        error("MDL parameter is required")
+    end
+    
+    local defaultConfig = getDefaultConfig()
+    local finalConfig = table.copy(defaultConfig)
+    
+    -- Merge user config with defaults
+    for k, v in pairs(userConfig) do
+        finalConfig[k] = v
+    end
+    
+    return finalConfig
+end
+
+-- Add mesh download status tracking
+local downloadStatus = {
+    total = #meshes,
+    completed = 0,
+    failed = {}
+}
+
+-- Progress tracking for UI display
+local progressData = {
+    downloading = false,
+    building = false,
+    spawning = false,
+    downloadProgress = 0,
+    buildProgress = 0,
+    spawnProgress = 0,
+    totalMeshes = #meshes,
+    downloadedMeshes = 0,
+    builtMeshes = 0,
+    spawnedMeshes = 0,
+    totalSpawnItems = 0,
+    currentStage = "Idle"
+}
+
+-- Process the meshes table to add defaults
+local function processMeshesTable(meshesTable)
+    local processedMeshes = {}
+    for i, meshConfig in ipairs(meshesTable) do
+        processedMeshes[i] = mergeConfig(meshConfig)
+    end
+    return processedMeshes
+end
+
+meshes = processMeshesTable(meshes)
+
+-- For colorful printing
+local W, R, G = Color(255, 255, 255), Color(255, 0, 0), Color(0, 255, 0)
+
+--############################################################################################################################################
+-- Initialize the mesh loader
+if CLIENT then
+    if _G.MeshLoaderCore then
+        _G.MeshLoaderCore.initClient({
+            meshName = meshName,
+            globalScale = globalScale,
+            offsetPos = offsetPos,
+            offsetAngle = offsetAngle,
+            meshSpawnDelay = meshSpawnDelay,
+            showMeshSpawnProgress = showMeshSpawnProgress,
+            debugPrints = debugPrints,
+            showProgressDisplay = showProgressDisplay,
+            progressDisplayType = progressDisplayType,
+            progressDisplayHeight = progressDisplayHeight,
+            meshes = meshes,
+            downloadStatus = downloadStatus,
+            progressData = progressData,
+            W = W, R = R, G = G
+        })
+    else
+        print("Error: MeshLoaderCore not loaded. Make sure sfex_meshloader_core.txt is included.")
+    end
+
+    -- Network handlers for mesh sharing between clients
+    net.receive("sendMeshToClient", function()
+        local recipient = net.readEntity()
+        local meshIndex = net.readInt(16)
+        
+        if meshes[meshIndex] and meshes[meshIndex].meshData then
+            net.start("sendMeshData")
+            net.writeInt(meshIndex, 16)
+            net.writeStream(meshes[meshIndex].meshData)
+            net.send(recipient)
+            
+            if debugPrints then print("Sending mesh ", meshIndex, " to ", recipient:getName()) end
+        end
+    end)
+
+    net.receive("sendMeshData", function()
+        local meshIndex = net.readInt(16)
+        net.readStream(function(data)
+            if meshes[meshIndex] and not meshes[meshIndex].meshData then
+                meshes[meshIndex].meshData = data
+                
+                if debugPrints then print("Received mesh ", meshIndex, " from another client, size: ", math.round(#data / 1048576, 3) .. "mb") end
+            end
+        end)
+    end)
+    
+else -- SERVER
+    local clientMeshes = {}
+
+    net.receive("reportMeshStatus", function(_, ply)
+        local status = net.readTable()
+        clientMeshes[ply] = status
+    end)
+
+    net.receive("requestMissingMeshes", function(_, ply)
+        local missingIndices = net.readTable()
+        for possibleSender, status in pairs(clientMeshes) do
+            if possibleSender ~= ply and isValid(possibleSender) then
+                for _, index in ipairs(missingIndices) do
+                    if status.completed[index] then
+                        net.start("sendMeshToClient")
+                        net.writeEntity(ply)
+                        net.writeInt(index, 16)
+                        net.send(possibleSender)
+                        
+                        if debugPrints then print("Requested client ", possibleSender:getName(), " to send mesh ", index, " to ", ply:getName()) end
+                        break
+                    end
+                end
+            end
+        end
+    end)
+
+    wire.adjustPorts({
+        Base = "entity",
+        MirrorL = "entity",
+        MirrorR = "entity",
+    })
+
+    local base = wire.ports.Base
+    local mirrorl = wire.ports.MirrorL
+    local mirrorr = wire.ports.MirrorR
+
+    net.receive("requestBase", function(_, ply)
+        if not isValid(base) then return end
+        net.start("sendBase")
+        net.writeEntity(base)
+        net.send(ply)
+    end)
+
+    net.receive("requestmirrorL", function(_, ply)
+        if not isValid(mirrorl) then return end
+        net.start("sendMirrorL")
+        net.writeEntity(mirrorl)
+        net.send(ply)
+    end)
+
+    net.receive("requestmirrorR", function(_, ply)
+        if not isValid(mirrorr) then return end
+        net.start("sendMirrorR")
+        net.writeEntity(mirrorr)
+        net.send(ply)
+    end)
+end
+
+hook.add("removed", "stopStreams", function()
+    if net.isStreaming() then
+        net.cancelStream()
+    end
+end)
