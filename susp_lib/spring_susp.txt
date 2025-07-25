@@ -44,7 +44,7 @@ local base = wire.ports.Base
 
 if #wheels == 0 or not isValid(base) then return end
     
-local Spring = require("lib/spring.txt")
+local Spring = require("susp_lib/spring_lib.txt")
 
 for i, wheel in ipairs(wheels) do
     if i < 3 then
