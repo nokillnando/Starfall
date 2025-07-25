@@ -20,7 +20,7 @@ local function frontCustomDamping(dispRate) -- Displacement rate is in m/s
 end
 --]]
 
-local rearOffset = Vector(0, 0, 100) -- 100 units above the wheel (as an example)
+local rearOffset = Vector(0, 0, 0) -- 100 units above the wheel (as an example)
 local rearConstant = 10000
 local rearDamping = 1000
 local rearMaxDamping = 10000
