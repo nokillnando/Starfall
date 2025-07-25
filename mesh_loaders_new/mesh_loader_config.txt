@@ -1,16 +1,19 @@
 --@name MeshLoader Config
 --@author [C17] Red Fox
 --@shared
---@include sfex_meshloader_core.txt
-require("sfex_meshloader_core.txt")
+--@include mesh_loaders_new/mesh_loader_core.txt
+dofile("mesh_loaders_new/mesh_loader_core.txt")
 
 --[[
 
     Changelog:
+    
+V2.06
+    What the fuck starfall, fixed some wierd behaviour..
+
 V2.05
     Proper http request limit for vtf textures, makes it sure to load after it downloads  them
     Make sure your client http max request is high for faster loading (default 3)
-    sf_http_requests_max_cl 
     
 V2.00
     HOLY MOTHER OF CHANGES, this thing is now core / config based, easier to maintain and update
@@ -181,6 +184,7 @@ local AllowCheckVersion = true  -- Set to false to disable online version checki
 -- scale parameters can be added optionally for individual meshes, can leave them out if they aren't used
 local meshes = {
                  
+      
         {
             mdl = "url here",
             texture = "url here",
@@ -195,7 +199,7 @@ local meshes = {
             Flags = {2048},   --be careful of the flags, the order matters as well as the type     
         
         },
- 
+
 
   
 }
