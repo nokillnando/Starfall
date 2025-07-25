@@ -1,8 +1,8 @@
---@name MeshLoader Core
---@author Original by Cheezus Mod by [C17] Red Fox
+--@name Mesh Loader Core
+--@author [C17] Red Fox
 --@shared
 
-local Version = "2.05"
+local Version = "2.06"
 
 if CLIENT then
 
@@ -22,11 +22,13 @@ local function asyncDownloadVtf(url, callback)
     local fileName = url:match("([^/]+%.vtf)") or "unnamed.vtf"
     local tempPath = vtfTempPath(url)
 
+    -- already on disk?
     if file.existsTemp(fileName) then
         callback(tempPath)
         return
     end
 
+    -- somebody else already downloading it?
     if vtfDownloads[url] then
         local tries = 0
         local poll
@@ -46,20 +48,21 @@ local function asyncDownloadVtf(url, callback)
 
     vtfDownloads[url] = true
 
-    local retriesLeft = 10
-    local function attemptDownload()
-        if not http.canRequest() then
-            retriesLeft = retriesLeft - 1
-            if retriesLeft <= 0 then
-                vtfDownloads[url] = nil
-                callback(nil)
-                return
-            end
-            timer.simple(0.5, attemptDownload)
+    ------------------------------------------------------------------
+    -- NEW: never break the global limit
+    local function safeGet()
+        local active = http.getActiveRequests()
+        local max    = http.getMaximumRequests()
+
+        if active >= max then
+            -- still full  try again later
+            timer.simple(0.25, safeGet)
             return
         end
 
+        -- now we are guaranteed to have a free slot
         file.deleteTemp(fileName)
+
         http.get(url,
             function(data)
                 vtfDownloads[url] = nil
@@ -73,34 +76,53 @@ local function asyncDownloadVtf(url, callback)
             function()
                 vtfDownloads[url] = nil
                 callback(nil)
-            end)
+            end
+        )
     end
 
-    attemptDownload()
+    safeGet()
 end
+
 
 local downloadQueue = {}
 
 local function processDownloadQueue()
-    while http.canRequest() and #downloadQueue > 0 do
+    local activeRequests = http.getActiveRequests()
+    local maxRequests = http.getMaximumRequests()
+
+    while activeRequests < maxRequests and #downloadQueue > 0 do
         local job = table.remove(downloadQueue, 1)
         asyncDownloadVtf(job.url, job.callback)
+        activeRequests = activeRequests + 1
     end
 
-    -- Keep polling until queue is empty
     if #downloadQueue > 0 then
         timer.simple(0.1, processDownloadQueue)
     end
 end
 
-local function queueVtfDownload(url, callback)
-    table.insert(downloadQueue, {
-        url = url,
-        callback = callback
-    })
+local vtfQueue = {}
+local vtfRunning = 0
 
-    processDownloadQueue()
+local function pumpVtfQueue()
+    local max = http.getMaximumRequests()
+    while vtfRunning < max and #vtfQueue > 0 do
+        local job = table.remove(vtfQueue, 1)
+        vtfRunning = vtfRunning + 1
+        asyncDownloadVtf(job.url, function(path)
+            vtfRunning = vtfRunning - 1
+            if job.callback then job.callback(path) end
+            pumpVtfQueue()               -- may start next
+        end)
+    end
 end
+
+-- drop-in replacement for every place that used queueVtfDownload
+local function queueVtfDownload(url, callback)
+    table.insert(vtfQueue, { url = url, callback = callback })
+    pumpVtfQueue()
+end
+
 
 
 
@@ -557,12 +579,7 @@ local function checkVersionOnSpawn(config)
     local function doVersionCheck()
         if not http.canRequest() then
             maxRetries = maxRetries - 1
-            if maxRetries <= 0 then
-                if config.AllowCheckVersion then
-                    print(config.W, "Version check failed - HTTP requests unavailable after multiple attempts")
-                end
-                return
-            end
+        if maxRetries <= 0 then return end
             timer.simple(0.5, doVersionCheck)
             return
         end
