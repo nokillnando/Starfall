@@ -2,7 +2,7 @@
 --@author [C17] Red Fox
 --@shared
 
-local Version = "2.06"
+local Version = "2.07"
 
 if CLIENT then
 
@@ -485,7 +485,7 @@ end
         end)
 
         hook.add("think", "build", function()
-            while chip():getQuotaAverage() < chip():getQuotaMax() / 4 do
+            while chip():getQuotaAverage() < chip():getQuotaMax() / 8 do
                 if buildThread() then
                     doneBuilding(meshName, debugPrints, meshSpawnDelay, showMeshSpawnProgress, meshes, offsetPos, offsetAngle, globalScale, triangles, W, R, G, progressData)
                     hook.remove("think", "build")
@@ -572,7 +572,7 @@ end
 local function checkVersionOnSpawn(config)
     if not config.AllowCheckVersion then return end
 
-    local githubURL = "https://raw.github.com/nokillnando/Starfall/main/mesh_loaders_new/sfex_meshloader_core.txt"
+    local githubURL = "https://raw.github.com/nokillnando/Starfall/main/mesh_loaders_new/mesh_loader_core.txt"
     local localVersion = Version
     local maxRetries = 10
 
