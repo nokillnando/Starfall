@@ -7,6 +7,8 @@ dofile("mesh_loaders_new/mesh_loader_core.txt")
 --[[
 
     Changelog:
+V2.07
+    Minor Fix
     
 V2.06
     What the fuck starfall, fixed some wierd behaviour..
