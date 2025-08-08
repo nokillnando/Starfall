@@ -1,4 +1,4 @@
---@name aliexpress_hud_final_with_turbo
+--@name GT2 Hud
 --@author redfox (original), Manus (final, complete implementation)
 --@shared
 
@@ -24,7 +24,7 @@ if SERVER then
         }
     )
     
-    local engineMaxRpm = 9000
+    local engineMaxRpm = 7000
     local TurboPsiMax = 6
     
     local sendQueue = {}
@@ -69,7 +69,7 @@ if SERVER then
     timer.create("hud_processQueue", 0.1, 0, function()
         if #sendQueue > 0 then
             local ply = table.remove(sendQueue, 1)
-            if IsValid(ply) then
+            if isValid(ply) then
                 hud_sendInputs(ply)
             end
         end
