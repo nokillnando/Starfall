@@ -1,0 +1,141 @@
+--@name susp_lib/spring_lib (v2.2 - Smart Anti-Roll Bar)
+--@author Cheezus & Manus
+
+--[[
+    Version 2.2 Major Feature:
+    - Added a new `AntiRollBar` class to the library.
+    - The old method of using a simple spring created unwanted diagonal forces.
+    - The new AntiRollBar class calculates force based ONLY on the vertical (Z-axis)
+      difference between wheels and applies a pure up/down force. This correctly
+      simulates a real anti-roll bar without interfering with other suspension axes.
+]]
+
+local clamp, max = math.clamp, math.max
+local Spring = class("Spring")
+local AntiRollBar = class("AntiRollBar") -- New class for our smart anti-roll bar
+local springs = {}
+local antiRollBars = {} -- Separate table to manage them
+local springID = 0
+
+-- ... (The entire Spring class from v2.1 remains unchanged here) ...
+function Spring:initialize(e1, e2, lPos1, lPos2)
+    if not isValid(e1) or not isValid(e2) then error("Failed to create spring: one or both entities are not valid", 2) end
+    if e1 == e2 then error("Failed to create spring: cannot constrain an entity to itself", 2) end
+    self.e1, self.e2 = e1, e2
+    self.phys1, self.phys2 = e1:getPhysicsObject(), e2:getPhysicsObject()
+    self.lPos1, self.lPos2 = lPos1 or Vector(), lPos2 or Vector()
+    self.constant, self.preload, self.dampingBump, self.dampingRebound = 0, 0, 0, 0
+    self.restingLength = (e1:localToWorld(self.lPos1) - e2:localToWorld(self.lPos2)):getLength()
+    self.displacement, self.lastDisplacement = 0, 0
+    self.id = springID
+    springs[springID] = self
+    springID = springID + 1
+end
+function Spring:setConstant(const) self.constant = max(0, const) end
+function Spring:setPreload(force) self.preload = force end
+function Spring:setDamping(bump, rebound)
+    self.dampingBump = max(0, bump)
+    self.dampingRebound = max(0, rebound or bump)
+end
+function Spring:setRestingLength(len) self.restingLength = max(0, len) end
+function Spring:remove() springs[self.id] = nil end
+-- ... (End of unchanged Spring class) ...
+
+
+--- Create a new Anti-Roll Bar controller.
+-- @param e1 The first entity (wheel) to connect.
+-- @param e2 The second entity (wheel) to connect.
+function AntiRollBar:initialize(e1, e2)
+    if not isValid(e1) or not isValid(e2) then error("Failed to create anti-roll bar: one or both entities are not valid", 2) end
+    self.e1 = e1
+    self.e2 = e2
+    self.phys1 = e1:getPhysicsObject()
+    self.phys2 = e2:getPhysicsObject()
+    self.constant = 0
+    self.id = springID -- Can share the same ID pool
+    antiRollBars[springID] = self
+    springID = springID + 1
+end
+
+--- Set the anti-roll bar's stiffness constant.
+-- @param const The stiffness constant. Higher = less body roll.
+function AntiRollBar:setConstant(const)
+    self.constant = max(0, const)
+end
+
+function AntiRollBar:remove()
+    antiRollBars[self.id] = nil
+end
+
+
+-- Fixed applyForceOffset
+local ENTITY = getMethods("Entity")
+local const = (1 / 39.3701 ^ 2) * 360 / (2 * 3.1416)
+function ENTITY:applyForceOffsetFixed(force, pos)
+    self:applyForceCenter(force)
+    local off = pos - self:localToWorld(self:getMassCenter())
+    self:applyTorque(off:cross(force) * const)
+end
+
+local dt = game.getTickInterval()
+
+-- Main tick hook now manages both springs and anti-roll bars
+hook.add("tick", "SuspensionLibTick_v2.2", function()
+    -- Spring Logic (unchanged from v2.1)
+    local invDt = 1 / dt
+    if dt == 0 then invDt = 0 end
+    for _, spring in pairs(springs) do
+        if isValid(spring.phys1) and isValid(spring.phys2) then
+            local e1, e2 = spring.e1, spring.e2
+            if not e1:isFrozen() or not e2:isFrozen() then
+                local wPos1 = e1:localToWorld(spring.lPos1)
+                local wPos2 = e2:localToWorld(spring.lPos2)
+                local forceVector = wPos1 - wPos2
+                local currentLength = forceVector:getLength()
+                spring.displacement = currentLength - spring.restingLength
+                if currentLength > 0 and not (spring.stretchOnly and spring.displacement <= 0) then
+                    forceVector:normalize()
+                    local springForce = -spring.constant * spring.displacement
+                    local displacementRate = (spring.displacement - spring.lastDisplacement) * invDt
+                    spring.lastDisplacement = spring.displacement
+                    local dampingForceValue
+                    if displacementRate > 0 then dampingForceValue = -spring.dampingRebound * displacementRate
+                    else dampingForceValue = -spring.dampingBump * displacementRate end
+                    local totalForceValue = springForce + dampingForceValue + spring.preload
+                    local totalForceVector = forceVector * totalForceValue
+                    if not e1:isFrozen() then e1:applyForceOffsetFixed(totalForceVector, wPos1) end
+                    if not e2:isFrozen() then e2:applyForceOffsetFixed(-totalForceVector, wPos2) end
+                end
+            end
+        else spring:remove() end
+    end
+
+    -- New Anti-Roll Bar Logic
+    local WORLD_UP = Vector(0, 0, 1)
+    for _, arb in pairs(antiRollBars) do
+        if isValid(arb.phys1) and isValid(arb.phys2) then
+            local e1, e2 = arb.e1, arb.e2
+            if not e1:isFrozen() or not e2:isFrozen() then
+                local pos1 = e1:getPos()
+                local pos2 = e2:getPos()
+
+                -- Calculate vertical difference only
+                local verticalDifference = pos1.z - pos2.z
+
+                -- Calculate the corrective force
+                local forceMagnitude = verticalDifference * arb.constant
+
+                -- Apply a pure vertical force to each wheel
+                e1:applyForceOffsetFixed(WORLD_UP * -forceMagnitude, pos1)
+                e2:applyForceOffsetFixed(WORLD_UP * forceMagnitude, pos2)
+            end
+        else arb:remove() end
+    end
+end)
+
+
+-- Return both classes so the main script can use them
+return {
+    Spring = Spring,
+    AntiRollBar = AntiRollBar
+}

@@ -1,0 +1,82 @@
+--@name Sim Spring Suspension (v5 - Smart Anti-Roll)
+--@author Cheezus & Manus
+--@server
+--@include susp_lib/spring_libv2.txt
+
+--[[
+    Version 5.0 Update:
+    - Now uses the new `AntiRollBar` class from the library for physically
+      correct anti-roll behavior that doesn't apply unwanted diagonal forces.
+]]
+
+-- TUNING (Use the gentle values from before as a starting point)
+local frontConstant = 80
+local frontDampingBump = 35
+local frontDampingRebound = 25
+local frontPreload = -250
+
+local rearConstant = 80
+local rearDampingBump = 35
+local rearDampingRebound = 25
+local rearPreload = -250
+
+-- Anti-roll constants can now be much higher and more intuitive without breaking things.
+local frontAntiRollConstant = 0
+local rearAntiRollConstant = 0
+
+-- This is just to keep the config area clean
+local frontOffset = Vector(0, 0, 0)
+local rearOffset = Vector(0, 0, 0)
+
+-- ===========================================================================
+--                                SCRIPT LOGIC
+-- ===========================================================================
+wire.adjustPorts({ FrontWheels = "array", RearWheels = "array", Base = "entity" })
+local base = wire.ports.Base
+if not isValid(base) then return end
+
+-- The library now returns a table with both classes in it.
+local SuspensionLib = require("susp_lib/spring_libv2.txt")
+local Spring = SuspensionLib.Spring
+local AntiRollBar = SuspensionLib.AntiRollBar
+
+local function setupAxle(axleWheels, settings)
+    if not axleWheels or #axleWheels == 0 then return end
+
+    -- Create main suspension springs
+    for _, wheel in ipairs(axleWheels) do
+        if isValid(wheel) then
+            local springAttachPos = base:worldToLocal(wheel:getPos() + settings.offset)
+            local s = Spring:new(base, wheel, springAttachPos)
+            s:setConstant(settings.constant)
+            s:setPreload(settings.preload)
+            s:setDamping(settings.dampingBump, settings.dampingRebound)
+        end
+    end
+
+    -- Create the new, smart anti-roll bar
+    if settings.antiRollConstant > 0 and #axleWheels > 1 then
+        for i = 1, #axleWheels do
+            for j = i + 1, #axleWheels do
+                local wheel1, wheel2 = axleWheels[i], axleWheels[j]
+                if isValid(wheel1) and isValid(wheel2) then
+                    -- Use the new AntiRollBar class
+                    local arb = AntiRollBar:new(wheel1, wheel2)
+                    arb:setConstant(settings.antiRollConstant)
+                end
+            end
+        end
+    end
+end
+
+-- Setup the axles
+setupAxle(wire.ports.FrontWheels, {
+    offset = frontOffset, constant = frontConstant, preload = frontPreload,
+    dampingBump = frontDampingBump, dampingRebound = frontDampingRebound,
+    antiRollConstant = frontAntiRollConstant
+})
+setupAxle(wire.ports.RearWheels, {
+    offset = rearOffset, constant = rearConstant, preload = rearPreload,
+    dampingBump = rearDampingBump, dampingRebound = rearDampingRebound,
+    antiRollConstant = rearAntiRollConstant
+})
