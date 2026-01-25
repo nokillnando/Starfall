@@ -22,7 +22,8 @@ if SERVER then
     --## USER CONFIGURATION ## --
     -- Tweak these values to change how your car feels and handles.
     ---------------------------------------------------------------------------
-
+    --The Axis debug is down below on the visual debug line
+    
     -- CONFIG: Steering limits & behavior
     -- How far the wheels can turn, in degrees.
     -- Higher = sharper turns.
@@ -33,7 +34,7 @@ if SERVER then
     local SpeedEffect             = 950
     -- How quickly the car steers.
     -- Higher = more responsive/twitchy steering.
-    local SteeringSpeed           = 1.25
+    local SteeringSpeed           = 1.35
     -- Acts as a damper for the drift correction.
     -- Lower = the assist tries harder to straighten the car during a slide. Too low is undesired.
     -- Higher = weakens the correction, allowing for wider and more controlled drifts.
@@ -50,9 +51,9 @@ if SERVER then
 
     -- CONFIG: Slip vs Drift thresholds
     -- How much sideways speed is needed before the car is considered "slipping".
-    local SlipCorrectionThreshold = 1.5
+    local SlipCorrectionThreshold = 1
     -- How much sideways speed is needed before drift multipliers are activated.
-    local DriftThreshold          = 1.5
+    local DriftThreshold          = 2
 
     -- CONFIG: Force multipliers
     -- The raw strength of the counter-steer force when you slide.
@@ -68,7 +69,7 @@ if SERVER then
 
     -- CONFIG: Gyro effect scaling by speed
     -- The speed at which the gyro reaches its maximum strength.
-    local GyroSpeedThreshold      = 150
+    local GyroSpeedThreshold      = 100
     -- The gyro's strength at 0 speed.
     -- (0 = off at low speed).
     local GyroMinScale            = 0
@@ -82,7 +83,7 @@ if SERVER then
     -- Vector(-1,0,0) = Forward is the Negative X direction.
     -- Vector(0,1,0)  = Forward is the Positive Y direction.
     -- Vector(0,-1,0) = Forward is the Negative Y direction.
-    local ForwardAxisMultiplier = Vector(1,0,0) -- Default: Negative X-axis is forward
+    local ForwardAxisMultiplier = Vector(-1,0,0) -- Default: Negative X-axis is forward
 
     ---------------------------------------------------------------------------
     --## CORE LOGIC ## --
@@ -209,73 +210,80 @@ if SERVER then
 
 -- ### VISUAL DEBUG ###
 elseif player() == owner() then
-    local base
-    local fwdAxis -- This will hold the exact vector received from the server
-    
-    timer.create("requestBase", 0.5, 0, function()
-        net.start("requestBase")
-        net.send()
-    end)
+    -- ## VISUAL DEBUG CONFIG ##
+    -- Set this to true to see the lines, or false to hide them.
+    local Debug = false 
 
-    net.receive("sendBase", function()
-        base = net.readEntity()
-        fwdAxis = net.readVector() -- Only the forward axis is needed from server
-        timer.stop("requestBase")
-    end)
-
-    enableHud(owner(), true)
-
-    local font = render.createFont("Trebuchet24", 24, nil, false, nil, nil, true)
-
-    hook.add("drawHud", "hud", function()
-        if not base or not base:isValid() or not fwdAxis then return end
-
-        -- Calculate the other axes EXACTLY as the server does:
-        -- Right is (y, -x) of the forward axis
-        local rightAxis = Vector(fwdAxis.y, -fwdAxis.x, 0)
-        local upAxis    = Vector(0, 0, 1)
-
-        -- Draw lines relative to base center (0 offset)
-        local drawOffset = Vector(0, 0, 0)
-        local basePos = base:localToWorld(drawOffset)
+    if Debug then
+        local base
+        local fwdAxis -- This will hold the exact vector received from the server
         
-        local right = base:localToWorld(drawOffset - rightAxis * 50)
-        local up    = base:localToWorld(drawOffset + upAxis * 50)
-        local fwd   = base:localToWorld(drawOffset - fwdAxis * 50)
-        
-        local alpha = math.max(300 - owner():getPos():getDistanceSqr(basePos) / 1000, 0)
+        timer.create("requestBase", 0.5, 0, function()
+            net.start("requestBase")
+            net.send()
+        end)
 
-        if alpha > 0 then
-            render.pushViewMatrix({ type = "3D" })
+        net.receive("sendBase", function()
+            base = net.readEntity()
+            fwdAxis = net.readVector() -- Only the forward axis is needed from server
+            timer.stop("requestBase")
+        end)
 
-            -- Blue = Forward (Based on config)
-            render.setColor(Color(0, 0, 255))
-            render.draw3DLine(basePos, fwd)
+        -- Only enable the HUD if Debug is true
+        enableHud(owner(), true)
 
-            -- Red = Right (Calculated from forward)
-            render.setColor(Color(255, 0, 0))
-            render.draw3DLine(basePos, right)
+        local font = render.createFont("Trebuchet24", 24, nil, false, nil, nil, true)
 
-            -- Green = Up
-            render.setColor(Color(0, 255, 0))
-            render.draw3DLine(basePos, up)
+        hook.add("drawHud", "hud", function()
+            if not base or not base:isValid() or not fwdAxis then return end
 
-            render.popViewMatrix()
+            -- Calculate the other axes EXACTLY as the server does:
+            -- Right is (y, -x) of the forward axis
+            local rightAxis = Vector(fwdAxis.y, -fwdAxis.x, 0)
+            local upAxis    = Vector(0, 0, 1)
 
-            local rightScr = right:toScreen()
-            local upScr    = up:toScreen()
-            local fwdScr   = fwd:toScreen()
+            -- Draw lines relative to base center (0 offset)
+            local drawOffset = Vector(0, 0, 0)
+            local basePos = base:localToWorld(drawOffset)
+            
+            local right = base:localToWorld(drawOffset - rightAxis * 50)
+            local up    = base:localToWorld(drawOffset + upAxis * 50)
+            local fwd   = base:localToWorld(drawOffset - fwdAxis * 50)
+            
+            local alpha = math.max(300 - owner():getPos():getDistanceSqr(basePos) / 1000, 0)
 
-            render.setFont(font)
+            if alpha > 0 then
+                render.pushViewMatrix({ type = "3D" })
 
-            render.setColor(Color(0, 0, 255, alpha))
-            render.drawSimpleText(fwdScr.x, fwdScr.y, "Forward", 1, 1)
+                -- Blue = Forward (Based on config)
+                render.setColor(Color(0, 0, 255))
+                render.draw3DLine(basePos, fwd)
 
-            render.setColor(Color(255, 0, 0, alpha))
-            render.drawSimpleText(rightScr.x, rightScr.y, "Right", 1, 1)
+                -- Red = Right (Calculated from forward)
+                render.setColor(Color(255, 0, 0))
+                render.draw3DLine(basePos, right)
 
-            render.setColor(Color(0, 255, 0, alpha))
-            render.drawSimpleText(upScr.x, upScr.y, "Up", 1, 1)
-        end
-    end)
+                -- Green = Up
+                render.setColor(Color(0, 255, 0))
+                render.draw3DLine(basePos, up)
+
+                render.popViewMatrix()
+
+                local rightScr = right:toScreen()
+                local upScr    = up:toScreen()
+                local fwdScr   = fwd:toScreen()
+
+                render.setFont(font)
+
+                render.setColor(Color(0, 0, 255, alpha))
+                render.drawSimpleText(fwdScr.x, fwdScr.y, "Forward", 1, 1)
+
+                render.setColor(Color(255, 0, 0, alpha))
+                render.drawSimpleText(rightScr.x, rightScr.y, "Right", 1, 1)
+
+                render.setColor(Color(0, 255, 0, alpha))
+                render.drawSimpleText(upScr.x, upScr.y, "Up", 1, 1)
+            end
+        end)
+    end
 end
