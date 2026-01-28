@@ -1,0 +1,652 @@
+--@name Tire Simulation Core
+--@author [C17] Red Fox
+--@shared
+
+local Version = "1.1"
+
+if CLIENT then
+    
+    local function initClient(config)
+        -- Defaults
+        local activeConfig = config or {}
+        -- Helper: Determine Right Axis if not set
+        if not activeConfig.RightAxis and activeConfig.ForwardAxis and activeConfig.UpAxis then
+             activeConfig.RightAxis = activeConfig.ForwardAxis:cross(activeConfig.UpAxis):getNormalized()
+        end
+        
+        local meshes = activeConfig.meshes or {} -- Not used here but kept for pattern consistency
+        local baseEntity = nil
+        local wheelEntities = {}
+        
+        -- Default Colors for prints
+        local W, R, G = config.W or Color(255, 255, 255), config.R or Color(255, 0, 0), config.G or Color(0, 255, 0)
+    
+        -- Version Check Logic
+        local function checkVersionOnSpawn(cfg)
+            if not cfg.AllowCheckVersion then return end
+            -- Placeholder URL - User needs to update this
+            local githubURL = "https://raw.github.com/nokillnando/Starfall/main/simcadetire/tire_simulation_core.txt"
+            local localVersion = Version
+            local maxRetries = 10
+    
+            local function doVersionCheck()
+                if not http.canRequest() then
+                    maxRetries = maxRetries - 1
+                    if maxRetries <= 0 then return end
+                    timer.simple(0.5, doVersionCheck)
+                    return
+                end
+    
+                http.get(githubURL,
+                    function(data)
+                        if not (data and data ~= "") then
+                            if cfg.AllowCheckVersion then
+                                print(W, "Tire Sim Core version check failed - no data received")
+                            end
+                            return
+                        end
+    
+                        local versionStart = data:find('Version = "')
+                        if not versionStart then
+                            if cfg.AllowCheckVersion then
+                                print(W, "Tire Sim Core version check failed - version string not found")
+                            end
+                            return
+                        end
+    
+                        versionStart = versionStart + 11
+                        local versionEnd = data:find('"', versionStart)
+                        if not versionEnd or versionEnd <= versionStart then
+                            if cfg.AllowCheckVersion then
+                                print(W, "Tire Sim Core version check failed - could not parse remote version")
+                            end
+                            return
+                        end
+    
+                        local remoteVersion = data:sub(versionStart, versionEnd - 1)
+                        local remoteParts = string.explode(".", remoteVersion)
+                        local localParts = string.explode(".", localVersion)
+    
+                        local remoteMajor = tonumber(remoteParts[1]) or 0
+                        local remoteMinor = tonumber(remoteParts[2]) or 0
+                        local localMajor = tonumber(localParts[1]) or 0
+                        local localMinor = tonumber(localParts[2]) or 0
+    
+                        if remoteMajor > localMajor or (remoteMajor == localMajor and remoteMinor > localMinor) then
+                            print(W, "Check config file for updated default variables")
+                            print(W, "Tire Sim Core Update available! Local: ", G, localVersion, W, " | Remote: ", G, remoteVersion)
+                        else
+                            print(W, "Local Tire Sim Core is up to date! Version: ", G, localVersion)
+                        end
+                    end,
+                    function(err)
+                        if cfg.AllowCheckVersion then
+                            print(W, "Tire Sim Core version check failed - could not connect to remote: ", R, err)
+                        end
+                    end
+                )
+            end
+            timer.simple(1, doVersionCheck)
+        end
+    
+        checkVersionOnSpawn(activeConfig)
+        
+        -- HUD / Visualizer Logic
+        if player() == owner() then
+            if activeConfig.ShowAxisVisualizer then
+                enableHud(owner(), true)
+    
+                -- Request the base entity from the server
+                timer.create("TireSim_RequestBase", 0.5, 0, function()
+                    net.start("requestBase")
+                    net.send()
+                end)
+    
+                net.receive("sendBase", function()
+                    baseEntity = net.readEntity()
+                    
+                    wheelEntities = {}
+                    local count = net.readUInt(8)
+                    for i=1, count do
+                        local name = net.readString()
+                        local ent = net.readEntity()
+                        table.insert(wheelEntities, {Name = name, Entity = ent})
+                    end
+    
+                    if baseEntity and baseEntity:isValid() then
+                        timer.stop("TireSim_RequestBase")
+                    end
+                end)
+    
+                local font = render.createFont("Trebuchet24", 24, nil, false, nil, nil, true)
+    
+                hook.add("drawHud", "TireSim_AxisVisual", function()
+                    if not (baseEntity and baseEntity:isValid()) then return end
+    
+                    local function drawAxes(ent, length, labelSuffix, name)
+                        if not (ent and ent:isValid()) then return end
+                        
+                        local pos = ent:getPos()
+                        local right, up, fwd
+    
+                        if ent == baseEntity then
+                            -- [VISUALIZER BASE]
+                            right = ent:localToWorldVector(activeConfig.RightAxis) * length
+                            up = ent:localToWorldVector(activeConfig.UpAxis) * length
+                            fwd = ent:localToWorldVector(activeConfig.ForwardAxis) * length
+                        else
+                            -- [VISUALIZER WHEEL]
+                            local vehicleRight = baseEntity:localToWorldVector(activeConfig.RightAxis)
+                            local rawRight = ent:getRight()
+                            if rawRight:dot(vehicleRight) < 0 then
+                                rawRight = -rawRight
+                            end
+    
+                            right = rawRight * length
+                            up = ent:getUp() * length
+                            fwd = ent:getForward() * length
+                        end
+    
+                        local pRight = pos + right
+                        local pUp = pos + up
+                        local pFwd = pos + fwd
+    
+                        render.pushViewMatrix({ type = "3D" })
+                        render.setColor(Color(255, 0, 0)); render.draw3DLine(pos, pRight)
+                        render.setColor(Color(0, 255, 0)); render.draw3DLine(pos, pUp)
+                        render.setColor(Color(0, 0, 255)); render.draw3DLine(pos, pFwd)
+                        render.popViewMatrix()
+                        
+                        -- Labels
+                        local sRight = pRight:toScreen()
+                        local sUp = pUp:toScreen()
+                        local sFwd = pFwd:toScreen()
+                        local sPos = pos:toScreen()
+                        
+                        render.setFont(font)
+                        if labelSuffix or ent == baseEntity then
+                            render.setColor(Color(255,0,0)); render.drawSimpleText(sRight.x, sRight.y, "R", 1, 1)
+                            render.setColor(Color(0, 255, 0)); render.drawSimpleText(sUp.x, sUp.y, "U", 1, 1)
+                            render.setColor(Color(0, 0, 255)); render.drawSimpleText(sFwd.x, sFwd.y, "F", 1, 1)
+                        end
+                        
+                        if name then
+                             render.setColor(Color(255, 255, 0))
+                             render.drawSimpleText(sPos.x, sPos.y - 30, name, 1, 1)
+                        end
+                    end
+    
+                    -- Draw Base Axes
+                    drawAxes(baseEntity, activeConfig.VisualizerLength * 25)
+    
+                    -- Draw Wheel Axes
+                    for _, wData in ipairs(wheelEntities) do
+                        drawAxes(wData.Entity, 15, true, wData.Name)
+                    end
+                end)
+            end
+        end
+    end
+    
+    _G.TireSimCore = {
+        initClient = initClient,
+        Version = Version
+    }
+
+else -- SERVER
+
+    local function initServer(config)
+        -- ============================================================================
+        -- CONFIG
+        -- ============================================================================
+        local Config = config
+        -- Helper: Determine Right Axis if not set, or verify
+        -- Typically Right = Fwd x Up.
+        Config.RightAxis = Config.ForwardAxis:cross(Config.UpAxis):getNormalized()
+
+        -- ============================================================================
+        -- LOGIC
+        -- ============================================================================
+        
+        local InternalProperties = Config.InternalProperties or {}
+        
+        local function GetGripForces(wheelData, activeTireData, lateralSlipAngle, longitudinalSlipRatio, load)
+            local Fz = load
+            -- Width is applied in the main think loop.
+            local peakLateralForce = Fz * ((Fz * activeTireData.Load_A1) + activeTireData.Load_A2) * activeTireData.CoF
+            local peakLongitudinalForce = peakLateralForce * 1.1
+        
+            local B, C, D, E, x
+            B, C, D, E = activeTireData.Lat_B, activeTireData.Lat_C, peakLateralForce, activeTireData.Lat_E
+            x = lateralSlipAngle
+            local latForce = D * math.sin(C * math.atan(B * x - E * (B * x - math.atan(B * x))))
+        
+            B, C, D, E = activeTireData.Lon_B, activeTireData.Lon_C, peakLongitudinalForce, activeTireData.Lon_E
+            x = longitudinalSlipRatio
+            local lonForce = D * math.sin(C * math.atan(B * x - E * (B * x - math.atan(B * x))))
+        
+            return latForce, lonForce
+        end
+        
+        wire.adjustInputs(
+            {"Base", "FrontWheels", "RearWheels", "ExtraFilterStatic", "ExtraFilterSemiDynamic", "Throttle", "Brake"},
+            {"entity", "array", "array", "array", "array", "number", "number"}
+        )
+        wire.adjustOutputs(
+            {"NumWheels", "WheelNames", "Loads", "GripPcts", "AbsoluteForces", "AngularDamping", "CPULoadPct", "TickSkip"},
+            {"number", "array", "array", "array", "array", "array", "number", "number"}
+        )
+    
+        local function getValidBase()
+            local base = wire.ports.Base
+            return (base and base:isValid()) and base or nil
+        end
+    
+        local Wheels = {}
+        local WheelHolos = {}
+        local OrderedWheelNames = {}
+        local NumWheels = 0
+        local VehicleFilter = {}
+        local CheckedEntities = {}
+        local Wheelbase = 0
+        local TrackWidth = 0
+        local TotalRealMass = 0
+    
+        local thinkCounter = 0
+        local skipTicks = 0
+        local lastAppliedForces = {}
+        local cpuLoadPct = 0
+        
+        local RightAxis = Config.RightAxis 
+    
+        local function updateSemiDynamicFilter()
+            local semiDynamicFilter = wire.ports.ExtraFilterSemiDynamic
+            if not semiDynamicFilter or #semiDynamicFilter == 0 then return end
+    
+            local newEnts = 0
+            for _, ent in ipairs(semiDynamicFilter) do
+                if ent and ent:isValid() and not CheckedEntities[ent] then
+                    -- [OPTIMIZATION] Using getAllConstrained instead of recursion
+                    local subParts = ent:getAllConstrained()
+                    table.insert(subParts, ent)
+                    
+                    for _, part in pairs(subParts) do
+                        if not CheckedEntities[part] then
+                            CheckedEntities[part] = true
+                            table.insert(VehicleFilter, part)
+                        end
+                    end
+                    newEnts = newEnts + 1
+                end
+            end
+    
+            if newEnts > 0 and Config.AllowPrintFilter then
+                print("[TireSim] Semi-dynamic filter found " .. newEnts .. " new entities.")
+            end
+        end
+    
+        local function initializeWheels()
+            local Base = getValidBase()
+            if not Base then return end
+    
+            for name, holo in pairs(WheelHolos) do if holo and holo:isValid() then holo:remove() end end
+            Wheels, WheelHolos, OrderedWheelNames, NumWheels, VehicleFilter, CheckedEntities, lastAppliedForces = {}, {}, {}, 0, {}, {}, {}
+    
+            -- [OPTIMIZATION] Replaced recursive scan with O(N) lookup
+            local allParts = Base:getAllConstrained()
+            table.insert(allParts, Base)
+            
+            for _, part in pairs(allParts) do
+                if part and part:isValid() and not CheckedEntities[part] then
+                    CheckedEntities[part] = true
+                    table.insert(VehicleFilter, part)
+                end
+            end
+    
+            local staticFilter = wire.ports.ExtraFilterStatic
+            if staticFilter and #staticFilter > 0 then
+                for _, ent in ipairs(staticFilter) do
+                    if ent and ent:isValid() and not CheckedEntities[ent] then
+                        CheckedEntities[ent] = true
+                        table.insert(VehicleFilter, ent)
+                         local subConstrained = ent:getAllConstrained()
+                         for _, sub in pairs(subConstrained) do
+                            if not CheckedEntities[sub] then
+                                CheckedEntities[sub] = true
+                                table.insert(VehicleFilter, sub)
+                            end
+                         end
+                    end
+                end
+            end
+    
+            local minFwd, maxFwd = 9e9, -9e9
+            local minRight, maxRight = 9e9, -9e9
+    
+            local wheelCounts = {
+                Front_Left = 0, Front_Right = 0, Rear_Left = 0, Rear_Right = 0,
+                Front_Center = 0, Rear_Center = 0
+            }
+            local axleInputNames = {"FrontWheels", "RearWheels"}
+            for _, inputName in ipairs(axleInputNames) do
+                local wheelArray = wire.ports[inputName]
+                local axleName = inputName:gsub("Wheels", "")
+                if wheelArray and #wheelArray > 0 then
+                    for i, wheelEntity in ipairs(wheelArray) do
+                        if wheelEntity and wheelEntity:isValid() then
+                            if not CheckedEntities[wheelEntity] then
+                                table.insert(VehicleFilter, wheelEntity)
+                                CheckedEntities[wheelEntity] = true
+                            end
+                            local localPos = Base:worldToLocal(wheelEntity:getPos())
+                            minFwd = math.min(minFwd, localPos.x); maxFwd = math.max(maxFwd, localPos.x)
+                            minRight = math.min(minRight, localPos.y); maxRight = math.max(maxRight, localPos.y)
+    
+                            local sideValue = localPos:dot(RightAxis)
+                            local side = "Center"; if sideValue > 0.1 then side = "Right" elseif sideValue < -0.1 then side = "Left" end
+                            
+                            local countKey = axleName .. "_" .. side
+                            wheelCounts[countKey] = (wheelCounts[countKey] or 0) + 1
+                            local nameIndex = wheelCounts[countKey]
+                            local wheelName = axleName .. "_" .. side .. "_" .. nameIndex
+                            local tireProps = Config.TireSetup[axleName] or {}
+                            
+                                -- [SIMCADE] Set physical material to ice
+                                wheelEntity:setMaterial("gmod_ice")
+                                
+                                Wheels[wheelName] = {
+                                    Entity = wheelEntity, PhysObj = wheelEntity:getPhysicsObject(),
+                                    CompoundName = tireProps.Compound,
+                                    Width = tireProps.Width,
+                                    AspectRatio = tireProps.AspectRatio,
+                                    Load = 0,
+                                }
+                            lastAppliedForces[wheelName] = {cancel=Vector(0,0,0), grip=Vector(0,0,0), gripLocal=Vector(0,0,0)}
+                            table.insert(OrderedWheelNames, wheelName)
+                            NumWheels = NumWheels + 1
+    
+                            if Config.ShowWheelHolograms then
+                                local holo = holograms.create(wheelEntity:getPos(), wheelEntity:getAngles(), "models/sprops/trans/wheel_d/t_wheel25.mdl", Vector(1,0.65,1))
+                                holo:setParent(Base); holo:setColor(Color(200, 200, 200, 200)); holo:setMaterial("models/debug/debugwhite"); holo:suppressEngineLighting(true)
+                                WheelHolos[wheelName] = holo
+                            end
+                        end
+                    end
+                end
+            end
+    
+            if NumWheels > 1 then
+                Wheelbase = math.abs(maxFwd - minFwd)
+                TrackWidth = math.abs(maxRight - minRight)
+            else
+                Wheelbase = 0
+                TrackWidth = 0
+            end
+            
+            -- Calculate Total Physical Mass (Base + Wheels)
+            TotalRealMass = Base:getPhysicsObject():getMass()
+            for _, w in pairs(Wheels) do
+                if w.PhysObj and w.PhysObj:isValid() then
+                    TotalRealMass = TotalRealMass + w.PhysObj:getMass()
+                end
+            end
+            print(Config.W, "[TireSim] Total Physical Mass detected: ", Config.G, TotalRealMass .. "kg", Config.W, " (Config Virtual: ", Config.G, Config.TotalVehicleMass .. "kg", Config.W, ")")
+            
+            updateSemiDynamicFilter()
+            
+            print(Config.W, "[TireSim] Initialized with ", Config.G, NumWheels, Config.W, " wheels. Simcade Version " .. Version)
+            wire.ports.NumWheels = NumWheels; wire.ports.WheelNames = OrderedWheelNames
+        end
+    
+        timer.create("TireSim_SemiDynamicFilterUpdate", 10, 0, updateSemiDynamicFilter)
+        
+        wire.onInputsChanged = function(changed)
+            if changed.FrontWheels or changed.RearWheels or changed.ExtraFilterStatic or changed.Throttle or changed.Brake then
+                initializeWheels()
+            end
+        end
+    
+        initializeWheels()
+    
+        -- Networking
+        net.receive("requestBase", function(_, ply)
+            local base = getValidBase()
+            if base then
+                net.start("sendBase")
+                net.writeEntity(base)
+                net.writeUInt(#OrderedWheelNames, 8)
+                for _, name in ipairs(OrderedWheelNames) do
+                    local wData = Wheels[name]
+                    if wData and wData.Entity and wData.Entity:isValid() then
+                        net.writeString(name)
+                        net.writeEntity(wData.Entity)
+                    end
+                end
+                net.send(ply)
+            end
+        end)
+    
+        local lastVel = Vector(0,0,0)
+    
+        hook.add("think", "TireSim_Main", function()
+            local Base = getValidBase()
+            if not Base or NumWheels == 0 then return end
+            
+            local basePhys = Base:getPhysicsObject()
+            if not basePhys or not basePhys:isValid() then return end
+            
+            thinkCounter = thinkCounter + 1
+    
+            -- [MONITORING] CPU Usage
+            local qUsed = quotaUsed()
+            local qMax = quotaMax()
+            if qMax > 0 then
+                cpuLoadPct = (qUsed / qMax) * 100
+            end
+    
+            -- [OPTIMIZATION] Fixed Update Rate
+            local tickInterval = game.getTickInterval()
+            local targetInterval = 1 / math.max(1, Config.UpdateRate)
+            skipTicks = math.max(0, math.floor(targetInterval / tickInterval + 0.5) - 1)
+            
+            local shouldUpdateGrip = (thinkCounter % (skipTicks + 1) == 0)
+            
+            -- State Update (Pacejka & Load) - Runs at Reduced Rate
+            if shouldUpdateGrip then
+                local dt = tickInterval * (skipTicks + 1)
+                local currentVel = basePhys:getVelocity()
+                local accel = (currentVel - lastVel) / dt
+                lastVel = currentVel
+                local localAccel = Base:worldToLocalVector(accel)
+    
+                local weightTransferFwd = 0
+                local weightTransferRight = 0
+                if Wheelbase > 0 and TrackWidth > 0 then
+                    weightTransferFwd = (localAccel.x / Config.Gravity) * Config.TotalVehicleMass * Config.CenterOfMassHeight / Wheelbase
+                    weightTransferRight = (localAccel.y / Config.Gravity) * Config.TotalVehicleMass * Config.CenterOfMassHeight / TrackWidth
+                end
+    
+                local function normalizeInput(rawValue, maxValueRef)
+                    local currentMax = math.max(maxValueRef, math.abs(rawValue))
+                    maxValueRef = currentMax
+                    return (currentMax > 0) and (math.abs(rawValue) / currentMax) or 0
+                end
+    
+                local throttleInput, brakeInput
+                if wire.ports.Throttle or wire.ports.Brake then
+                    throttleInput = normalizeInput(wire.ports.Throttle or 0, Config.ThrottleMaxValue)
+                    brakeInput = normalizeInput(wire.ports.Brake or 0, Config.BrakeMaxValue)
+                    throttleInput = math.clamp(throttleInput, 0.0, 1.0)
+                    brakeInput = math.clamp(brakeInput, 0.0, 1.0)
+                else
+                    local longitudinalG = localAccel.x / Config.Gravity
+                    throttleInput = math.clamp(longitudinalG, 0, 1)
+                    brakeInput = math.clamp(-longitudinalG, 0, 1)
+                end
+                
+                local loads_t, grip_pcts_t, forces_t, damping_t = {}, {}, {}, {}
+                local baseUp = Base:localToWorldVector(Config.UpAxis)
+                
+                -- [FIX] Validate Filter
+                for j=#VehicleFilter, 1, -1 do
+                     local e = VehicleFilter[j]
+                     if not (e and e:isValid()) then
+                         table.remove(VehicleFilter, j)
+                     end
+                end
+    
+                for i, name in ipairs(OrderedWheelNames) do
+                    local wheelData = Wheels[name]
+                    if wheelData.Entity and wheelData.Entity:isValid() and wheelData.PhysObj and wheelData.PhysObj:isValid() then
+                        local activeTireData = InternalProperties[wheelData.CompoundName] or InternalProperties.Sport
+                        
+                        -- Load Calc
+                        local totalRatio = Config.WeightRatioFront + Config.WeightRatioRear
+                        local frontRatioNormalized = Config.WeightRatioFront / totalRatio
+                        local staticLoad = Config.TotalVehicleMass * Config.Gravity * (string.find(name, "Front") and frontRatioNormalized or (1 - frontRatioNormalized)) / (NumWheels / 2)
+                        
+                        local rightSign = string.find(name, "Right") and 1 or -1
+                        local isFrontWheel = string.find(name, "Front")
+    
+                        -- Aero
+                        local contactPointVel = basePhys:getVelocityAtPoint(wheelData.Entity:getPos())
+                        local trueSpeed = contactPointVel:getLength()
+                        local speedMph = trueSpeed / 17.6
+                        local aeroLoad = (isFrontWheel and Config.FrontAeroFactor or Config.RearAeroFactor) * Config.TotalVehicleMass * (speedMph / 100)^2
+    
+                        -- Transfer
+                        local transferLoad = 0
+                        if brakeInput > Config.InputDeadzone then
+                            local transferForce = brakeInput * Config.BrakeTransferFactor * Config.TotalVehicleMass
+                            transferLoad = isFrontWheel and transferForce or -transferForce
+                        elseif throttleInput > Config.InputDeadzone then
+                            local transferForce = throttleInput * Config.ThrottleTransferFactor * Config.TotalVehicleMass
+                            transferLoad = isFrontWheel and -transferForce or transferForce
+                        end
+    
+                        wheelData.Load = math.max(50, staticLoad + aeroLoad + transferLoad + (weightTransferRight * rightSign))
+    
+                        -- Grip Calc
+                        local traceDist = Config.TireRadius + 5
+                        local trace = trace.line(wheelData.Entity:getPos(), wheelData.Entity:getPos() - baseUp * traceDist, VehicleFilter)
+                        
+                        local latForceMag = 0
+                        local gripPct = 100
+                        local rollingResistance = 0
+                        
+                        if trace.Hit then
+                            local vehicleRight = Base:localToWorldVector(RightAxis)
+                            local wheelRight = wheelData.Entity:getRight()
+                            if wheelRight:dot(vehicleRight) < 0 then wheelRight = -wheelRight end
+                            
+                            local lateralVel = contactPointVel:dot(wheelRight)
+                            local surfaceGripMultiplier = activeTireData.SurfaceMultipliers[trace.MatType] or activeTireData.SurfaceMultipliers.Default
+                            gripPct = math.clamp(100 * surfaceGripMultiplier, 0, 100)
+                            
+                            if trueSpeed > 15 then
+                                local safeSpeed = math.max(trueSpeed, 300)
+                                local lateralSlipAngle = math.atan(lateralVel / safeSpeed) * math.min(trueSpeed / 300, 1.0)
+                                local longitudinalSlipRatio = math.clamp(localAccel.x / Config.Gravity, -1, 1) * -0.1
+                                
+                                local latForceRaw
+                                latForceRaw, _ = GetGripForces(wheelData, activeTireData, lateralSlipAngle, longitudinalSlipRatio, wheelData.Load)
+                                
+                                local widthFactor = wheelData.Width / 225
+                                local gripBias = isFrontWheel and Config.FrontGripBias or Config.RearGripBias
+                                local finalGripMultiplier = (gripPct / 100) * widthFactor * gripBias
+                                
+                                -- Target Magnitude
+                                local targetMag = latForceRaw * finalGripMultiplier * Config.OverallGripMultiplier
+    
+                                 -- Damping
+                                local prevMag = lastAppliedForces[name] and lastAppliedForces[name].mag or 0
+                                local forceChange = targetMag - prevMag
+                                local dampedMag = prevMag + (forceChange / math.max(1, Config.GripDampingFactor))
+                                
+                                -- Clamp
+                                local maxOneG = Config.TotalVehicleMass * Config.Gravity
+                                local maxForceLim = maxOneG * 1.5 
+                                dampedMag = math.clamp(dampedMag, -maxForceLim, maxForceLim)
+    
+                                latForceMag = dampedMag
+                            else
+                                latForceMag = 0
+                            end
+                            
+                            -- Rolling Resistance
+                            rollingResistance = activeTireData.BaseRollingResistance
+                            if trueSpeed < 2 then 
+                                 wheelData.IsStatic = true
+                            else
+                                 wheelData.IsStatic = false
+                            end
+                        else
+                            latForceMag = 0
+                            wheelData.IsStatic = false
+                        end
+                        
+                        lastAppliedForces[name] = { mag = latForceMag }
+                        wheelData.LastComponents = { Mag = latForceMag, IsStatic = wheelData.IsStatic, Damping = rollingResistance }
+                        
+                        loads_t[i] = wheelData.Load
+                        grip_pcts_t[i] = gripPct
+                        forces_t[i] = latForceMag
+                        damping_t[i] = rollingResistance
+                    end
+                end
+                
+                wire.ports.Loads, wire.ports.GripPcts, wire.ports.AbsoluteForces, wire.ports.AngularDamping = loads_t, grip_pcts_t, forces_t, damping_t
+                wire.ports.CPULoadPct = cpuLoadPct
+                wire.ports.TickSkip = skipTicks
+            end 
+            
+            -- Force Apply Block 
+            local massRatio = math.min(1.0, TotalRealMass / Config.TotalVehicleMass)
+            massRatio = math.max(0.1, massRatio) 
+            
+            for i, name in ipairs(OrderedWheelNames) do
+                local wheelData = Wheels[name]
+                if wheelData and wheelData.Entity and wheelData.Entity:isValid() and wheelData.PhysObj and wheelData.PhysObj:isValid() then
+                    local comps = wheelData.LastComponents
+                    if comps then
+                        local wheelPhys = wheelData.PhysObj
+                        
+                        -- 1. Apply Lateral Grip
+                        if math.abs(comps.Mag) > 0.1 then
+                             local vehicleRight = Base:localToWorldVector(RightAxis)
+                             local wheelRight = wheelData.Entity:getRight()
+                             if wheelRight:dot(vehicleRight) < 0 then wheelRight = -wheelRight end
+                             
+                             local forceVec = -wheelRight * comps.Mag * massRatio
+                             wheelPhys:applyForceCenter(forceVec)
+                        end
+                        
+                        -- 2. Yaw Stability
+                        if Config.YawStabilityFactor > 0 then
+                            local angVel = basePhys:getAngleVelocity()
+                            local yawVel = angVel.z
+                            if math.abs(yawVel) > 1 then 
+                                local counterForce = -basePhys:getVelocityAtPoint(wheelData.Entity:getPos()):getNormalized() * (math.abs(yawVel) * Config.YawStabilityFactor * 50)
+                                local rightVec = basePhys:localToWorldVector(RightAxis)
+                                local latCounter = rightVec * counterForce:dot(rightVec)
+                                wheelPhys:applyForceCenter(latCounter * massRatio)
+                            end
+                        end
+                        
+                        -- 3. Damping
+                        if comps.IsStatic then
+                            wheelPhys:setDamping(200, 200)
+                        else
+                            wheelPhys:setDamping(0, comps.Damping or 0)
+                        end
+                    end
+                end
+            end
+        end)
+    end -- end initServer
+
+    _G.TireSimCore = {
+        initServer = initServer,
+        Version = Version
+    }
+end
