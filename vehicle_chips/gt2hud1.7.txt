@@ -235,7 +235,8 @@ if CLIENT then
         render.setColor(Color(55, 55, 55, 200))
         render.drawFilledCircle(pos.x, pos.y, radius * 0.2)
 
-        local tick_step = maxturbopsi / 10 
+        local tick_step = maxturbopsi / 10
+        if tick_step < 2 then tick_step = 1 end 
         for i = 0, maxturbopsi, tick_step do
             if i == 0 then continue end
             local anglestep = (255 / maxturbopsi) * i
