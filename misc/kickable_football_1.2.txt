@@ -1,0 +1,130 @@
+-- Football script for StarfallEx
+--@name Kickable Football 1.2
+--@model models/props_phx/misc/soccerball.mdl
+
+--@server
+-- Requires 'player' and 'prop' permissions
+
+if SERVER then
+
+-- Configuration
+local config = {
+    kickDistance = 90,               -- Distance to trigger kick
+    baseForce = 7000,                -- Base kick force
+    shiftMultiplier = 3,            -- Shift kick force multiplier
+    shootShiftMultiplier = 1.5,
+    shootMult = 5,                   -- Shoot multiplier for M2
+    upwardForce = 7000,              -- Upward boost on kick
+    inertia = Vector(2, 2, 2),
+    drag = false,
+    linear_damp = 0.4,
+    angular_damp = 0.02,
+
+    -- Movement multipliers
+    sideMultiplier = 2.5,            -- A/D
+    shiftSideMultiplier = 0.7,       -- A/D + Shift
+    backMultiplier = 0.8,            -- S
+
+    -- Weapon that allows kicking
+    allowedWeapon = "none",          -- Change this to the desired weapon
+
+    -- Cooldown for shooting (M2)
+    shootCooldownTime = 2         -- In seconds (M2 only)
+}
+
+local football = chip()
+
+local phys = football:getPhysicsObject()
+if phys and phys:isValid() then
+    phys:enableDrag(config.drag)
+    phys:setDamping(config.linear_damp, config.angular_damp)
+    phys:setMass(50)
+    football:setInertia(config.inertia)
+    football:setPhysMaterial("gm_ps_soccerball")
+end
+
+-- Cooldown tracking
+local cooldown = {}        -- General action cooldown
+local shootCooldowns = {}  -- M2-specific cooldown
+
+hook.add("think", "football_kick_handler", function()
+    for _, ply in pairs(find.allPlayers()) do
+        if not ply:isAlive() then continue end
+        if not ply:getActiveWeapon():isValid() or ply:getActiveWeapon():getClass() ~= config.allowedWeapon then continue end
+
+        local distance = ply:getPos():getDistance(football:getPos())
+        if distance > config.kickDistance then continue end
+
+        local steamID = ply:getSteamID()
+        local curTime = timer.curtime()
+
+        -- Power shot (M2)
+        if ply:keyDown(2048) then
+            -- Enforce shoot cooldown
+            if shootCooldowns[steamID] and curTime - shootCooldowns[steamID] < config.shootCooldownTime then continue end
+
+            cooldown[steamID] = curTime
+            shootCooldowns[steamID] = curTime
+
+            local eyeAngles = ply:getEyeAngles()
+            local forwardVec = eyeAngles:getForward()
+            local rightVec = eyeAngles:getRight()
+            local powerDir = forwardVec
+
+            if ply:keyDown(8) then powerDir = powerDir + forwardVec end -- W
+            if ply:keyDown(16) then powerDir = powerDir - forwardVec * config.backMultiplier end -- S
+
+            if ply:keyDown(512) then
+                powerDir = powerDir - rightVec * (ply:keyDown(131072) and config.shiftSideMultiplier or config.sideMultiplier)
+            end
+
+            if ply:keyDown(1024) then
+                powerDir = powerDir + rightVec * (ply:keyDown(131072) and config.shiftSideMultiplier or config.sideMultiplier)
+            end
+
+            powerDir = powerDir + Vector(0, 0, config.upwardForce / (config.baseForce * config.shootMult))
+            powerDir:normalize()
+
+            local shootForce = config.baseForce * config.shootMult
+            if ply:keyDown(131072) then shootForce = shootForce * config.shootShiftMultiplier end
+
+            football:applyForceCenter(powerDir * shootForce)
+            continue
+        end
+
+        -- Normal movement kick (M1)
+        if ply:keyDown(1) then
+            -- Enforce generic action cooldown (shared with M2)
+            if cooldown[steamID] and curTime - cooldown[steamID] < 0.3 then continue end
+            cooldown[steamID] = curTime
+
+            local eyeAngles = ply:getEyeAngles()
+            local forwardVec = eyeAngles:getForward()
+            local rightVec = eyeAngles:getRight()
+            local moveDir = Vector(0, 0, 0)
+
+            if ply:keyDown(8) then moveDir = moveDir + forwardVec end
+            if ply:keyDown(16) then moveDir = moveDir - forwardVec * config.backMultiplier end
+
+            if ply:keyDown(512) then
+                moveDir = moveDir - rightVec * (ply:keyDown(131072) and config.shiftSideMultiplier or config.sideMultiplier)
+            end
+
+            if ply:keyDown(1024) then
+                moveDir = moveDir + rightVec * (ply:keyDown(131072) and config.shiftSideMultiplier or config.sideMultiplier)
+            end
+
+            if moveDir == Vector(0, 0, 0) then continue end
+
+            moveDir:normalize()
+            local kickForce = config.baseForce
+            if ply:keyDown(131072) then kickForce = kickForce * config.shiftMultiplier end
+
+            football:applyForceCenter(moveDir * kickForce)
+        end
+    end
+end)
+
+print("Football setup successfully!")
+
+end

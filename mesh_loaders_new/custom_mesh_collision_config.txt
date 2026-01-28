@@ -1,0 +1,313 @@
+--@name Custom Mesh Collision Config
+--@author [C17] Red Fox
+--@shared
+--@include mesh_loaders_new/custom_mesh_collision_core.txt
+
+--[[
+V1.7
+Core/Config just like my mesh loader
+
+V1.68.c
+Should now respect http limits automatically
+
+V1.68
+Bunch of new spaghetti code that should allow for faster spawning(whitin limits of course), atleast hopefully
+
+V1.66c
+Actual correct ACF version check, proper default to legacy armor calculation
+
+V1.66
+Prop Table for filtering, in case you need them, please do some table merging with SF for full effect
+
+v1.65 NEW
+New ACE armor function, thanks RDC and ItsNotEd
+Proper armor, ductility and types(see the armor id list below)
+Must be on ACE Version 502 and up otherwise it will default to a somewhat wrong way of doing it
+
+V1.64 NEW
+Added some options for spawning delay among some others
+
+V1.62 NEW
+Added debug for vertice distance error
+Added optional variables for mesh configs, will default to those in a table
+
+############################################################################################################################################################
+V1.60 NEW:
+Actual ACF thickness, or atleast close enough to it, replaces prop weight if used
+Only one type of material though, the default one(RHA)
+############################################################################################################################################################
+
+TO DO:
+
+Improve debugging to be more compact
+
+############################################################################################################################################################
+
+Might have bugs and whatnot, you have been warned
+
+PLEASE READ THESE NOTES, dont come nagging to me later if you dont
+
+[1] Link the Base entity to set what entity will be the one to set position, angles and so on.
+The Wheels array is to what extra nocollides it will put on
+Parent entity is what it will be parented to instead of Base, doesnt inherit the postion and angles, for that use the Base
+If using parent DISABLE all constraint based settings, for your own good
+
+############################################################################################################################################################
+
+[2] This was never meant to be used for ACF combat, so its support is minimal at best
+Make sure all your collisions are convex, this chip can handle up to 10 convex models, by default, as a single prop
+To make sure you dont use extra server resources by checking for ACF prop health make this checkForACFHealth false
+Just beware that if that object is removed by ACF damage(and maybe others?) an error.mdl will appear
+If you dont want that to happen just enable that and set the acfThresholdHealth to what health it should remove before acf itself removes
+It might still happen if the damage is higher than it can handle in a single shot
+YOU CAN set ACF armor by adjusting its weight / thickness setting, but since its was never meant to be used like this, ductility and different material
+types is not something that can be set, youll have to live with that
+
+############################################################################################################################################################
+
+[3] If you choose to not use parent, this chip will use welds, nocollides and inertia for collisions
+To make it stay in place and be stable, it will weld and nocollide between each CUSTOM PROP (not convex model) and the base prop
+It will nocollide with the WheelsF and WheelsB array as well, but not weld
+Try to keep the convex models up to 10 for good practice, unless the server has a higher value, if so then you will need to edit
+A small part of the chip ( local threshold = 10 ) to make sure everything can be in a single prop
+DEFAULT FOR SERVERS IS 10!
+
+############################################################################################################################################################
+
+[4] Of course since it creates physical props its own set of issues can arise, like weight distribution, inertia and so on,
+specially when there is more than a single custom prop
+Apparently the mesh name(in the .obj data) influences what will be part of which custom prop,
+Like so: cube.010 and cube.011, cube.011 will be part of another custom prop
+Havent fully tested this though, so take with a grain of salt
+
+############################################################################################################################################################
+
+[5] If your vehicle is too long you might need to separate it in parts for more stability
+like so:
+front, middle, rear collision meshes (.OBJs)
+
+############################################################################################################################################################
+
+[6] You need some 3D modelling knowledge to fully use this
+Refer here to some info:
+
+https://developer.valvesoftware.com/wiki/Collision_mesh
+https://en.wikipedia.org/wiki/Convex_set
+
+Some stuff dont apply here though
+Like the shade smooth
+
+############################################################################################################################################################
+
+[7] ISSUES!!!
+
+1) Even if the props are made to not be duped, the constraints remain
+Whenever spawned by duping, it will error those constraints
+
+2) No two vertices can have a distance less than 0.5 or something similar when spawning
+
+3) Saggy collision mesh, specially with longer vehicles
+
+4) Errors spawn when using with ACF damage
+
+5) Errors when spawning using individual col meshes option or overall fail to spawn
+
+6) Failed to create bath X
+
+7) My ACF props arent setting to the correct thickness!!
+
+8) Its eating my FPS!!!!
+
+############################################################################################################################################################
+
+[8] FIXES / NOTES!!
+
+1) You use the !sfdel command before duping, this will remove ALL the constraints and custom props made by the chip
+Then use the !sfres to reset the chip and respawn those custom props again
+YOU MUST BE LOOKING at one of the custom props, base, or wheels!
+
+2) Try merging vertices little by little until it stops erroring, or make it thicker
+thats a starfall thing and or server setting?, cant do much about that
+    
+3) Thats source for you, try splitting it into parts,
+even if your vehicle is small you might need to do that to retain rigity,
+play with weight and inertia, might help
+
+4) Refer to note [2]
+
+5) Add some delay to spawning, seens to be some hard limit on the delay you can spawn things(maybe)
+
+6) Most likely you hit the custom prop limit (maybe?), thats an server issue, try reducing the number of individual meshes, ie, side plates in a single .obj
+
+7) Seens to happen mostly with smaller meshes, individual single mesh ones as well, but not always, try setting the thickness higher so that it matches with
+the ACF armor tool
+
+8) Seens the more custom props it has the more it will eat your fps, cant do much about that, try optmizing your stuff to use less props as possible
+This isnt some magical do it all chip, youll have to do your part as well
+    
+9) If you want more props or more props per second to spawn before erroring, ask your server operators to change these:
+
+sf_http_requests_max to something like like 10, default 3
+sf_props_burstmax to something like like 20, default 4
+sf_props_burstrate to something like like 20, default 4
+
+That way you can spawn as fast as normal props
+############################################################################################################################################################
+
+
+[9] Explaining of each possible config
+
+    {
+        url = "", ########################################### URL for the .Obj file to load the collisions from
+        ColorAndAlpha = Color(255, 255, 255, GlobalAlpha), ## Self Explanatory
+        offsetPos = Vector(0, 0, 0), ######################## Offset from the Base / chip(if base not linked) entity
+        offsetAngle = Angle(0, 0, 0), ####################### Same as above but for angles
+        inertia = Vector(10, 10, 10), ####################### Inertia values, can affect rigidity
+        propWeight = 1, ##################################### Self Explanatory
+        thickness = 0, ###################################### ACF prop thickness
+        ductility = 0, ###################################### ACF armor ductility (ACE Ver 502 and higher)
+        armorType = "RHA", ################################## ACF Armor type, must use correct ID (ACE Ver 502 and higher)
+        useParent = false, ################################## Whether the object will use parent or not, if parent it will NOT retain collisions, mostly useful for ACF combat stuff (maybe)
+        enableGravity = false, ############################## Self Explanatory
+        enableMotion = false, ############################### Frozen when spawned
+        enableDrag = false, ################################# Self Explanatory
+        useCustomParentEnt = true, ########################## Use the parent entity instead of the base, for parenting, it will still use the base for position and whatnot however
+        acfThresholdHealth = 5, ############################# Health threshold for ACF, removes prop when health is below this, fixes error.mdl when destroyed, don't set too low or high?
+        checkForACFHealth = false, ########################## Enable or disable ACF health checking
+        weldWithOtherEnts = true, ########################### Will it weld with other props from the meshConfig table?
+        nocollideWithOtherEnts = true, ###################### Will it nocollide with other props from the meshConfig table?
+        linearDamping = 0, ################################## Same as speed damping
+        rotDamping = 0, ##################################### Same as rotation damping
+        buoyancyRatio = 0, ################################## Self Explanatory
+        physMaterial = "metalvehicle" ####################### Self Explanatory
+        allowNocollideWithFWheels = true, ################### Should the prop collide with the front wheels?
+        allowNocollideWithBWheels = true, ################### Should the prop collide with the back wheels?
+        allowIndividualColMeshes = false, ################### When true, each convex mesh becomes its own prop
+    },
+    
+    
+[10] Armor Types IDs
+
+    Alum - Aluminum
+    CHA - Cast homogenous armor
+    Cer - Ceramic
+    DU - Depleted Uranium
+    ERA - Explosive Reactive Armor
+    RHA - Rolled homogenous armor
+    Rub - Rubber
+    Texto - Textolite
+    Ti - Titanium
+
+    
+]]--
+
+
+-- Execute the core file to ensure the global table is available
+dofile("mesh_loaders_new/custom_mesh_collision_core.txt")
+
+if SERVER then
+    local config = {}
+    
+    -- Global Settings
+    config.GlobalAlpha = 255 --What alpha should the props be when finished spawning?
+    config.checkVertDistance = true  -- Global enable/disable vertex distance checking
+    config.vertThreshold = 0.5      -- Global minimum allowed distance between vertices, devault for most servers should be 0.5
+    config.simplifiedVertDebug = true  -- Global vertex error simplified debug message toggle
+    config.printConvexNumber = false --Print number of convex meshes per custom prop
+    config.printACFremoval = false --Prints removal of ACF props, if health enabled
+    config.PrintACFVersionError = false --If you have more than one chip, disable this in them
+    
+    -- Processing Settings
+    config.allowSimultaneousProcess = true  -- Default to false for safety
+    config.maxSimultaneousHTTPRequests = 10   -- Maximum number of simultaneous HTTP requests
+    config.spawnDelay = 0.5 -- Delay between batches in seconds
+    config.printInteractionsForEachProp = false  -- Global toggle for interaction message behavior
+    
+    config.setAlphaWhenProcessing = true  -- Global toggle for processing alpha visibility
+    config.processingAlpha = 255          -- Alpha value during processing
+    config.debugCompletion = false      -- Toggle for completion debugging
+    
+    -- Mesh Configurations
+    local meshConfigs = {
+
+    {
+        url = "https://raw.githubusercontent.com/nokillnando/gt2cars/main/Honda/S2000/s2000col.obj", --Obj file
+        ColorAndAlpha = Color(255,255, 255, GlobalAlpha),
+        offsetAngle = Vector(0, 90, 90),
+        offsetPos = Vector(0, 0, 5),
+        inertia = Vector(50, 50, 50),
+        propWeight = 100,
+        weldWithOtherEnts = true,
+        nocollideWithOtherEnts = true,
+
+        physMaterial = "metalvehicle",
+        allowNocollideWithFWheels = true,
+        allowNocollideWithBWheels = true
+    },
+    }
+
+    local function getConfigWithDefaults(meshConfig)
+        local defaults = {
+            url = "", -- This must be provided
+            ColorAndAlpha = Color(255, 255, 255, config.GlobalAlpha or 255),
+            offsetPos = Vector(0, 0, 20),
+            offsetAngle = Angle(0, 0, 0),
+            inertia = Vector(10, 10, 10),
+            propWeight = 1,
+            thickness = 0,
+            ductility = 0,
+            armorType = "RHA",
+            useParent = false,
+            enableGravity = true,
+            enableMotion = false,
+            enableDrag = false,
+            useCustomParentEnt = false,
+            acfThresholdHealth = 5,
+            checkForACFHealth = true,
+            weldWithOtherEnts = false,
+            nocollideWithOtherEnts = false,
+            linearDamping = 0,
+            rotDamping = 0,
+            buoyancyRatio = 0,
+            physMaterial = "default",
+            allowNocollideWithFWheels = false,
+            allowNocollideWithBWheels = false,
+            allowIndividualColMeshes = false
+        }
+        
+        -- Check if config is provided
+        if not meshConfig then return defaults end
+        
+        -- Create a new table with default values
+        local finalConfig = table.copy(defaults)
+        
+        -- Override defaults with provided values
+        for k, v in pairs(meshConfig) do
+            finalConfig[k] = v
+        end
+        
+        return finalConfig
+    end
+
+    -- Process meshes with defaults
+    config.meshConfigs = {}
+    for i, meshConfig in ipairs(meshConfigs) do
+        config.meshConfigs[i] = getConfigWithDefaults(meshConfig)
+    end
+    
+    -- Initialize the core
+    if _G.CustomMeshCollisionCore then
+        _G.CustomMeshCollisionCore.initServer(config)
+    else
+        print("Error: CustomMeshCollisionCore not loaded!")
+    end
+
+else -- CLIENT
+    local AllowCheckVersion = true
+
+    if _G.CustomMeshCollisionCore then
+        _G.CustomMeshCollisionCore.initClient({
+            AllowCheckVersion = AllowCheckVersion
+        })
+    end
+end

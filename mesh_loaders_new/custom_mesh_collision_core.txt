@@ -1,0 +1,1042 @@
+--@name Custom Mesh Collision Core
+--@author [C17] Red Fox
+--@shared
+
+local Core = {}
+_G.CustomMeshCollisionCore = Core
+
+local Version = "1.7"
+
+local activeConfig = {}
+local Props = {}
+local spawnQueue = {}
+local totalPropsToSpawn = 0
+local totalPropsSpawned = 0
+local configsProcessed = 0
+local completionHandled = false
+local isProcessing = false
+local entityHealthTable = {}
+local SF_CREATED_CONSTRAINTS = {}
+local propTable = {}
+local objects = {}
+local allConvexes = {}
+local meshCoroutines = {}
+local hasNetworkedProps = false
+
+if SERVER then
+
+
+
+    -- Function to extract filename from URL
+    local function getObjNameFromURL(url)
+        local parts = string.split(url, "/")
+        local lastPart = parts[#parts]
+        if not lastPart then return "unknown" end
+        
+        -- Remove URL parameters and .obj extension
+        local filename = string.split(lastPart, "?")[1]
+        filename = string.gsub(filename, "%.obj$", "")
+        
+        return filename or "unknown"
+    end
+
+    local function calculateACFArea(ent)
+        local physObj = ent:getPhysicsObject()
+        if physObj:isValid() then        
+            return (physObj:getSurfaceArea() * 2.70945)    --trial and error, its close enough to actual acf final weight, without ductility   
+        end
+        return 1 -- Fallback value if physObj is invalid
+    end
+
+    -- Function to calculate weight based on thickness and area
+    local function calculateWeightFromThickness(area, thickness)
+        local weight = area * (1 + 0) ^ 0.5 * thickness * 0.00078 * 1.25 -- Convert to kg
+        return weight
+    end
+
+    local function checkVertexDistances(vertices, threshold)
+        local failures = {}
+        for i = 1, #vertices do
+            for j = i + 1, #vertices do
+                local dist = vertices[i]:getDistance(vertices[j])
+                if dist < threshold then
+                    table.insert(failures, {vertex1 = i, vertex2 = j, distance = dist})
+                end
+            end
+        end
+        return failures
+    end
+
+    -- Function to parse .obj file data
+    local function parseObjFile(data)
+        local lines = data:split("\n")
+        local currentObject = nil
+        objects = {}  -- Reset objects for each configuration
+        
+        for _, line in ipairs(lines) do
+            local parts = line:split(" ")
+            local prefix = parts[1]
+            
+            if prefix == "o" then
+                -- New object
+                currentObject = { 
+                    name = parts[2] or "unnamed_object", -- Store object name
+                    vertices = {} 
+                }
+                table.insert(objects, currentObject)
+            elseif prefix == "v" and currentObject then
+                -- Vertex
+                local x = tonumber(parts[2])
+                local y = tonumber(parts[3])
+                local z = tonumber(parts[4])
+                table.insert(currentObject.vertices, Vector(x, y, z))
+            end
+        end
+    end
+
+    local function networkPropsToClients()
+        -- Only network once and only when complete
+        if hasNetworkedProps or not completionHandled then 
+            return false 
+        end
+
+        local propsToNetwork = Props or {}
+        
+        if #propsToNetwork == 0 then 
+            return false
+        end
+        
+        -- Network props
+        net.start("StarfallCustomPropsNetwork")
+        net.writeUInt(#propsToNetwork, 16)
+        
+        for _, prop in ipairs(propsToNetwork) do
+            net.writeEntity(prop)
+        end
+        net.send()
+        
+        if activeConfig.debugCompletion then
+            print(string.format("[SF Props] Networked %d props to clients", #propsToNetwork))
+        end
+        
+        hasNetworkedProps = true
+        return true
+    end
+
+    local function handleCompletion()
+        -- If already handled, don't do it again
+        if completionHandled then return end
+        
+        -- More thorough completion check
+        if configsProcessed < #activeConfig.meshConfigs then
+            if activeConfig.debugCompletion then
+                print(string.format("Completion check: waiting for configs - %d/%d", 
+                    configsProcessed, #activeConfig.meshConfigs))
+            end
+            return
+        end
+        
+        if totalPropsSpawned < totalPropsToSpawn then
+            if activeConfig.debugCompletion then
+                print(string.format("Completion check: waiting for props - %d/%d", 
+                    totalPropsSpawned, totalPropsToSpawn))
+            end
+            return
+        end
+        
+        if http.getActiveRequests() > 0 then
+            if activeConfig.debugCompletion then
+                print(string.format("Completion check: waiting for HTTP - %d active", 
+                    http.getActiveRequests()))
+            end
+            return
+        end
+        
+        -- Set flag to prevent multiple executions
+        completionHandled = true
+        
+        --print("Mesh processing completed successfully!")
+        
+        -- Use a timer to ensure everything has finished processing
+        timer.simple(activeConfig.spawnDelay * 2, function()
+            -- Handle alpha changes
+            if activeConfig.setAlphaWhenProcessing then
+                for _, propData in ipairs(propTable) do
+                    if propData.entity and propData.entity:isValid() then
+                        local finalColor = Color(
+                            propData.originalColor.r,
+                            propData.originalColor.g,
+                            propData.originalColor.b,
+                            activeConfig.GlobalAlpha
+                        )
+                        propData.entity:setColor(finalColor)
+                    end
+                end
+            end
+            
+            -- Handle interactions message
+            if not activeConfig.printInteractionsForEachProp then
+                print("All prop interactions handled.")
+            end
+            
+            -- Update wire ports
+            if wire.ports then
+                wire.ports.Complete = 1
+                wire.ports.Props = Props
+            end
+            
+            -- Final network update
+            networkPropsToClients()
+            
+            -- Clear the processing flag
+            isProcessing = false
+        end)
+    end
+    
+    local function handlePropInteractions(wheelsF, wheelsB)
+        local nonParentProps = {}
+        
+        -- First, collect all props that don't use parent
+        for _, prop in ipairs(propTable) do
+            if prop and prop.entity and prop.entity:isValid() and not prop.config.useParent then
+                table.insert(nonParentProps, prop)
+            end
+        end
+        
+        -- Apply constraints between non-parent props
+        for i = 1, #nonParentProps do
+            for j = i + 1, #nonParentProps do
+                local prop1 = nonParentProps[i]
+                local prop2 = nonParentProps[j]
+                
+                if prop1.config.weldWithOtherEnts and prop2.config.weldWithOtherEnts then
+                    constraint.weld(prop1.entity, prop2.entity, 0, 0, 0, true)
+                end
+                
+                if prop1.config.nocollideWithOtherEnts and prop2.config.nocollideWithOtherEnts then
+                    constraint.nocollide(prop1.entity, prop2.entity, 0, 0)
+                end
+            end
+        end
+        
+        -- Apply nocollide with front wheels for non-parent props
+        if wheelsF then
+            for _, prop in ipairs(nonParentProps) do
+                if prop.config.allowNocollideWithFWheels then
+                    for _, wheel in ipairs(wheelsF) do
+                        if wheel and wheel:isValid() then
+                            constraint.nocollide(prop.entity, wheel, 0, 0)
+                        end
+                    end
+                end
+            end
+        end
+        
+        -- Apply nocollide with back wheels for non-parent props
+        if wheelsB then
+            for _, prop in ipairs(nonParentProps) do
+                if prop.config.allowNocollideWithBWheels then
+                    for _, wheel in ipairs(wheelsB) do
+                        if wheel and wheel:isValid() then
+                            constraint.nocollide(prop.entity, wheel, 0, 0)
+                        end
+                    end
+                end
+            end
+        end
+        
+        -- Only print if printInteractionsForEachProp is true
+        if activeConfig.printInteractionsForEachProp then
+            print("All prop interactions handled.")
+        end
+    end
+
+    local function processEntities(ent, config, base, parent)
+        if not ent or not ent:isValid() then return end
+        
+        local hullSizeLimit = 2048 
+        
+        -- Detailed logging for hull size
+        local hullSize = ent:obbSize()
+        local maxDimension = math.max(hullSize.x, hullSize.y, hullSize.z)
+        
+        if maxDimension > hullSizeLimit then
+            print(string.format(
+                "WARNING: Prop hull size %.2f exceeds limit of %d. Prop may not spawn correctly. Dimensions: %s", 
+                maxDimension, hullSizeLimit, tostring(hullSize)
+            ))
+        end
+        
+        -- Rest of the existing processing logic
+        if config.useParent then
+            if config.useCustomParentEnt and parent and parent:isValid() then
+                ent:setParent(parent)
+            else
+                ent:setParent(base)
+            end
+        else
+            constraint.weld(ent, base, 0, 0, 0, true)
+        end
+        
+        local physObj = ent:getPhysicsObject()
+        local area = calculateACFArea(ent)
+            
+        local weight = 1 -- Default weight
+
+        if acf and config.thickness and config.thickness > 0 then
+            if type(acf.getVersion) == "function" then
+                if acf.getVersion() >= 502 then
+                    -- ACF 502+ detected, use aceSetArmorProperties
+                    ent:aceSetArmorProperties(config.thickness, config.ductility, config.armorType)
+                    weight = ent:getMass() -- Preserve existing mass
+                else
+                    -- Print warning only once if ACF version is outdated
+                    if not acfVersionWarned then
+                        if activeConfig.PrintACFVersionError then
+                            print("[WARNING] ACE version is below 502. Using legacy armor calculation. Might result in incorrect armor values")
+                        end
+                        acfVersionWarned = true
+                    end
+                    weight = calculateWeightFromThickness(area, config.thickness) --  Always set weight
+                end
+            else
+                -- Print warning only once if acf.getVersion is missing
+                if not acfCheckWarned then
+                        if activeConfig.PrintACFVersionError then
+                            print("[WARNING] Incorrect ACF version or using ACF3. Using legacy armor calculation. Might result in incorrect armor values")
+                        end
+                    acfCheckWarned = true
+                end
+                weight = calculateWeightFromThickness(area, config.thickness) --  Always set weight
+            end
+        elseif config.propWeight then
+            -- Use propWeight if thickness isn't set
+            weight = config.propWeight
+        end
+
+        --  Ensure mass is always set
+        ent:setMass(weight)
+
+        ent:setInertia(config.inertia)
+        ent:enableMotion(config.enableMotion)
+        ent:enableGravity(config.enableGravity)
+        ent:enableDrag(config.enableDrag)
+        
+        -- Set initial processing alpha if enabled
+        if activeConfig.setAlphaWhenProcessing then
+            local processingColor = Color(
+                config.ColorAndAlpha.r,
+                config.ColorAndAlpha.g,
+                config.ColorAndAlpha.b,
+                activeConfig.processingAlpha
+            )
+            ent:setColor(processingColor)
+        else
+            ent:setColor(config.ColorAndAlpha)
+        end
+        
+        ent:doNotDuplicate()
+        
+        physObj:setMaterial(config.physMaterial)
+        physObj:setDamping(config.linearDamping, config.rotDamping)
+        physObj:setBuoyancyRatio(config.buoyancyRatio)
+        
+        table.insert(propTable, {
+            entity = ent, 
+            config = config,
+            originalColor = config.ColorAndAlpha  -- Store original color for later
+        })
+        
+        table.insert(Props, ent)
+        if config.checkForACFHealth then
+            entityHealthTable[ent] = config.acfThresholdHealth
+        end
+        
+       totalPropsSpawned = totalPropsSpawned + 1
+        if activeConfig.debugCompletion then
+            print(string.format("Prop spawned: %d/%d", totalPropsSpawned, totalPropsToSpawn))
+        end
+    end
+    
+    local function attemptCreateProp(convexBatch, objName, config, base, parent)
+        -- Ensure we can spawn before trying
+        if not prop.canSpawn() then
+            print("Prop spawn blocked, delaying...")
+            return nil
+        end
+        
+        local success, ent = pcall(function()
+            return prop.createCustom(
+                base:localToWorld(config.offsetPos),
+                base:localToWorldAngles(config.offsetAngle),
+                convexBatch,
+                true
+            )
+        end)
+        
+        if success and ent and ent:isValid() then
+            -- table.insert(Props, ent) -- Done in processEntities
+            return ent
+        else
+            print(string.format("Failed to create prop for object: \"%s\"", objName))
+            return nil
+        end
+    end
+
+    local function createCustomProps(config)
+        -- Config is already processed with defaults from the config file
+        
+         if not config.url or config.url == "" then
+            error("URL is required in mesh configuration")
+            return
+        end
+        
+        -- Get the base entity from wire ports
+        local base = wire.ports.Base
+        local parent = wire.ports.Parent
+    
+        -- Fallback to chip if base entity is not valid
+        if not base or not base:isValid() then
+            base = chip()
+        end
+        
+        local objName = getObjNameFromURL(config.url)
+    
+        -- Collect convexes from all objects
+        local function collectConvexes()
+            allConvexes = {}  -- Reset allConvexes for each configuration
+            local failedMeshes = {}  -- Track failed meshes
+            
+            for _, obj in ipairs(objects) do
+                if #obj.vertices > 0 then
+                    -- Check vertex distances if enabled globally
+                    if activeConfig.checkVertDistance then
+                        local failures = checkVertexDistances(obj.vertices, activeConfig.vertThreshold)
+                        if #failures > 0 then
+                            table.insert(failedMeshes, obj.name)
+                            continue -- Skip this mesh
+                        end
+                    end
+                    
+                    -- Create a convex part from the vertices
+                    local convex = obj.vertices
+                    table.insert(allConvexes, convex)
+                end
+            end
+    
+            -- Output failed meshes in a single line if any exist
+            if #failedMeshes > 0 then
+                if activeConfig.simplifiedVertDebug then
+                    print(string.format("\n%s - Mesh(es) \"%s\" has failed some vertex distance checks, skipping mesh(es)", 
+                        objName, 
+                        table.concat(failedMeshes, "\", \"")
+                    ))
+                else
+                    print(string.format("\n%s - The following meshes failed vertex distance checks (threshold: %.2f):", 
+                        objName, 
+                        activeConfig.vertThreshold
+                    ))
+                    print("  - " .. table.concat(failedMeshes, "\n  - "))
+                end
+            end
+            
+            if activeConfig.printConvexNumber then
+                print("Total convexes collected: " .. #allConvexes)
+            end
+        end
+        
+        -- Modify the createPropsWithThreshold function to handle individual convex meshes
+        local function createPropsWithThreshold()
+            local threshold = 10  -- Number of convexes per prop
+            local hullSizeLimit = 2048 -- Maximum hull size limit
+            
+            local function splitConvexesIntoTables(allConvexes)
+                -- Reset the count when starting a new mesh
+                if configsProcessed == 0 then
+                    totalPropsToSpawn = 0
+                    totalPropsSpawned = 0
+                end
+                
+                if not allConvexes or #allConvexes == 0 then
+                    print("Warning: No convexes to split into tables")
+                    totalPropsToSpawn = totalPropsToSpawn + 0  -- No additional props to spawn
+                    return {}
+                end
+                
+                -- If allowIndividualColMeshes is true, convert each convex into its own separate batch
+                if config.allowIndividualColMeshes then
+                    local individualConvexTables = {}
+                    for _, convex in ipairs(allConvexes) do
+                        table.insert(individualConvexTables, {convex})
+                    end
+                    totalPropsToSpawn = totalPropsToSpawn + #individualConvexTables
+                    return individualConvexTables
+                end
+                
+                local convexTables = {}
+                
+               -- If total number of convexes is 10 or less, return a single table
+                if #allConvexes <= 10 then
+                    totalPropsToSpawn = totalPropsToSpawn + 1
+                    return {allConvexes}
+                end
+                
+                local currentTable = {}
+                local currentTableVertexCount = 0
+                local batchCount = 0
+                
+                for _, convex in ipairs(allConvexes) do
+                    -- Check if adding this convex would exceed the threshold
+                    if #currentTable >= 10 or currentTableVertexCount + #convex > 256 then
+                        table.insert(convexTables, currentTable)
+                        batchCount = batchCount + 1
+                        currentTable = {}
+                        currentTableVertexCount = 0
+                    end
+                    
+                    table.insert(currentTable, convex)
+                    currentTableVertexCount = currentTableVertexCount + #convex
+                end
+                
+                -- Add the last table if not empty
+                if #currentTable > 0 then
+                    table.insert(convexTables, currentTable)
+                    batchCount = batchCount + 1
+                end
+                
+                totalPropsToSpawn = totalPropsToSpawn + batchCount
+                return convexTables
+            end
+    
+            -- Organize convexes into multiple tables
+            local convexTableBatches = splitConvexesIntoTables(allConvexes)
+            
+            -- Sequential spawning of batches with spawn rate limiting
+            local spawnQueue = {}
+            
+                -- Add all batches to spawn queue
+            for i, batch in ipairs(convexTableBatches) do
+                table.insert(spawnQueue, batch)
+            end
+            
+            -- Add this near the other global variables
+            local maxRetries = 5
+            local retryCounters = {}
+            
+            local function spawnNextBatch()
+                -- Check if we can spawn more props
+                if not prop.canSpawn() then
+                    print(string.format("Prop limit reached, retrying in %.2f seconds...", activeConfig.spawnDelay * 2))
+                    
+                    -- Try again later with increased delay
+                    timer.simple(activeConfig.spawnDelay * 2, spawnNextBatch)
+                    return
+                end
+                
+                -- Update spawn rate dynamically
+                local propSpawnRate = prop.spawnRate()
+                local dynamicSpawnDelay = math.max(activeConfig.spawnDelay, 1 / math.max(1, propSpawnRate))
+                
+                if #spawnQueue > 0 then
+                    local currentBatch = table.remove(spawnQueue, 1)
+                    local batchId = tostring(currentBatch) -- Create a unique identifier
+                    
+                    -- Initialize retry counter if it doesn't exist
+                    retryCounters[batchId] = retryCounters[batchId] or 0
+                    
+                    -- Fetch the object name
+                    local objName = getObjNameFromURL(config.url)
+                    
+                    -- Attempt to create the prop
+                    local ent = attemptCreateProp(currentBatch, objName, config, base, parent)
+                    
+                    if ent then
+                        processEntities(ent, config, base, parent)
+                        retryCounters[batchId] = nil -- Clear retry counter on success
+                        
+                        -- Schedule next batch spawn according to spawn rate limit
+                        if #spawnQueue > 0 then
+                            timer.simple(dynamicSpawnDelay, spawnNextBatch)
+                        else
+                            -- Final batch of this mesh, apply interactions
+                            if wire and wire.ports then
+                                handlePropInteractions(wire.ports.WheelsF, wire.ports.WheelsB)
+                            end
+                        end
+                    else
+                        -- Increment retry counter
+                        retryCounters[batchId] = retryCounters[batchId] + 1
+                        
+                        if retryCounters[batchId] < maxRetries then
+                            -- If prop creation fails, requeue it to try later WITH BACKOFF
+                            print(string.format("Failed to create prop for object: \"%s\" - Retry %d/%d", 
+                                objName, retryCounters[batchId], maxRetries))
+                            table.insert(spawnQueue, currentBatch) -- Re-add to queue
+                            
+                            -- Use a longer delay when retrying failed props, increasing with each retry
+                            local retryDelay = dynamicSpawnDelay * (1 + retryCounters[batchId])
+                            timer.simple(retryDelay, spawnNextBatch)
+                        else
+                            print(string.format("Giving up on prop after %d retries for object: \"%s\"", maxRetries, objName))
+                            -- Skip this batch and continue with others
+                            if #spawnQueue > 0 then
+                                timer.simple(dynamicSpawnDelay, spawnNextBatch)
+                            end
+                        end
+                    end
+                end
+            end
+            
+            if #spawnQueue > 0 then
+                spawnNextBatch()
+            else
+                print("No convex batches to spawn")
+            end
+        end
+    
+        -- Collect convexes and create the props
+        collectConvexes()
+        createPropsWithThreshold()
+    end
+
+    local function checkACFPresence()
+        if not acf then
+                if activeConfig.PrintACFVersionError then
+                    print("[ERROR] ACF is not present! Some features will not work.")
+                end
+            return false
+        end
+    
+        if type(acf.getVersion) ~= "function" then
+                if activeConfig.PrintACFVersionError then
+                    print("[WARNING] Using ACF3 or unknown ACF version. Some features might not work as expected.")
+                end
+        elseif acf.getVersion() < 502 then
+                if activeConfig.PrintACFVersionError then
+                    print("[WARNING] ACF version is below 502. Some armor functions might not work as expected.")
+                end
+        end
+    
+        return true
+    end
+
+    local isACFPresent = checkACFPresence()
+    
+    local function monitorACFHealth()
+        if not isACFPresent then
+            return
+        end
+    
+        for ent, threshold in pairs(entityHealthTable) do
+            if ent:isValid() then
+                local health = ent:acfPropHealth()
+                if health and health < threshold then
+                    if activeConfig.printACFremoval then
+                        print("Removing entity due to low ACF health: " .. tostring(ent))
+                    end
+                    ent:remove()
+                    entityHealthTable[ent] = nil  -- Remove from the table
+                end
+            else
+                entityHealthTable[ent] = nil  -- Remove from the table if entity is invalid
+            end
+        end
+    
+        -- If no entities need health monitoring, remove the Think hook
+        if next(entityHealthTable) == nil then
+            hook.remove("Think", "ACFHealthMonitor")
+        end
+    end
+
+    local function removeCreatedEntitiesAndConstraints()
+        for _, constraint in ipairs(SF_CREATED_CONSTRAINTS) do
+            if constraint and constraint:isValid() then
+                constraint:remove()
+            end
+        end
+        SF_CREATED_CONSTRAINTS = {}
+    
+        for _, propData in ipairs(propTable) do
+            if propData.entity and propData.entity:isValid() then
+                propData.entity:remove()
+            end
+        end
+        propTable = {}
+        entityHealthTable = {}
+        configsProcessed = 0
+    end
+
+    local function isLookingAtRelevantProp(ply)
+        local trace = ply:getEyeTrace()
+        if not trace.Entity or not trace.Entity:isValid() then return false end
+    
+        -- Check if looking at a prop in propTable
+        for _, propData in ipairs(propTable) do
+            if propData.entity == trace.Entity then
+                return true
+            end
+        end
+    
+        -- Check if looking at the base
+        if wire.ports.Base and trace.Entity == wire.ports.Base then
+            return true
+        end
+    
+        -- Check if looking at any wheel
+        if wire.ports.WheelsF then
+            for _, wheel in ipairs(wire.ports.WheelsF) do
+                if trace.Entity == wheel then
+                    return true
+                end
+            end
+        end
+        if wire.ports.WheelsB then
+            for _, wheel in ipairs(wire.ports.WheelsB) do
+                if trace.Entity == wheel then
+                    return true
+                end
+            end
+        end
+    
+        return false
+    end
+    
+    local function processMeshConfig(config)
+        return coroutine.create(function()
+            http.get(config.url, function(body, len, headers, code)
+                if code == 200 then
+                    parseObjFile(body)
+                    createCustomProps(config)
+                    
+                    configsProcessed = configsProcessed + 1
+                    
+                    -- Check if all configurations have been processed
+                    if configsProcessed == #activeConfig.meshConfigs then
+                       handlePropInteractions(wire.ports.WheelsF, wire.ports.WheelsB)
+                    end
+                else
+                    print("Failed to download .obj file: HTTP error " .. code)
+                    configsProcessed = configsProcessed + 1
+                end
+            end, function(err)
+                print("Failed to download .obj file: " .. err)
+                configsProcessed = configsProcessed + 1
+            end)
+            coroutine.yield()
+        end)
+    end
+    
+    local function startProcessing()
+        if isProcessing then return end
+        isProcessing = true
+        configsProcessed = 0
+        totalPropsToSpawn = 0
+        totalPropsSpawned = 0
+        completionHandled = false  -- Reset completion flag
+        
+        -- Safety timer with improved logging
+        timer.create("safetyCompletion", 30, 1, function()
+            if not completionHandled then
+                print("WARNING: Safety timer triggered. Forcing completion check...")
+                print(string.format("Status: %d/%d configs processed, %d/%d props spawned, %d HTTP requests active", 
+                    configsProcessed, #activeConfig.meshConfigs, totalPropsSpawned, totalPropsToSpawn, http.getActiveRequests()))
+                
+                -- If we've processed all configs and spawned all props, force completion
+                if configsProcessed >= #activeConfig.meshConfigs and totalPropsSpawned >= totalPropsToSpawn then
+                    -- Force completion
+                    completionHandled = true
+                    print("Forcing completion process...")
+                    
+                    -- Update wire ports
+                    wire.ports.Complete = 1
+                    wire.ports.Props = Props
+                    
+                    -- Final network update
+                    networkPropsToClients()
+                    
+                    -- Clear the processing flag
+                    isProcessing = false
+                else
+                    -- Extend the safety timer
+                    print("Extending safety timer by 15 seconds...")
+                    timer.create("safetyCompletion", 15, 1, function()
+                        -- Force completion regardless of state
+                        completionHandled = true
+                        wire.ports.Complete = 1
+                        wire.ports.Props = Props
+                        networkPropsToClients()
+                        isProcessing = false
+                        print("Final forced completion due to timeout")
+                    end)
+                end
+            end
+        end)
+        
+        if #activeConfig.meshConfigs == 0 then
+            print("No mesh configurations provided")
+            isProcessing = false
+            return
+        end
+    
+        -- Create request queue for all meshes
+        local requestQueue = {}
+        for i, config in ipairs(activeConfig.meshConfigs) do
+            table.insert(requestQueue, config)
+        end
+        
+        -- Determine maximum simultaneous HTTP requests
+        local maxRequests = math.min(activeConfig.maxSimultaneousHTTPRequests, http.getMaximumRequests())
+        
+        -- Process HTTP request queue
+        local function processRequestQueue()
+            local activeRequests = http.getActiveRequests()
+            
+            while #requestQueue > 0 and activeRequests < maxRequests do
+                local config = table.remove(requestQueue, 1)
+                
+                http.get(config.url, function(body, len, headers, code)
+                    if code == 200 then
+                        parseObjFile(body)
+                        createCustomProps(config)
+                        
+                        configsProcessed = configsProcessed + 1
+                        if activeConfig.debugCompletion then
+                            print(string.format("Mesh %d/%d processed", configsProcessed, #activeConfig.meshConfigs))
+                        end
+                    else
+                        print("Failed to download .obj file: HTTP error " .. code)
+                        configsProcessed = configsProcessed + 1
+                    end
+                    
+                    processRequestQueue()  -- Process next in queue when this one finishes
+                    --configsProcessed = configsProcessed + 1
+                    if activeConfig.debugCompletion then
+                        print(string.format("Mesh %d/%d processed", configsProcessed, #activeConfig.meshConfigs))
+                    end
+                end, function(err)
+                    print("Failed to download .obj file: " .. err)
+                    configsProcessed = configsProcessed + 1
+                    
+                    processRequestQueue()  -- Process next in queue when this one errors
+                   --configsProcessed = configsProcessed + 1
+                    if activeConfig.debugCompletion then
+                        print(string.format("Mesh %d/%d processed", configsProcessed, #activeConfig.meshConfigs))
+                    end
+                end)
+                
+                activeRequests = activeRequests + 1
+            end
+            
+                        -- Check if we're done
+            if #requestQueue == 0 and http.getActiveRequests() == 0 and configsProcessed == #activeConfig.meshConfigs then
+                timer.remove("processHTTPQueue")
+                -- Don't call handleCompletion directly
+            end
+            
+            if wire.ports then
+                wire.ports.Props = Props
+            end
+        end
+        
+        -- Start processing the queue
+        processRequestQueue()
+        
+        -- Set up a timer to periodically check the queue
+        timer.create("processHTTPQueue", 0.1, 0, function()
+            processRequestQueue()
+            
+            -- Remove timer if all processing is complete
+            if #requestQueue == 0 and http.getActiveRequests() == 0 and configsProcessed == #activeConfig.meshConfigs then
+                timer.remove("processHTTPQueue")
+            end
+        end)
+        
+        timer.create("CheckMeshCompletion", 1, 0, function()
+            handleCompletion()
+        end)
+        
+    end
+
+    local function resetChipAndRespawn()
+        -- Stop all timers
+        timer.remove("processMeshCoroutines")
+        timer.remove("processHTTPQueue")
+        timer.remove("safetyCompletion")
+        timer.remove("CheckMeshCompletion")
+        
+        -- Reset all state flags
+        isProcessing = false
+        configsProcessed = 0
+        totalPropsToSpawn = 0
+        totalPropsSpawned = 0
+        completionHandled = false
+        
+        -- Clear arrays and objects
+        spawnQueue = {}
+        meshCoroutines = {}
+        allConvexes = {}
+        objects = {}
+        
+        -- Remove existing entities and constraints
+        removeCreatedEntitiesAndConstraints()
+        
+        -- Reset Props array and Wire outputs
+        Props = {}
+        if wire.ports then
+            wire.ports.Props = Props
+            wire.ports.Complete = 0
+        end
+        
+        -- Force network update
+        hasNetworkedProps = false
+        
+        print("Mesh configuration reset...")
+        
+        -- Start processing again after a short delay
+        timer.simple(1, function()
+            print("Starting mesh processing...")
+            startProcessing()
+        end)
+    end
+    
+    function Core.initServer(config)
+        activeConfig = config
+        
+        wire.adjustPorts({
+            Base = "entity",
+            WheelsF = "array",
+            WheelsB = "array",
+            Parent = "entity",
+        },{Props = "array",
+        Complete = "number",})
+        
+        wire.ports.Complete = 0
+        
+        -- Hooks
+        hook.add("Think", "ACFHealthMonitor", function()
+            if next(entityHealthTable) ~= nil then
+                monitorACFHealth()
+            end
+        end)
+        
+        hook.add("Think", "CheckMeshCompletion", function()
+            if isProcessing and not completionHandled then
+                handleCompletion()
+            elseif completionHandled then
+                hook.remove("Think", "CheckMeshCompletion")
+            end
+        end)
+        
+        hook.add("Think", "NetworkCustomPropsOnCompletion", function()
+            if completionHandled then
+                if networkPropsToClients() then
+                    hook.remove("Think", "NetworkCustomPropsOnCompletion")
+                end
+            end
+        end)
+        
+        hook.add("PlayerSay", "SF_MeshConfig_Commands", function(ply, text)
+            if text:lower() == "!sfdel" then
+                if isLookingAtRelevantProp(ply) and ply == owner() then
+                    removeCreatedEntitiesAndConstraints()
+                    print("Mesh configuration entities and constraints removed.")
+                end
+                return ""
+            elseif text:lower() == "!sfres" then
+                if isLookingAtRelevantProp(ply) and ply == owner() then
+                    resetChipAndRespawn()
+                end
+                return ""
+            end
+        end)
+        
+        hook.add("removed", "stopStreams", function()
+            if net.isStreaming() then
+                net.cancelStream()
+            end
+        end)
+        
+        startProcessing()
+    end
+
+else -- CLIENT
+
+    local function checkVersionOnSpawn(config)
+        if not config.AllowCheckVersion then return end
+
+        local githubURL = "https://raw.github.com/nokillnando/Starfall/refs/heads/main/mesh_loaders_new/custom_mesh_collision_core.txt"
+        local localVersion = Version
+        local maxRetries = 10
+        local W, R, G = Color(255, 255, 255), Color(255, 0, 0), Color(0, 255, 0)
+
+        local function doVersionCheck()
+            if not http.canRequest() then
+                maxRetries = maxRetries - 1
+                if maxRetries <= 0 then return end
+                timer.simple(0.5, doVersionCheck)
+                return
+            end
+
+            http.get(githubURL,
+                function(data)
+                    if not (data and data ~= "") then
+                        print(W, "Custom Mesh Collision Core version check failed - no data received")
+                        return
+                    end
+
+                    local versionStart = data:find('Version = "')
+                    if not versionStart then
+                        print(W, "Custom Mesh Collision Core version check failed - version string not found")
+                        return
+                    end
+
+                    versionStart = versionStart + 11
+                    local versionEnd = data:find('"', versionStart)
+                    if not versionEnd or versionEnd <= versionStart then
+                        print(W, "Custom Mesh Collision Core version check failed - could not parse remote version")
+                        return
+                    end
+
+                    local remoteVersion = data:sub(versionStart, versionEnd - 1)
+                    local remoteParts = string.explode(".", remoteVersion)
+                    local localParts = string.explode(".", localVersion)
+
+                    local remoteMajor = tonumber(remoteParts[1]) or 0
+                    local remoteMinor = tonumber(remoteParts[2]) or 0
+                    local localMajor = tonumber(localParts[1]) or 0
+                    local localMinor = tonumber(localParts[2]) or 0
+
+                    if remoteMajor > localMajor or (remoteMajor == localMajor and remoteMinor > localMinor) then
+                        print(W, "Check config file for updated default variables")
+                        print(W, "Custom Mesh Collision Core Update available! Local: ", G, localVersion, W, " | Remote: ", G, remoteVersion)
+                        print(W, "Check config file for URL")
+                    else
+                        print(W, "Local Custom Mesh Collision Core is up to date or higher than online! Version: ", G, localVersion)
+                    end
+                end,
+                function(err)
+                   print(W, "Custom Mesh Collision Core version check failed - HTTP Error: " .. err)
+                end
+            )
+        end
+        doVersionCheck()
+    end
+
+    function Core.initClient(config)
+        config = config or {}
+        
+         -- Network receive for props
+        net.receive("StarfallCustomPropsNetwork", function()
+            local propCount = net.readUInt(16)
+            
+            for i = 1, propCount do
+                local prop = net.readEntity()
+                if prop and prop:isValid() then
+                    prop:setRenderBounds(Vector(-10), Vector(10))
+                end
+            end
+        end)
+        
+        checkVersionOnSpawn(config)
+    end
+end

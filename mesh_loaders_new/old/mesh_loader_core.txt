@@ -2,9 +2,7 @@
 --@author [C17] Red Fox
 --@shared
 
-local Version = "2.08"
-
---Offset fix??
+local Version = "2.07"
 
 if CLIENT then
 
@@ -15,137 +13,128 @@ if CLIENT then
         return "../data/sf_filedatatemp/" .. owner():getSteamID64(false) .. "/" .. name
     end
 
-    local function asyncDownloadVtf(url, callback)
-        if not url:lower():find("%.vtf") then
-            callback(nil)
+local function asyncDownloadVtf(url, callback)
+    if not url:lower():find("%.vtf") then
+        callback(nil)
+        return
+    end
+
+    local fileName = url:match("([^/]+%.vtf)") or "unnamed.vtf"
+    local tempPath = vtfTempPath(url)
+
+    -- already on disk?
+    if file.existsTemp(fileName) then
+        callback(tempPath)
+        return
+    end
+
+    -- somebody else already downloading it?
+    if vtfDownloads[url] then
+        local tries = 0
+        local poll
+        poll = function()
+            tries = tries + 1
+            if file.existsTemp(fileName) then
+                callback(tempPath)
+            elseif tries < 30 then
+                timer.simple(0.25, poll)
+            else
+                callback(nil)
+            end
+        end
+        timer.simple(0.1, poll)
+        return
+    end
+
+    vtfDownloads[url] = true
+
+    ------------------------------------------------------------------
+    -- NEW: never break the global limit
+    local function safeGet()
+        local active = http.getActiveRequests()
+        local max    = http.getMaximumRequests()
+
+        if active >= max then
+            -- still full  try again later
+            timer.simple(0.25, safeGet)
             return
         end
 
-        local fileName = url:match("([^/]+%.vtf)") or "unnamed.vtf"
-        local tempPath = vtfTempPath(url)
+        -- now we are guaranteed to have a free slot
+        file.deleteTemp(fileName)
 
-        -- already on disk?
-        if file.existsTemp(fileName) then
-            callback(tempPath)
-            return
-        end
-
-        -- somebody else already downloading it?
-        if vtfDownloads[url] then
-            local tries = 0
-            local poll
-            poll = function()
-                tries = tries + 1
-                if file.existsTemp(fileName) then
+        http.get(url,
+            function(data)
+                vtfDownloads[url] = nil
+                if data and #data > 0 then
+                    file.writeTemp(fileName, data)
                     callback(tempPath)
-                elseif tries < 30 then
-                    timer.simple(0.25, poll)
                 else
                     callback(nil)
                 end
+            end,
+            function()
+                vtfDownloads[url] = nil
+                callback(nil)
             end
-            timer.simple(0.1, poll)
-            return
-        end
-
-        vtfDownloads[url] = true
-
-        ------------------------------------------------------------------
-        -- NEW: never break the global limit
-        local function safeGet()
-            local active = http.getActiveRequests()
-            local max    = http.getMaximumRequests()
-
-            if active >= max then
-                -- still full  try again later
-                timer.simple(0.25, safeGet)
-                return
-            end
-
-            -- now we are guaranteed to have a free slot
-            file.deleteTemp(fileName)
-
-            http.get(url,
-                function(data)
-                    vtfDownloads[url] = nil
-                    if data and #data > 0 then
-                        file.writeTemp(fileName, data)
-                        callback(tempPath)
-                    else
-                        callback(nil)
-                    end
-                end,
-                function()
-                    vtfDownloads[url] = nil
-                    callback(nil)
-                end
-            )
-        end
-
-        safeGet()
+        )
     end
 
+    safeGet()
+end
 
-    local downloadQueue = {}
 
-    local function processDownloadQueue()
-        local activeRequests = http.getActiveRequests()
-        local maxRequests = http.getMaximumRequests()
+local downloadQueue = {}
 
-        while activeRequests < maxRequests and #downloadQueue > 0 do
-            local job = table.remove(downloadQueue, 1)
-            asyncDownloadVtf(job.url, job.callback)
-            activeRequests = activeRequests + 1
-        end
+local function processDownloadQueue()
+    local activeRequests = http.getActiveRequests()
+    local maxRequests = http.getMaximumRequests()
 
-        if #downloadQueue > 0 then
-            timer.simple(0.1, processDownloadQueue)
-        end
+    while activeRequests < maxRequests and #downloadQueue > 0 do
+        local job = table.remove(downloadQueue, 1)
+        asyncDownloadVtf(job.url, job.callback)
+        activeRequests = activeRequests + 1
     end
 
-    local vtfQueue = {}
-    local vtfRunning = 0
-
-    local function pumpVtfQueue()
-        local max = http.getMaximumRequests()
-        while vtfRunning < max and #vtfQueue > 0 do
-            local job = table.remove(vtfQueue, 1)
-            vtfRunning = vtfRunning + 1
-            asyncDownloadVtf(job.url, function(path)
-                vtfRunning = vtfRunning - 1
-                if job.callback then job.callback(path) end
-                pumpVtfQueue()               -- may start next
-            end)
-        end
+    if #downloadQueue > 0 then
+        timer.simple(0.1, processDownloadQueue)
     end
+end
 
-    -- drop-in replacement for every place that used queueVtfDownload
-    local function queueVtfDownload(url, callback)
-        table.insert(vtfQueue, { url = url, callback = callback })
-        pumpVtfQueue()
+local vtfQueue = {}
+local vtfRunning = 0
+
+local function pumpVtfQueue()
+    local max = http.getMaximumRequests()
+    while vtfRunning < max and #vtfQueue > 0 do
+        local job = table.remove(vtfQueue, 1)
+        vtfRunning = vtfRunning + 1
+        asyncDownloadVtf(job.url, function(path)
+            vtfRunning = vtfRunning - 1
+            if job.callback then job.callback(path) end
+            pumpVtfQueue()               -- may start next
+        end)
     end
+end
+
+-- drop-in replacement for every place that used queueVtfDownload
+local function queueVtfDownload(url, callback)
+    table.insert(vtfQueue, { url = url, callback = callback })
+    pumpVtfQueue()
+end
 
 
 
 
 
     local base = chip()
-    local activeConfig = {}
-    local spawnedHolograms = {}
+
+    net.start("requestBase")
+    net.send()
 
     net.receive("sendBase", function()
         local ent = net.readEntity()
         base = isValid(ent) and ent or chip()
-
-        if activeConfig.offsetPos and activeConfig.offsetAngle then
-            for i, holo in ipairs(spawnedHolograms) do
-                if isValid(holo) then
-                    holo:setParent(base)
-                    holo:setPos(base:localToWorld(activeConfig.offsetPos))
-                    holo:setAngles(base:localToWorldAngles(activeConfig.offsetAngle))
-                end
-            end
-        end
     end)
 
     local buildThread
@@ -203,7 +192,6 @@ if CLIENT then
             end
 
             local holo = hologram.create(base:localToWorld(offsetPos), base:localToWorldAngles(offsetAngle), "models/Combine_Helicopter/helicopter_bomb01.mdl")
-            table.insert(spawnedHolograms, holo)
             holo:setParent(base)
             holo:setFilterMag(v.LowPolyTexture)
             holo:setFilterMin(v.LowPolyTexture)
@@ -332,7 +320,6 @@ if CLIENT then
                         end
                         timer.simple(1, setCubeMap)
                         local function updateCubemap()
-                            if not isValid(chip()) then return end
                             setCubeMap()
                             timer.simple(cubemapUpdateInterval, updateCubemap)
                         end
@@ -582,83 +569,77 @@ if CLIENT then
         end)
     end
 
-    local function checkVersionOnSpawn(config)
-        if not config.AllowCheckVersion then return end
+local function checkVersionOnSpawn(config)
+    if not config.AllowCheckVersion then return end
 
-        local githubURL = "https://raw.github.com/nokillnando/Starfall/main/mesh_loaders_new/mesh_loader_core.txt"
-        local localVersion = Version
-        local maxRetries = 10
+    local githubURL = "https://raw.github.com/nokillnando/Starfall/main/mesh_loaders_new/mesh_loader_core.txt"
+    local localVersion = Version
+    local maxRetries = 10
 
-        local function doVersionCheck()
-            if not http.canRequest() then
-                maxRetries = maxRetries - 1
-            if maxRetries <= 0 then return end
-                timer.simple(0.5, doVersionCheck)
-                return
-            end
-
-            http.get(githubURL,
-                function(data)
-                    if not (data and data ~= "") then
-                        if config.AllowCheckVersion then
-                            print(config.W, "Core MeshLoader version check failed - no data received")
-                        end
-                        return
-                    end
-
-                    local versionStart = data:find('Version = "')
-                    if not versionStart then
-                        if config.AllowCheckVersion then
-                            print(config.W, "Core MeshLoader version check failed - version string not found")
-                        end
-                        return
-                    end
-
-                    versionStart = versionStart + 11
-                    local versionEnd = data:find('"', versionStart)
-                    if not versionEnd or versionEnd <= versionStart then
-                        if config.AllowCheckVersion then
-                            print(config.W, "Core MeshLoader version check failed - could not parse remote version")
-                        end
-                        return
-                    end
-
-                    local remoteVersion = data:sub(versionStart, versionEnd - 1)
-                    local remoteParts = string.explode(".", remoteVersion)
-                    local localParts = string.explode(".", localVersion)
-
-                    local remoteMajor = tonumber(remoteParts[1]) or 0
-                    local remoteMinor = tonumber(remoteParts[2]) or 0
-                    local localMajor = tonumber(localParts[1]) or 0
-                    local localMinor = tonumber(localParts[2]) or 0
-
-                    if remoteMajor > localMajor or (remoteMajor == localMajor and remoteMinor > localMinor) then
-                        print(config.W, "Check config file for updated default variables")
-                        print(config.W, "Core MeshLoader Update available! Local: ", config.G, localVersion, config.W, " | Remote: ", config.G, remoteVersion)
-                        print(config.W, "Check config file for URL")
-                    else
-                        print(config.W, "Local Core MeshLoader is up to date or higher than online! Version: ", config.G, localVersion)
-                    end
-                end,
-                function(err)
-                    if config.AllowCheckVersion then
-                        print(config.W, "Core MeshLoader version check failed - could not connect to remote: ", config.R, err)
-                    end
-                end
-            )
+    local function doVersionCheck()
+        if not http.canRequest() then
+            maxRetries = maxRetries - 1
+        if maxRetries <= 0 then return end
+            timer.simple(0.5, doVersionCheck)
+            return
         end
 
-        -- Delay start by 1s just like before
-        timer.simple(1, doVersionCheck)
+        http.get(githubURL,
+            function(data)
+                if not (data and data ~= "") then
+                    if config.AllowCheckVersion then
+                        print(config.W, "Core MeshLoader version check failed - no data received")
+                    end
+                    return
+                end
+
+                local versionStart = data:find('Version = "')
+                if not versionStart then
+                    if config.AllowCheckVersion then
+                        print(config.W, "Core MeshLoader version check failed - version string not found")
+                    end
+                    return
+                end
+
+                versionStart = versionStart + 11
+                local versionEnd = data:find('"', versionStart)
+                if not versionEnd or versionEnd <= versionStart then
+                    if config.AllowCheckVersion then
+                        print(config.W, "Core MeshLoader version check failed - could not parse remote version")
+                    end
+                    return
+                end
+
+                local remoteVersion = data:sub(versionStart, versionEnd - 1)
+                local remoteParts = string.explode(".", remoteVersion)
+                local localParts = string.explode(".", localVersion)
+
+                local remoteMajor = tonumber(remoteParts[1]) or 0
+                local remoteMinor = tonumber(remoteParts[2]) or 0
+                local localMajor = tonumber(localParts[1]) or 0
+                local localMinor = tonumber(localParts[2]) or 0
+
+                if remoteMajor > localMajor or (remoteMajor == localMajor and remoteMinor > localMinor) then
+                    print(config.W, "Check config file for updated default variables")
+                    print(config.W, "Core MeshLoader Update available! Local: ", config.G, localVersion, config.W, " | Remote: ", config.G, remoteVersion)
+                    print(config.W, "Check config file for URL")
+                else
+                    print(config.W, "Local Core MeshLoader is up to date or higher than online! Version: ", config.G, localVersion)
+                end
+            end,
+            function(err)
+                if config.AllowCheckVersion then
+                    print(config.W, "Core MeshLoader version check failed - could not connect to remote: ", config.R, err)
+                end
+            end
+        )
     end
 
+    -- Delay start by 1s just like before
+    timer.simple(1, doVersionCheck)
+end
+
     local function initClient(config)
-        activeConfig = config
-        
-        -- Request base now that we are initialized
-        net.start("requestBase")
-        net.send()
-        
         checkVersionOnSpawn(config)
         downloadMeshes(config.debugPrints, config.meshes, buildMeshes, config.meshName, config.meshSpawnDelay, config.showMeshSpawnProgress, config.offsetPos, config.offsetAngle, config.globalScale, config.downloadStatus, config.progressData, config.W, config.R, config.G)
 
@@ -749,7 +730,6 @@ if CLIENT then
 
 else -- SERVER
     local clientMeshes = {}
-    local lastBase = nil
 
     net.receive("reportMeshStatus", function(_, ply)
         local status = net.readTable()
@@ -782,24 +762,10 @@ else -- SERVER
 
 
     net.receive("requestBase", function(_, ply)
-        local currentBase = wire.ports.Base
-        if not isValid(currentBase) then 
-            return 
-        end
+        if not isValid(base) then return end
         net.start("sendBase")
-        net.writeEntity(currentBase)
+        net.writeEntity(base)
         net.send(ply)
-    end)
-
-    timer.create("monitorBase", 1, 0, function()
-        local currentBase = wire.ports.Base
-        if currentBase ~= lastBase then
-            lastBase = currentBase
-            net.start("sendBase")
-            net.writeEntity(currentBase)
-            
-            net.send(find.allPlayers())
-        end
     end)
 
 end

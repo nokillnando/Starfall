@@ -7,14 +7,10 @@ if SERVER then
     wire.adjustInputs(
         {
             "Chassis",
-            "Wheels",
-            "ExtraFilterStatic",
-            "ExtraFilterSemiDynamic"
+            "Wheels"
         },
         {
             "Entity",
-            "Array",
-            "Array",
             "Array"
         }
     )
@@ -25,7 +21,6 @@ if SERVER then
     
     local stressAngVelTicks = 0
     local stressAngVelSkip = 6
-    local lastFilterHash = ""
 
     local angVelAxis = "y"
     
@@ -71,74 +66,9 @@ if SERVER then
         end
         
         stressAngVelTicks = stressAngVelSkip * (frozen and 20 or 1)
-        
-
 
         return    
     end
-    
-    local filterCache = {}
-    
-    function checkFilterUpdates()
-         local dynamicFilter = wire.ports.ExtraFilterSemiDynamic
-         local resolved = {}
-         local inputsSeen = {}
-         
-         if dynamicFilter and #dynamicFilter > 0 then
-             local checked = {}
-             
-             for _, root in ipairs(dynamicFilter) do
-                 if root and root:isValid() then
-                     local rootIdx = root:entIndex()
-                     inputsSeen[rootIdx] = true
-                     
-                     -- Check Cache
-                     if not filterCache[rootIdx] then
-                        -- [EXPENSIVE] Only runs once per unique, valid input entity
-                         local constrained = root:getAllConstrained()
-                         table.insert(constrained, root)
-                         filterCache[rootIdx] = constrained
-                     end
-                     
-                     -- Use Cache
-                     local cachedParts = filterCache[rootIdx]
-                     for _, part in pairs(cachedParts) do
-                         if part and part:isValid() then
-                             local idx = part:entIndex()
-                             if not checked[idx] then
-                                 checked[idx] = true
-                                 table.insert(resolved, part)
-                             end
-                         end
-                     end
-                 end
-             end
-         end
-         
-         -- Garbage collect cache (remove entries no longer in input)
-         -- limit GC to avoid lag? No, table iteration is fast compared to getAllConstrained.
-         for idx, _ in pairs(filterCache) do
-             if not inputsSeen[idx] then
-                 filterCache[idx] = nil
-             end
-         end
-         
-         -- Check for changes
-         local hash = ""
-         table.sort(resolved, function(a,b) return a:entIndex() < b:entIndex() end)
-         for _, e in ipairs(resolved) do hash = hash .. e:entIndex() .. "," end
-         
-         if hash ~= lastFilterHash then
-            lastFilterHash = hash
-            net.start("update_dynamic_filter")
-            net.writeUInt(#resolved, 13)
-            for _, e in ipairs(resolved) do
-                net.writeUInt(e:entIndex(), 13)
-            end
-            net.send(find.allPlayers())
-         end
-    end
-    timer.create("check_filter_updates", 3, 0, checkFilterUpdates)
     
     hook.add("tick","send_stress_angvels",function()
         sendStressAngVel(wire.ports.Wheels)
@@ -150,25 +80,6 @@ if SERVER then
         
         for i,e in ipairs(wire.ports.Wheels) do
             table.insert(wheels,{i = e:entIndex(), w = e})
-        end
-        
-        -- Resolve Static Filter
-        local staticFilter = wire.ports.ExtraFilterStatic
-        local resolvedStatic = {}
-        if staticFilter and #staticFilter > 0 then
-             local checked = {}
-             for _, ent in ipairs(staticFilter) do
-                 if ent and ent:isValid() and not checked[ent] then
-                     local constrained = ent:getAllConstrained()
-                     table.insert(constrained, ent)
-                     for _, c in pairs(constrained) do
-                         if not checked[c] then
-                             checked[c] = true
-                             table.insert(resolvedStatic, c)
-                         end
-                     end
-                 end
-             end
         end
         
         if table.count(wheels) > 0 then
@@ -184,12 +95,6 @@ if SERVER then
             net.writeUInt(table.count(wheels),8)
             for _,w in pairs(wheels) do
                 net.writeUInt(w.i,13)
-            end
-
-            -- Send Static Filter
-            net.writeUInt(#resolvedStatic, 13)
-            for _, e in ipairs(resolvedStatic) do
-                net.writeUInt(e:entIndex(), 13)
             end
 
             net.send(ply)
@@ -601,10 +506,6 @@ if CLIENT then
     
     local wheels = {}
     local wheelscount = 0
-    local extraStaticIDs = {}
-    local extraDynamicIDs = {}
-    local autoIgnored = {}
-    local autoIgnoredLookup = {}
     local initWheelsDone = false
     local chassisid = nil
     local chassis = nil
@@ -675,80 +576,30 @@ if CLIENT then
             wheel.id = id
             wheels[id] = wheel
         end       
-        
-        -- Read Static Filter
-        local extraCount = net.readUInt(13)
-        extraStaticIDs = {}
-        for i=1, extraCount do
-             local eid = net.readUInt(13)
-             table.insert(extraStaticIDs, eid)
-        end
 
         discoverEntities()
     end
     
-    function rebuildTraceFilter()
-        if not chassis or not chassis:isValid() then return end
-        
-        traceFilter = {}
-        table.insert(traceFilter, chassis)
-        
-        for i,w in pairs(wheels) do
-            if w.entity and w.entity:isValid() then
-                table.insert(traceFilter, w.entity)
-            end
-        end
-        
-        for _, eid in ipairs(extraStaticIDs) do
-             local e = entity(eid)
-             if e and e:isValid() then table.insert(traceFilter, e) end
-        end
-        
-        for _, eid in ipairs(extraDynamicIDs) do
-             local e = entity(eid)
-             if e and e:isValid() then table.insert(traceFilter, e) end
-        end
-        
-        -- Add auto-ignored entities (preserved across rebuilds)
-        for _, e in ipairs(autoIgnored) do
-            if e and e:isValid() then table.insert(traceFilter, e) end
-        end
-        
-        -- print("[Client] Rebuilt TraceFilter: " .. #traceFilter .. " entities. (Dyn: " .. #extraDynamicIDs .. ", Auto: " .. #autoIgnored .. ")")
-    end
-
-    net.receive("update_dynamic_filter", function()
-        local count = net.readUInt(13)
-        extraDynamicIDs = {}
-        for i=1, count do
-            local eid = net.readUInt(13)
-            table.insert(extraDynamicIDs, eid)
-        end
-        -- print("[Client] Recv Dynamic Filter: " .. count .. " IDs")
-        rebuildTraceFilter()
-    end)
-    
     function discoverEntities()
-        if not owner():isValid() then return end
         chassis = entity(chassisid)
         if chassis == nil or not chassis:isValid() then
             timer.simple(1,discoverEntities)
             return
         end     
         
+        table.insert(traceFilter,chassis) 
+
         for i,w in pairs(wheels) do
             w.entity = entity(w.id)
             if w.entity == nil or not w.entity:isValid() then
                 timer.simple(1,discoverEntities)
                 return
             end
+            table.insert(traceFilter,w.entity)      
         end
-        
-        rebuildTraceFilter()
         
         initWheels()
     end
-
     
     function downloadSounds()
         local function verifyAllLoaded()
@@ -861,26 +712,10 @@ function materialTraces()
         end
         local startPos = w.entity:getPos()
         local endPos = (startPos - chassis:getUp()*w.diameter)
-        
-        -- Validate trace filter before tracing
-        -- [OPTIMIZATION] Only iterate if we suspect invalid entities, or just use a pcall?
-        -- Trace.line implementation throws if an object is invalid. We must scrub it.
-        -- Since this is an expensive loop, we rely on the rebuild functions mostly, 
-        -- but if an entity is deleted in between, we need to catch it.
-        for i = #traceFilter, 1, -1 do
-            if not traceFilter[i]:isValid() then
-                table.remove(traceFilter, i)
-            end
-        end
 
         local wheeltrace = trace.line(startPos, endPos, traceFilter)
         if wheeltrace.Entity:isValid() and (wheeltrace.Entity:getParent() == chassis or wheeltrace.Entity:getParent() == w.entity) then 
             table.insert(traceFilter, wheeltrace.Entity) 
-            
-            if not autoIgnoredLookup[wheeltrace.Entity] then
-                autoIgnoredLookup[wheeltrace.Entity] = true
-                table.insert(autoIgnored, wheeltrace.Entity) 
-            end
             continue 
         end
 
