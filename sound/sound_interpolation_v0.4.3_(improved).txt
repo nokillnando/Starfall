@@ -1,0 +1,441 @@
+--@name Sound Interpolation v0.4.3 (Improved)
+--@author Cheezus (Original), Manus (Improvements)
+--@shared
+
+if SERVER then
+    wire.adjustPorts({
+        --If necessary, add more inputs here, like Exhaust
+        Engine = "entity",
+        Exhaust = "entity",
+        Active = "number",
+        RPM = "number",
+        Throttle = "number",
+    })
+else
+    local maxThrottle = 1 --For ACF engines, this is 100.
+    local redline = 7000 --Redline of your engine.
+    -- local additionalCurveWidth = 0 -- Removed, as equal power crossfade handles blending directly
+
+    --Define sound banks inside here, each bank is encompassed by { }
+    banks = {
+
+        {
+            part = "Engine", --Which entity to attach the sound to
+            onVolume = 1, --On-throttle volume
+            offVolume = 0.5, --Off-throttle volume
+            sounds = { --[RPM to play the sound at] = "sound/path.wav"
+                [758] = "acf_forza6apex/fiat/fiatabarthpuntoss/engine_00758.wav",
+                [2955] = "acf_forza6apex/fiat/fiatabarthpuntoss/engine_02955.wav",
+                [4955] = "acf_forza6apex/fiat/fiatabarthpuntoss/engine_04955.wav",
+                [6669] = "acf_forza6apex/fiat/fiatabarthpuntoss/engine_06669.wav",                                                
+
+
+            }
+        },
+        
+        {
+            part = "Exhaust", --Which entity to attach the sound to
+            onVolume = 1, --On-throttle volume
+            offVolume = 0.5, --Off-throttle volume
+            sounds = { --[RPM to play the sound at] = "sound/path.wav"
+                [797] = "acf_forza6apex/fiat/fiatabarthpuntoss/exhaust_00797.wav",
+                [2659] = "acf_forza6apex/fiat/fiatabarthpuntoss/exhaust_02659.wav",
+                [4790] = "acf_forza6apex/fiat/fiatabarthpuntoss/exhaust_04790.wav",
+                [6877] = "acf_forza6apex/fiat/fiatabarthpuntoss/exhaust_06877.wav",                                                
+
+
+            }
+        },
+
+        --[[
+        {
+            part = "Engine",
+            onVolume = 0.2,
+            offVolume = 0.8,
+            sounds = {
+                [778] = "https://github.com/CheezusChrust/Starfall-Sounds/blob/main/sounds_forza/sound/gearworks/s60r/00778.wav",
+                [2188] = "https://github.com/CheezusChrust/Starfall-Sounds/blob/main/sounds_forza/sound/gearworks/s60r/02188.wav",
+                [3041] = "https://github.com/CheezusChrust/Starfall-Sounds/blob/main/sounds_forza/sound/gearworks/s60r/03041.wav",
+                [4349] = "https://github.com/CheezusChrust/Starfall-Sounds/blob/main/sounds_forza/sound/gearworks/s60r/04349.wav",
+                [5508] = "https://github.com/CheezusChrust/Starfall-Sounds/blob/main/sounds_forza/sound/gearworks/s60r/05508.wav",
+                [6349] = "https://github.com/CheezusChrust/Starfall-Sounds/blob/main/sounds_forza/sound/gearworks/s60r/06349.wav",
+                [6932] = "https://github.com/CheezusChrust/Starfall-Sounds/blob/main/sounds_forza/sound/gearworks/s60r/06932.wav",
+            }
+        },
+        --]]
+    }
+
+    --Create a custom sound object to work with both web and local sounds
+    --Would use bass.loadFile but it doesn't seem to play wav files
+    local function createSound(ent, path, onCreated)
+        local snd = {}
+        onCreated = onCreated or function() end
+        snd.web = string.find(path, "https://") and true or false
+
+        function snd:play()
+            if not snd.obj then return end
+            snd.obj:play()
+
+            if snd.web then
+                hook.add("think", tostring(snd), function()
+                    snd.obj:setPos(ent:getPos())
+                end)
+            end
+        end
+
+        function snd:stop()
+            if not snd.obj then return end
+
+            if snd.web then
+                snd.obj:pause()
+                snd.obj:setTime(0)
+                hook.remove("think", tostring(snd))
+            else
+                snd.obj:stop()
+            end
+        end
+
+        function snd:isValid()
+            return snd.obj and true or false
+        end
+
+        function snd:setPitch(pitch)
+            if not snd.obj then return end
+            pitch = pitch * (snd.web and 1 or 100)
+            snd.obj:setPitch(pitch)
+        end
+
+        function snd:setVolume(volume)
+            if not snd.obj then return end
+            snd.obj:setVolume(volume)
+        end
+
+        if snd.web then
+            bass.loadURL(path, "3d noblock noplay", function(s)
+                if not s then return end
+                s:setLooping(true)
+                snd.obj = s
+                onCreated(snd)
+            end)
+        else
+            snd.obj = sounds.create(ent, path)
+            onCreated(snd)
+        end
+
+        return snd
+    end
+
+    --Maps a value, X, from a range A-B, to a new range C-D
+    local function map(x, a, b, c, d)
+        return (x - a) / (b - a) * (d - c) + c
+    end
+
+    -- Original fade function removed, replaced by direct equal power crossfade logic
+
+    local loaded = false
+    local loadedSounds = 0
+    local soundCount = 0
+
+    local function checkFinishedLoading()
+        loaded = loadedSounds == soundCount
+
+        if loaded then
+            for _, bank in pairs(banks) do
+                bank.soundRpms = {}
+
+                for rpm in pairs(bank.sounds) do
+                    table.insert(bank.soundRpms, rpm)
+                end
+
+                table.sort(bank.soundRpms)
+            end
+
+            if player() == owner() then
+                notification.kill("loading")
+            end
+        end
+    end
+
+    local function timeout()
+        if not loaded then
+            print("Some sounds failed to load - check sound paths")
+        end
+
+        if player() == owner() then
+            notification.kill("loading")
+        end
+
+        loadedSounds = soundCount
+        checkFinishedLoading()
+    end
+
+    local function initSounds()
+        timer.simple(5, timeout)
+
+        for _, bank in pairs(banks) do
+            bank.soundObjects = {}
+            if not bank.partEntity then continue end
+
+            for soundRPM, soundPath in pairs(bank.sounds) do
+                soundPath = string.replace(soundPath, "github.com", "raw.githubusercontent.com")
+                soundPath = string.replace(soundPath, "raw/", "")
+                soundPath = string.replace(soundPath, "blob/", "")
+                soundPath = string.format(soundPath, string.format("%04d", soundRPM))
+
+                bank.soundObjects[soundRPM] = createSound(bank.partEntity, soundPath, function(s)
+                    loadedSounds = loadedSounds + 1
+                    checkFinishedLoading()
+                end)
+            end
+        end
+    end
+
+    --Permission check - notify owner if other players can't hear the sounds
+    if player() ~= owner() then
+        local permissions = {}
+
+        if not hasPermission("bass.loadURL", "https://raw.githubusercontent.com/CheezusChrust/Starfall-Sounds/main/misc/22r_ext_idle.mp3") then
+            table.insert(permissions, "bass.loadURL")
+        end
+
+        if not hasPermission("sound.create", "ambient/alarms/klaxon1.wav") then
+            table.insert(permissions, "sound.create")
+        end
+
+        if soundCount > sounds.soundsLeft() + 1 or soundCount > bass.soundsLeft() + 1 then
+            table.insert(permissions, "[not enough sounds left]")
+        end
+
+        if table.count(permissions) > 0 then
+            net.start("loadFailed")
+            net.writeTable(permissions)
+            net.send()
+
+            return
+        end
+    else
+        net.receive("loadFailedNotify", function()
+            local ply = net.readString()
+            local perms = table.concat(net.readTable())
+            print(Color(255, 0, 0), ply, Color(255, 255, 255), " does not have the required permissions: " .. perms)
+        end)
+    end
+
+    --Request each bank's entity from the server
+    local function requestParts()
+        net.start("requestParts")
+        local requestedParts = {}
+    
+        for _, bank in pairs(banks) do
+            soundCount = soundCount + table.count(bank.sounds)
+            table.insert(requestedParts, bank.part)
+        end
+    
+        net.writeTable(requestedParts)
+        net.send()
+    end
+
+    requestParts()
+
+    net.receive("receiveParts", function()
+        local ents = net.readTable()
+
+        for k, v in pairs(ents) do
+            if not v:isValid() then
+                timer.simple(1, requestParts)
+            
+                return
+            end
+            for _, bank in pairs(banks) do
+                if bank.part == k then
+                    bank.partEntity = v
+                end
+            end
+        end
+
+        if player() == owner() then
+            enableHud(owner(), true)
+            notification.addProgress("loading", "Loading sounds...")
+        end
+
+        initSounds()
+    end)
+
+    local active = false
+
+    --Play/stop sounds based on if engine active or not
+    net.receive("activeCheck", function()
+        active = net.readBool()
+        if not loaded then return end
+
+        if active then
+            for _, bank in pairs(banks) do
+                if not bank.sounds or table.count(bank.sounds) == 0 then continue end
+                if not bank.partEntity then continue end
+
+                for _, snd in pairs(bank.soundObjects) do
+                    snd:play()
+                    snd:setVolume(0)
+                    snd:setPitch(0)
+                end
+            end
+        else
+            for _, bank in pairs(banks) do
+                if not bank.sounds or table.count(bank.sounds) == 0 then continue end
+                if not bank.partEntity then continue end
+
+                for _, snd in pairs(bank.soundObjects) do
+                    snd:stop()
+                end
+            end
+        end
+    end)
+
+    local engineRPM = 0
+    local throttle = 0
+
+    --Receive data from server regarding engine status
+    net.receive("engineData", function()
+        if not loaded then return end
+        engineRPM = net.readUInt(14) * (banks[1].soundRpms[#banks[1].soundRpms] / redline)
+        throttle = math.max(net.readFloat(), 0)
+    end)
+
+    local smoothRPM = 0
+    local smoothThrottle = 0
+
+    hook.add("think", "interval", function()
+        if not active or not loaded then return end
+        smoothRPM = smoothRPM * (1 - 0.08) + engineRPM * 0.1
+        smoothThrottle = smoothThrottle * (1 - 0.1) + throttle * 0.1
+
+        for _, bank in pairs(banks) do
+            if not bank.sounds or table.count(bank.sounds) == 0 then continue end
+            if not bank.partEntity then continue end
+
+            local currentRPM = smoothRPM
+            local soundRpms = bank.soundRpms -- This is already sorted
+
+            local lowerRPM = nil
+            local upperRPM = nil
+            local lowerSound = nil
+            local upperSound = nil
+
+            -- Find the two closest RPM points
+            for i = 1, #soundRpms do
+                local rpm = soundRpms[i]
+                if currentRPM >= rpm then
+                    lowerRPM = rpm
+                    lowerSound = bank.soundObjects[rpm]
+                else
+                    upperRPM = rpm
+                    upperSound = bank.soundObjects[rpm]
+                    break
+                end
+            end
+
+            -- Ensure all sounds are initially zeroed out to prevent lingering volumes
+            for _, rpm_key in pairs(soundRpms) do
+                bank.soundObjects[rpm_key]:setVolume(0)
+            end
+
+            -- Handle edge cases and interpolation
+            if lowerRPM and not upperRPM then -- currentRPM is above the highest defined RPM
+                -- Only the highest RPM sound plays
+                local soundObject = lowerSound
+                local vol = map(smoothThrottle, 0, maxThrottle, bank.offVolume, bank.onVolume)
+                local pitch = (currentRPM / lowerRPM)
+                soundObject:setVolume(vol)
+                soundObject:setPitch(pitch)
+
+            elseif not lowerRPM and upperRPM then -- currentRPM is below the lowest defined RPM
+                -- Only the lowest RPM sound plays
+                local soundObject = upperSound
+                local vol = map(smoothThrottle, 0, maxThrottle, bank.offVolume, bank.onVolume)
+                local pitch = (currentRPM / upperRPM)
+                soundObject:setVolume(vol)
+                soundObject:setPitch(pitch)
+
+            elseif lowerRPM and upperRPM then -- currentRPM is between two defined RPMs, crossfade
+                local range = upperRPM - lowerRPM
+                local alpha = (currentRPM - lowerRPM) / range -- Interpolation factor (0 to 1)
+
+                -- Equal Power Crossfade for Volume
+                local vol1_curve = math.cos(alpha * math.pi / 2) -- Volume for lower RPM sound
+                local vol2_curve = math.sin(alpha * math.pi / 2) -- Volume for upper RPM sound
+
+                local vol1 = vol1_curve * map(smoothThrottle, 0, maxThrottle, bank.offVolume, bank.onVolume)
+                local vol2 = vol2_curve * map(smoothThrottle, 0, maxThrottle, bank.offVolume, bank.onVolume)
+
+                lowerSound:setVolume(vol1)
+                upperSound:setVolume(vol2)
+
+                -- Pitch Interpolation (linear for now, can be improved if needed)
+                local pitch1 = (currentRPM / lowerRPM)
+                local pitch2 = (currentRPM / upperRPM)
+
+                lowerSound:setPitch(pitch1)
+                upperSound:setPitch(pitch2)
+            end
+        end
+    end)
+end
+
+if SERVER then
+    --Process entity requests and send desired entity back to requesting client
+    net.receive("requestParts", function(_, ply)
+        local requestedEntities = net.readTable()
+        local ents = {}
+
+        for _, v in pairs(requestedEntities) do
+            if wire.ports[v] and wire.ports[v]:isValid() then
+                ents[v] = wire.ports[v]
+            elseif ply == owner() then
+                print("Missing input '" .. v .. "'")
+            end
+        end
+
+        if table.count(ents) == 0 then return end
+        net.start("receiveParts")
+        net.writeTable(ents)
+
+        net.send({ply})
+    end)
+
+    --Notify owner of people with restrictive permissions
+    net.receive("loadFailed", function(_, ply)
+        net.start("loadFailedNotify")
+        net.writeString(ply:getName())
+        net.writeTable(net.readTable())
+
+        net.send({owner()})
+    end)
+
+    --Send engine RPM and throttle to all clients
+    timer.create("engineData", 0.045, 0, function()
+        if wire.ports.Active > 0 then
+            net.start("engineData")
+            net.writeUInt(wire.ports.RPM or 0, 14)
+            net.writeFloat(wire.ports.Throttle or 0)
+            net.send(nil, true) --Using the unreliable channel is significantly faster
+        end
+    end)
+
+    --Send engine state to all clients
+    hook.add("input", "activeCheck", function(input, value)
+        if input == "Active" then
+            net.start("activeCheck")
+            net.writeBool(value == 1)
+            net.send()
+        end
+    end)
+end
+
+--Make all of the prints fancy
+local oldPrint = print
+
+function print(...)
+    oldPrint(Color(100, 255, 100), "[Sound Interpolation] ", Color(255, 255, 255), ...)
+end
+
+
