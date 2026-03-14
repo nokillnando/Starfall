@@ -19,6 +19,7 @@ if SERVER then
     local sendQueue = {}
     local maxBytesPerSecond = 2048 -- Max bytes per player per second to avoid spam.
     local bytesUsed = {} -- Tracks bytes used per player.
+    local lastSendTime = {} -- Tracks last send timestamp per player for anti-burst.
     local lastResetTime = timer.systime()
 
     function hud_sendInputs(ply)
@@ -31,6 +32,16 @@ if SERVER then
         
         -- Initialize byte counter for the player if it doesn't exist for this second.
         bytesUsed[ply] = bytesUsed[ply] or 0
+
+        -- Enforce minimum per-player interval to avoid burst limit (`net.send` can fail in rapid bursts)
+        local now = timer.systime()
+        local minInterval = 0.1 -- 10Hz max (adjust higher for safety)
+        if lastSendTime[ply] and now - lastSendTime[ply] < minInterval then
+            if not table.hasValue(sendQueue, ply) then
+                table.insert(sendQueue, ply)
+            end
+            return 0 -- Indicate message was not sent due to burst control.
+        end
         
         -- Estimate message size. 8 floats (8*4=32) + 2 ints (4*2=8) = 40 bytes.
         local messageSize = 40
@@ -53,7 +64,23 @@ if SERVER then
         
         -- If clear to send, update the byte counter and send the data.
         bytesUsed[ply] = bytesUsed[ply] + messageSize
-        
+
+        -- Extra safety guards: stream capacity and bandwidth headroom.
+        if net.canWriteStream and not net.canWriteStream() then
+            if not table.hasValue(sendQueue, ply) then
+                table.insert(sendQueue, ply)
+            end
+            return 0
+        end
+
+        local availableBytes = (net.getBytesLeft and net.getBytesLeft()) or math.huge
+        if availableBytes < messageSize then
+            if not table.hasValue(sendQueue, ply) then
+                table.insert(sendQueue, ply)
+            end
+            return 0
+        end
+
         net.start("hud_sendInputs")
         net.writeFloat(wire.ports.EngineRPM or 0)
         net.writeFloat(engineMaxRpm)
@@ -65,7 +92,9 @@ if SERVER then
         net.writeFloat(TurboPsiMax)
         net.writeInt(wire.ports.GearboxGear or 0, 4)
         net.writeInt(wire.ports.GearMode or 0, 4) -- Send GearMode
+
         net.send(ply, true)
+        lastSendTime[ply] = now
         
         return 1 -- Indicate message was sent.
     end

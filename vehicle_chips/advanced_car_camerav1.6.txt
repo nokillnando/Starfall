@@ -1,4 +1,4 @@
---@name  Advanced Car CameraV1.5 (Network Fix)
+--@name  Advanced Car CameraV1.6 (Network Fix)
 --@author [C17] Red Fox, Manus, KimiV2, Gemini (refactor)
 --@version 1.6 - Timer-based networking refactor
 
@@ -81,6 +81,7 @@ if SERVER then
     local wasActive = false
     local lastSentData = {}
     local needsUpdate = {}
+    local lastSendTime = {}
 
     -- Think hook now only watches state and sets flags
     hook.add("Think", "SFGlideCam_StateWatcher", function()
@@ -126,22 +127,35 @@ if SERVER then
 
     -- This timer sends all updates at a controlled rate (20Hz)
     timer.create("SFGlideCam_NetworkSender", 0.05, 0, function()
+        -- stream guard to prevent net burst abuse
+        if net.canWriteStream and not net.canWriteStream() then return end
+        local globalMsgSizeGuard = (net.getBytesLeft and net.getBytesLeft()) or math.huge
+        if globalMsgSizeGuard < 256 then return end
+
         for driver, update in pairs(needsUpdate) do
             if driver and driver:isValid() then
-                if update.start then
-                    net.start("SFGlideCam_Start")
-                    net.writeEntity(update.base)
-                    net.send(driver)
-                elseif update.stop then
-                    net.start("SFGlideCam_Stop")
-                    net.send(driver)
-                end
+                local now = timer.systime()
+                local minInterval = 0.05
+                if lastSendTime[driver] and (now - lastSendTime[driver]) < minInterval then
+                    -- Skip this driver this tick to avoid burst
+                else
+                    if update.start then
+                        net.start("SFGlideCam_Start")
+                        net.writeEntity(update.base)
+                        net.send(driver)
+                    elseif update.stop then
+                        net.start("SFGlideCam_Stop")
+                        net.send(driver)
+                    end
 
-                if update.data then
-                    net.start("SFGlideCam_FullUpdate")
-                    net.writeTable(update.data)
-                    net.send(driver)
-                    lastSentData[driver] = update.data
+                    if update.data then
+                        net.start("SFGlideCam_FullUpdate")
+                        net.writeTable(update.data)
+                        net.send(driver)
+                        lastSentData[driver] = update.data
+                    end
+
+                    lastSendTime[driver] = now
                 end
             end
         end

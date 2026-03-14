@@ -2,7 +2,7 @@
 --@author [C17] Red Fox
 --@shared
 
-local Version = "2.08"
+local Version = "2.11"
 
 --Offset fix??
 
@@ -24,9 +24,23 @@ if CLIENT then
         local fileName = url:match("([^/]+%.vtf)") or "unnamed.vtf"
         local tempPath = vtfTempPath(url)
 
+        -- Stagger VTF loads to prevent Source VFS from choking on simultaneous reads
+        vtfLoadDelay = (vtfLoadDelay or 0) + 1
+        local myDelay = vtfLoadDelay * 0.3
+
+        -- Double-tap: apply texture now AND re-apply after 2s in case Source cached a failed read
+        local function safeCallback(path)
+            if isValid(chip()) then callback(path) end
+            timer.simple(2, function()
+                if isValid(chip()) then callback(path) end
+            end)
+        end
+
         -- already on disk?
         if file.existsTemp(fileName) then
-            callback(tempPath)
+            timer.simple(myDelay, function()
+                safeCallback(tempPath)
+            end)
             return
         end
 
@@ -37,7 +51,9 @@ if CLIENT then
             poll = function()
                 tries = tries + 1
                 if file.existsTemp(fileName) then
-                    callback(tempPath)
+                    timer.simple(0.3, function()
+                        safeCallback(tempPath)
+                    end)
                 elseif tries < 30 then
                     timer.simple(0.25, poll)
                 else
@@ -70,7 +86,10 @@ if CLIENT then
                     vtfDownloads[url] = nil
                     if data and #data > 0 then
                         file.writeTemp(fileName, data)
-                        callback(tempPath)
+                        -- Delay before telling material to use the file
+                        timer.simple(0.3, function()
+                            safeCallback(tempPath)
+                        end)
                     else
                         callback(nil)
                     end
@@ -132,17 +151,117 @@ if CLIENT then
     local base = chip()
     local activeConfig = {}
     local spawnedHolograms = {}
+    local networkedEntities = {}
 
     net.receive("sendBase", function()
         local ent = net.readEntity()
         base = isValid(ent) and ent or chip()
 
-        if activeConfig.offsetPos and activeConfig.offsetAngle then
-            for i, holo in ipairs(spawnedHolograms) do
-                if isValid(holo) then
-                    holo:setParent(base)
-                    holo:setPos(base:localToWorld(activeConfig.offsetPos))
-                    holo:setAngles(base:localToWorldAngles(activeConfig.offsetAngle))
+        for i, holo in ipairs(spawnedHolograms) do
+            if isValid(holo) then
+                local targetParent = base
+                
+                if holo.MeshTargetParentName and networkedEntities[holo.MeshTargetParentName] and isValid(networkedEntities[holo.MeshTargetParentName]) then
+                    targetParent = networkedEntities[holo.MeshTargetParentName]
+                end
+                
+                holo:setParent(targetParent)
+                
+                -- Use individual mesh offsets if they exist, otherwise global, or default to 0 if not loaded yet
+                local meshOffsetPos = (holo.MeshConfig and holo.MeshConfig.offsetPos) or activeConfig.offsetPos or Vector(0, 0, 0)
+                local meshOffsetAng = (holo.MeshConfig and holo.MeshConfig.offsetAngle) or activeConfig.offsetAngle or Angle(0, 0, 0)
+                
+                holo:setPos(targetParent:localToWorld(meshOffsetPos))
+                holo:setAngles(targetParent:localToWorldAngles(meshOffsetAng))
+            end
+        end
+    end)
+    
+    net.receive("sendMeshParent", function()
+        local parentName = net.readString()
+        local ent = net.readEntity()
+        networkedEntities[parentName] = ent
+        
+        for i, holo in ipairs(spawnedHolograms) do
+            if isValid(holo) and holo.MeshTargetParentName == parentName then
+                local targetParent = base
+                if isValid(ent) then targetParent = ent end
+                
+                holo:setParent(targetParent)
+                
+                local meshOffsetPos = (holo.MeshConfig and holo.MeshConfig.offsetPos) or activeConfig.offsetPos or Vector(0, 0, 0)
+                local meshOffsetAng = (holo.MeshConfig and holo.MeshConfig.offsetAngle) or activeConfig.offsetAngle or Angle(0, 0, 0)
+                
+                holo:setPos(targetParent:localToWorld(meshOffsetPos))
+                holo:setAngles(targetParent:localToWorldAngles(meshOffsetAng))
+            end
+        end
+    end)
+    local activeWireSwaps = {}
+    
+    net.receive("sendMeshSwap", function()
+        local inputName = net.readString()
+        local val = net.readFloat()
+        
+        activeWireSwaps[inputName] = val
+        
+        for _, holo in ipairs(spawnedHolograms) do
+            if isValid(holo) and holo.MeshConfig and holo.MeshConfig.TextureSwaps and holo.MeshConfig.TextureSwaps[inputName] then
+                holo.ActiveSwaps = holo.ActiveSwaps or {}
+                if val > 0 then
+                    holo.ActiveSwaps[inputName] = true
+                else
+                    holo.ActiveSwaps[inputName] = nil
+                end
+                
+                local activeSwapName = nil
+                for name, _ in pairs(holo.MeshConfig.TextureSwaps) do
+                    if holo.ActiveSwaps[name] then
+                        activeSwapName = name
+                        break
+                    end
+                end
+                
+                local mat = holo.MeshConfig.mat
+                
+                if activeSwapName then
+                    local swapData = holo.MeshConfig.TextureSwaps[activeSwapName]
+                    local isHighlight = type(swapData) == "table" and swapData.highlight == true
+                    local swapColor = type(swapData) == "table" and swapData.color
+                    
+                    if mat and mat.setTexture then
+                        local t = holo.MeshConfig.preloadedSwaps[activeSwapName]
+                        if t then
+                            mat:setTexture("$basetexture", t)
+                        elseif holo.MeshConfig.OriginalTexture then
+                            mat:setTexture("$basetexture", holo.MeshConfig.OriginalTexture)
+                        else
+                            mat:setTexture("$basetexture", "hunter/myplastic")
+                        end
+                    end
+                    
+                    if isHighlight then
+                        holo:suppressEngineLighting(true)
+                    else
+                        holo:suppressEngineLighting(holo.MeshConfig.SuppressEngineLighting or false)
+                    end
+                    
+                    if swapColor then
+                        holo:setColor(swapColor)
+                    else
+                        holo:setColor(holo.MeshConfig.ColorAndAlpha or Color(255, 255, 255, 255))
+                    end
+                else
+                    -- No active swaps remaining, revert completely to default mesh state
+                    if mat and mat.setTexture then
+                        if holo.MeshConfig.OriginalTexture then
+                            mat:setTexture("$basetexture", holo.MeshConfig.OriginalTexture)
+                        else
+                            mat:setTexture("$basetexture", "hunter/myplastic")
+                        end
+                    end
+                    holo:suppressEngineLighting(holo.MeshConfig.SuppressEngineLighting or false)
+                    holo:setColor(holo.MeshConfig.ColorAndAlpha or Color(255, 255, 255, 255))
                 end
             end
         end
@@ -154,6 +273,9 @@ if CLIENT then
         setName("Mesh Loader - " .. triCount .. " tris ".."- "..meshName)
         if debugPrints then print(W, "Finished building, using ", G, triCount, W, " tris") end
         if debugPrints then print(W, "Starting to spawn meshes with ", G, meshSpawnDelay, W, " second delay between each...") end
+        
+        activeConfig.offsetPos = offsetPos
+        activeConfig.offsetAngle = offsetAngle
 
         local spawnQueue = {}
         for meshIndex, v in ipairs(meshes) do
@@ -202,9 +324,24 @@ if CLIENT then
                       G, math.floor(spawned/totalToSpawn*100), W, "%)")
             end
 
-            local holo = hologram.create(base:localToWorld(offsetPos), base:localToWorldAngles(offsetAngle), "models/Combine_Helicopter/helicopter_bomb01.mdl")
+            local targetParent = base
+            local assignedParentName = v.Parent
+            if assignedParentName and type(assignedParentName) == "string" then
+                if networkedEntities[assignedParentName] and isValid(networkedEntities[assignedParentName]) then
+                    targetParent = networkedEntities[assignedParentName]
+                end
+            else
+                assignedParentName = nil
+            end
+
+            local meshOffsetPos = v.offsetPos or offsetPos
+            local meshOffsetAng = v.offsetAngle or offsetAngle
+
+            local holo = hologram.create(targetParent:localToWorld(meshOffsetPos), targetParent:localToWorldAngles(meshOffsetAng), "models/Combine_Helicopter/helicopter_bomb01.mdl")
+            holo.MeshTargetParentName = assignedParentName
+            holo.MeshConfig = v
             table.insert(spawnedHolograms, holo)
-            holo:setParent(base)
+            holo:setParent(targetParent)
             holo:setFilterMag(v.LowPolyTexture)
             holo:setFilterMin(v.LowPolyTexture)
             holo:setMesh(holomesh)
@@ -218,6 +355,48 @@ if CLIENT then
             else
                 holo:suppressEngineLighting(v.SuppressEngineLighting)
             end
+            
+            -- Immediately apply any active swaps that were networked while we were downloading/building
+            if v.TextureSwaps then
+                holo.ActiveSwaps = {}
+                for swapName, val in pairs(activeWireSwaps) do
+                    if val > 0 and v.TextureSwaps[swapName] then
+                        holo.ActiveSwaps[swapName] = true
+                    end
+                end
+                
+                local activeSwapName = nil
+                for name, _ in pairs(v.TextureSwaps) do
+                    if holo.ActiveSwaps[name] then
+                        activeSwapName = name
+                        break
+                    end
+                end
+                
+                if activeSwapName then
+                    local swapData = v.TextureSwaps[activeSwapName]
+                    local isHighlight = type(swapData) == "table" and swapData.highlight == true
+                    local swapColor = type(swapData) == "table" and swapData.color
+                    
+                    if v.mat and v.mat.setTexture then
+                        local t = v.preloadedSwaps[activeSwapName]
+                        if t then
+                            v.mat:setTexture("$basetexture", t)
+                        elseif v.OriginalTexture then
+                            v.mat:setTexture("$basetexture", v.OriginalTexture)
+                        else
+                            v.mat:setTexture("$basetexture", "hunter/myplastic")
+                        end
+                    end
+                    
+                    if isHighlight then
+                        holo:suppressEngineLighting(true)
+                    end
+                    if swapColor then
+                        holo:setColor(swapColor)
+                    end
+                end
+            end
 
             if #spawnQueue > 0 then
                 timer.simple(meshSpawnDelay, spawnNextMesh)
@@ -225,6 +404,42 @@ if CLIENT then
                 if debugPrints then print(G, "All meshes spawned successfully!") end
                 progressData.spawning = false
                 setName("Mesh Loader - " .. triCount .. " tris, "..meshName.." - Complete")
+                
+                -- Reconciliation timer: handles AdvDupe2 timing where wires connect AFTER the chip boots
+                -- Periodically re-requests server state AND directly re-parents any mismatched holograms
+                local reconcileAttempts = 0
+                timer.create("meshParentReconcile", 1, 20, function()
+                    if not isValid(chip()) then timer.remove("meshParentReconcile") return end
+                    reconcileAttempts = reconcileAttempts + 1
+                    
+                    -- Re-request all states from server
+                    net.start("requestBase")
+                    net.send()
+                    
+                    -- Directly reconcile any holograms whose parent doesn't match networkedEntities
+                    local allResolved = true
+                    for _, holo in ipairs(spawnedHolograms) do
+                        if isValid(holo) and holo.MeshTargetParentName then
+                            local expectedParent = networkedEntities[holo.MeshTargetParentName]
+                            if expectedParent and isValid(expectedParent) then
+                                local currentParent = holo:getParent()
+                                if currentParent ~= expectedParent then
+                                    holo:setParent(expectedParent)
+                                    local meshOffsetPos = (holo.MeshConfig and holo.MeshConfig.offsetPos) or activeConfig.offsetPos or offsetPos
+                                    local meshOffsetAng = (holo.MeshConfig and holo.MeshConfig.offsetAngle) or activeConfig.offsetAngle or offsetAngle
+                                    holo:setPos(expectedParent:localToWorld(meshOffsetPos))
+                                    holo:setAngles(expectedParent:localToWorldAngles(meshOffsetAng))
+                                end
+                            else
+                                allResolved = false
+                            end
+                        end
+                    end
+                    
+                    if allResolved and reconcileAttempts >= 5 then
+                        timer.remove("meshParentReconcile")
+                    end
+                end)
             end
         end
         spawnNextMesh()
@@ -257,11 +472,67 @@ if CLIENT then
 
         buildThread = coroutine.wrap(function()
             local builtCount = 0
+            local materialCache = {}
+            
+            -- Generate a fingerprint key from all material-defining properties
+            local function materialFingerprint(v)
+                local parts = {
+                    v.texture or "",
+                    v.BumpMapLink or "",
+                    v.EnvMapLink or "",
+                    v.PhongExponentTexture or "",
+                    v.CubeMapTexture or "",
+                    tostring(v.TextureScale or 1),
+                    tostring(v.EnableHalfLambert or false),
+                    tostring(v.EnableBaseMapAlphaEnvMask or false),
+                    tostring(v.EnableBaseMapAlphaPhongMask or false),
+                    tostring(v.EnableNormalmapAlphaEnvMapMask or false),
+                    tostring(v.UseEnvMapSpecularReflections or false),
+                    tostring(v.UsePhong or 0),
+                    tostring(v.InvertPhongMask or 0),
+                    tostring(v.UseRimLight or 0),
+                    tostring(v.PhongBoost or 0),
+                    tostring(v.PhongExp or 0),
+                    tostring(v.PhongAlbedoTint or 0),
+                    tostring(v.PhongAlbedoBoost or 0),
+                    tostring(v.RimLightBoost or 0),
+                    tostring(v.RimLightExp or 0),
+                    tostring(v.EnvMapContrast or 0),
+                    tostring(v.EnvMapSaturation or 0),
+                    tostring(v.EnvMapFresnel or 0),
+                    tostring(v.LowPolyTexture or false),
+                    v.Material or "",
+                    tostring(v.UseModTexture or false),
+                    v.UseIngameBumpMapp and v.BumpMapTexture or "",
+                }
+                -- Vectors
+                if v.EnvMapShinyness then table.insert(parts, tostring(v.EnvMapShinyness)) end
+                if v.PhongTint then table.insert(parts, tostring(v.PhongTint)) end
+                if v.PhongFresnelRange then table.insert(parts, tostring(v.PhongFresnelRange)) end
+                if v.Color2 then table.insert(parts, tostring(v.Color2)) end
+                -- Flags
+                if v.Flags then
+                    for _, f in ipairs(v.Flags) do table.insert(parts, tostring(f)) end
+                end
+                return table.concat(parts, "|")
+            end
+            
             for k, v in ipairs(meshes) do
                 progressData.builtMeshes = builtCount
                 progressData.buildProgress = builtCount / #meshes
 
                 if v.UseModTexture then
+                    -- Check material cache before creating a new one
+                    local fingerprint = materialFingerprint(v)
+                    local cachedEntry = materialCache[fingerprint]
+                    
+                    if cachedEntry and not v.TextureSwaps then
+                        -- Reuse existing material (only if NO TextureSwaps are present)
+                        v.mat = cachedEntry.mat
+                        v.OriginalTexture = cachedEntry.originalTexture
+                        v.preloadedSwaps = cachedEntry.preloadedSwaps
+                        if debugPrints then print(W, "Reusing material for mesh ", G, k) end
+                    else
                     local mat = material.create("VertexLitGeneric")
                     mat:setUndefined("$basetexture")
                     mat:setUndefined("$bumpmap")
@@ -296,6 +567,7 @@ if CLIENT then
                     mat:setFloat("$envmapsaturation", v.EnvMapSaturation)
                     mat:setVector("$envmaptint", v.EnvMapShinyness)
                     mat:setFloat("$envmapfresnel", v.EnvMapFresnel)
+                            
 
                     mat:setInt("$phong", v.UsePhong)
                     mat:setInt("$invertphongmask", v.InvertPhongMask)
@@ -322,7 +594,7 @@ if CLIENT then
                                 local Nmat = material.load(v.CubeMapTexture)
                                 local newEnvMap = Nmat:getTexture("$envmap")
                                 for _, mesh_val in ipairs(meshes) do
-                                    if mesh_val.mat then
+                                    if mesh_val.mat and mesh_val.mat.setTexture then
                                         mesh_val.mat:setTexture("$envmap", newEnvMap)
                                     end
                                 end
@@ -430,6 +702,10 @@ if CLIENT then
                         queueVtfDownload(vtfUrl, function(path)
                             if path then
                                 mat:setTexture("$basetexture", path)
+                                v.OriginalTexture = path
+                                if materialCache[fingerprint] then
+                                    materialCache[fingerprint].originalTexture = path
+                                end
                             else
                                 mat:setTexture("$basetexture", "hunter/myplastic")
                             end
@@ -443,13 +719,52 @@ if CLIENT then
                                 end
                                 local sx, sy = 1024 / w, 1024 / h
                                 layout(0, 0, w * sx, h * sy)
+                                timer.simple(0.2, function()
+                                    if isValid(chip()) and mat then
+                                        v.OriginalTexture = mat:getTexture("$basetexture")
+                                        if materialCache[fingerprint] then
+                                            materialCache[fingerprint].originalTexture = v.OriginalTexture
+                                        end
+                                    end
+                                end)
                             end)
                         else
                             mat:setTexture("$basetexture", "hunter/myplastic")
                         end
                     else
                         local m = material.load(v.texture)
+                        v.OriginalTexture = m:getTexture("$basetexture")
                         mat:setTexture("$basetexture", m:getTexture("$basetexture"))
+                        if materialCache[fingerprint] then
+                            materialCache[fingerprint].originalTexture = v.OriginalTexture
+                        end
+                    end
+                    
+                    if v.TextureSwaps then
+                        v.preloadedSwaps = {}
+                        for inputName, swapConfig in pairs(v.TextureSwaps) do
+                            local url = type(swapConfig) == "table" and swapConfig.texture or (type(swapConfig) == "string" and swapConfig or nil)
+                            
+                            if url then
+                                if url:lower():find("%.vtf") then
+                                    queueVtfDownload(url, function(path)
+                                        if path then v.preloadedSwaps[inputName] = path end
+                                    end)
+                                elseif url:sub(1, 4) == "http" then
+                                     local dummy = material.create("VertexLitGeneric")
+                                     dummy:setTextureURL("$basetexture", url, function(_, _, w, h, layout)
+                                         if w and h then
+                                             layout(0,0, w * (1024/w), h * (1024/h))
+                                             timer.simple(0.2, function()
+                                                 if isValid(chip()) and dummy then v.preloadedSwaps[inputName] = dummy:getTexture("$basetexture") end
+                                             end)
+                                         end
+                                     end)
+                                else
+                                    v.preloadedSwaps[inputName] = material.load(url):getTexture("$basetexture")
+                                end
+                            end
+                        end
                     end
 
 
@@ -457,6 +772,16 @@ if CLIENT then
                     textureMatrix:setScale(Vector(v.TextureScale, v.TextureScale, 1))
                     mat:setMatrix("$basetexturetransform", textureMatrix)
                     v.mat = mat
+                    
+                    -- Store in cache ONLY if this material isn't subject to TextureSwaps
+                    if not v.TextureSwaps then
+                        materialCache[fingerprint] = {
+                            mat = mat,
+                            originalTexture = v.OriginalTexture,
+                            preloadedSwaps = v.preloadedSwaps,
+                        }
+                    end
+                    end -- end of else (cache miss)
                 else
                     v.mat = material.load(v.Material)
                 end
@@ -750,6 +1075,65 @@ if CLIENT then
 else -- SERVER
     local clientMeshes = {}
     local lastBase = nil
+    
+    local trackedParentEntities = {}
+    local trackedNormalInputs = {}
+    local lastParentEntities = {}
+    local lastNormalInputs = {}
+
+    local function initServer(config)
+        trackedParentEntities = {}
+        trackedNormalInputs = {}
+        lastParentEntities = {}
+        lastNormalInputs = {}
+        
+        local inputNames = { "Base" }
+        local inputTypes = { "entity" }
+        local usedInputs = { ["Base"] = true }
+        
+        -- Dynamically collect Parent and TextureSwap inputs
+        if config and config.meshes then
+            for _, meshData in ipairs(config.meshes) do
+                if meshData.Parent and type(meshData.Parent) == "string" then
+                    local wireInputName = meshData.Parent
+                    if not usedInputs[wireInputName] then
+                        table.insert(inputNames, wireInputName)
+                        table.insert(inputTypes, "entity")
+                        usedInputs[wireInputName] = true
+                        table.insert(trackedParentEntities, wireInputName)
+                    end
+                end
+                
+                if meshData.TextureSwaps then
+                    for inputName, url in pairs(meshData.TextureSwaps) do
+                        if not usedInputs[inputName] then
+                            table.insert(inputNames, inputName)
+                            table.insert(inputTypes, "normal")
+                            usedInputs[inputName] = true
+                            table.insert(trackedNormalInputs, inputName)
+                        end
+                    end
+                end
+            end
+        end
+        
+        wire.adjustInputs(inputNames, inputTypes)
+        
+        -- Force re-broadcast all parent states after multiple delays
+        -- This handles AdvDupe2 wiring which connects AFTER the chip initializes
+        -- Multiple delays help in Multiplayer where entity replication takes time
+        local function forceRebroadcast()
+            if not isValid(chip()) then return end
+            for _, parentName in ipairs(trackedParentEntities) do
+                lastParentEntities[parentName] = nil
+            end
+            lastBase = nil
+        end
+        
+        timer.simple(3, forceRebroadcast)
+        timer.simple(7, forceRebroadcast)
+        timer.simple(12, forceRebroadcast)
+    end
 
     net.receive("reportMeshStatus", function(_, ply)
         local status = net.readTable()
@@ -774,13 +1158,6 @@ else -- SERVER
         end
     end)
 
-    wire.adjustPorts({
-        Base = "entity",
-    })
-
-    local base = wire.ports.Base
-
-
     net.receive("requestBase", function(_, ply)
         local currentBase = wire.ports.Base
         if not isValid(currentBase) then 
@@ -789,19 +1166,67 @@ else -- SERVER
         net.start("sendBase")
         net.writeEntity(currentBase)
         net.send(ply)
+        
+        for _, parentName in ipairs(trackedParentEntities) do
+            local parentEnt = wire.ports[parentName]
+            if isValid(parentEnt) then
+                net.start("sendMeshParent")
+                net.writeString(parentName)
+                net.writeEntity(parentEnt)
+                net.send(ply)
+            end
+        end
+        
+        for _, inputName in ipairs(trackedNormalInputs) do
+            local currentVal = wire.ports[inputName] or 0
+            if currentVal > 0 then
+                net.start("sendMeshSwap")
+                net.writeString(inputName)
+                net.writeFloat(currentVal)
+                net.send(ply)
+            end
+        end
     end)
 
-    timer.create("monitorBase", 1, 0, function()
+    hook.add("tick", "monitorBase", function()
         local currentBase = wire.ports.Base
         if currentBase ~= lastBase then
             lastBase = currentBase
             net.start("sendBase")
-            net.writeEntity(currentBase)
-            
+            net.writeEntity(isValid(currentBase) and currentBase or chip())
             net.send(find.allPlayers())
+        end
+        
+        for _, parentName in ipairs(trackedParentEntities) do
+            local currentEnt = wire.ports[parentName]
+            if currentEnt ~= lastParentEntities[parentName] then
+                lastParentEntities[parentName] = currentEnt
+                
+                net.start("sendMeshParent")
+                net.writeString(parentName)
+                net.writeEntity(isValid(currentEnt) and currentEnt or chip())
+                net.send(find.allPlayers())
+            end
+        end
+        
+        for _, inputName in ipairs(trackedNormalInputs) do
+            local currentVal = wire.ports[inputName] or 0
+            if currentVal ~= lastNormalInputs[inputName] then
+                lastNormalInputs[inputName] = currentVal
+                
+                net.start("sendMeshSwap")
+                net.writeString(inputName)
+                net.writeFloat(currentVal)
+                net.send(find.allPlayers())
+            end
         end
     end)
 
+    _G.MeshLoaderCore = {
+        mirror = mirror,
+        initServer = initServer,
+        Version = Version
+    }
 end
 hook.add("removed", "stopStreams", function()
     if net.isStreaming() then

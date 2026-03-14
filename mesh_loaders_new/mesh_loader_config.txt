@@ -8,6 +8,16 @@ dofile("mesh_loaders_new/mesh_loader_core.txt")
 
     Changelog:
     
+V2.11
+    Minor bug fixes
+    
+V2.10
+    Fixing some stuff
+    New parenting stuff so everything can be done in a single chip
+    TextureSwapping, for things like brakes, lights etc
+    It already featured local scale,offsetpos and angling, so just making sure people know
+    This version youll have to update the config file as well
+    
 V2.06
     What the fuck starfall, fixed some wierd behaviour..
 
@@ -123,7 +133,18 @@ Now that this has been said, go scroll down
     LowPolyTexture------------------Linear texture filtering, PS1 style
     Color2--------------------------Vector, think of it as a extra color brightness if needed
     SuppressEngineLighting----------Make it fullbright
+    offsetPos = Vector(0, 0, 0)-----As name implies
+    offsetAngle = Angle(0, 0, 0)----Same as above, both are local-able for each mesh entry    
+    Parent = "Wheel_Front_Left"-----Now you can set wheels and more in a single chip, works as a custom parent for each mesh entry
     
+    TextureSwaps = {
+        ["Brake"] = { --Input name
+            texture = "url here", --optional url or texture path
+            highlight = false, -- disable lighting or not when activating the swap, and optionally change color/alpha
+            color = Color(255,0,0,255) --optional
+        } 
+    }
+
     
         To use any of the following, EnvMapMask, BumpMap, you MUST enable the use of UseEnvMapSpecularReflections
     ALL of these must be used in some way or other, follow the example and read the notes.
@@ -195,9 +216,18 @@ local meshes = {
             PhongBoost = 1.5, --only works with normalmap - Spec Boost
             PhongExp = 64, --Spec Glossiness 
             RimLightBoost = 1.25,
-            RimLightExp = 18,   
             Flags = {2048},   --be careful of the flags, the order matters as well as the type     
-        
+            
+            --Parent = "Wheel_Front_Left" --now you can set wheels and more in a single chip
+           -[[
+            TextureSwaps = {
+                ["Brake"] = { --Input name
+                    texture = "url here", --optional url or texture path
+                    highlight = false, -- disable lighting or not when activating the swap, and optionally change color/alpha
+                    color = Color(255,0,0,255) --optional
+                } 
+            }
+            -]]
         },
 
 
@@ -254,9 +284,13 @@ local function mergeConfig(userConfig)
     local defaultConfig = getDefaultConfig()
     local finalConfig = table.copy(defaultConfig)
     
-    -- Merge user config with defaults
+    -- Merge everything from user config, overwriting defaults or adding new params
     for k, v in pairs(userConfig) do
-        finalConfig[k] = v
+        if type(v) == "table" and k ~= "Flags" and k ~= "ColorAndAlpha" then
+            finalConfig[k] = table.copy(v)
+        else
+            finalConfig[k] = v
+        end
     end
     
     return finalConfig
@@ -300,34 +334,36 @@ meshes = processMeshesTable(meshes)
 local W, R, G = Color(255, 255, 255), Color(255, 0, 0), Color(0, 255, 0)
 
 --############################################################################################################################################
--- Initialize the mesh loader
-if CLIENT then
-    if _G.MeshLoaderCore then
-        _G.MeshLoaderCore.initClient({
-            AllowCheckVersion = AllowCheckVersion,
-            meshName = meshName,
-            globalScale = globalScale,
-            offsetPos = offsetPos,
-            offsetAngle = offsetAngle,
-            meshSpawnDelay = meshSpawnDelay,
-            showMeshSpawnProgress = showMeshSpawnProgress,
-            debugPrints = debugPrints,
-            showProgressDisplay = showProgressDisplay,
-            progressDisplayType = progressDisplayType,
-            progressDisplayHeight = progressDisplayHeight,
-            meshes = meshes,
-            downloadStatus = downloadStatus,
-            progressData = progressData,
-            purgeOwnerTempFiles = _G.PurgeMeshLoaderTempFiles,
-            W = W, R = R, G = G
-        })
+if _G.MeshLoaderCore then
+    local configTbl = {
+        AllowCheckVersion = AllowCheckVersion,
+        meshName = meshName,
+        globalScale = globalScale,
+        offsetPos = offsetPos,
+        offsetAngle = offsetAngle,
+        meshSpawnDelay = meshSpawnDelay,
+        showMeshSpawnProgress = showMeshSpawnProgress,
+        debugPrints = debugPrints,
+        showProgressDisplay = showProgressDisplay,
+        progressDisplayType = progressDisplayType,
+        progressDisplayHeight = progressDisplayHeight,
+        meshes = meshes,
+        downloadStatus = downloadStatus,
+        progressData = progressData,
+        purgeOwnerTempFiles = _G.PurgeMeshLoaderTempFiles,
+        W = W, R = R, G = G
+    }
+    
+    if CLIENT then
+        _G.MeshLoaderCore.initClient(configTbl)
     else
-        print("Error: MeshLoaderCore not loaded. Make sure sfex_meshloader_core.txt is included.")
+        _G.MeshLoaderCore.initServer(configTbl)
     end
-    
-    
+else
+    print("Error: MeshLoaderCore not loaded. Make sure sfex_meshloader_core.txt is included.")
+end
 
-    -- Network handlers for mesh sharing between clients
+if CLIENT then
     net.receive("sendMeshToClient", function()
         local recipient = net.readEntity()
         local meshIndex = net.readInt(16)
@@ -379,21 +415,6 @@ else -- SERVER
             end
         end
     end)
-
---[[    wire.adjustPorts({
-        Base = "entity",
-    })
-
-    local base = wire.ports.Base
-
-    net.receive("requestBase", function(_, ply)
-        if not isValid(base) then return end
-        net.start("sendBase")
-        net.writeEntity(base)
-        net.send(ply)
-    end)
-    ]]--
-
 end
 
 hook.add("removed", "stopStreams", function()
