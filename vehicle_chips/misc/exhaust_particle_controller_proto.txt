@@ -1,0 +1,155 @@
+--@name Exhaust Particle Controller
+--@author RedFox (modified by Gemini for networking)
+--@shared
+
+-- This script controls exhaust particle emission based on throttle input from wiremod.
+-- It is self-contained and creates particles relative to the chip's position.
+
+if SERVER then
+    -- Wiremod input setup
+    wire.adjustInputs({"Throttle"}, {"Normal"}, {"Engine throttle (0-1)"})
+
+    -- Configuration
+    local EXHAUST_POS = Vector(0, 0, 0) -- Relative position of the exhaust from the chip
+    local ENGINE_TYPE = "gasoline" -- or "diesel"
+
+    -- Determines particle properties based on throttle and engine type
+    local function getExhaustParams(throttle)
+        if ENGINE_TYPE == "gasoline" then
+            local rate = math.max(1, throttle * 8)
+            local darkness = math.floor(180 - throttle * 60)
+            local color = Color(darkness, darkness, darkness, math.floor(120 + throttle * 60))
+            return rate, color
+        elseif ENGINE_TYPE == "diesel" then
+            local rate = 2 + throttle * 12
+            local darkness = math.floor(120 - throttle * 80)
+            local color = Color(darkness, darkness, darkness, math.floor(160 + throttle * 80))
+            return rate, color
+        end
+        return 0, Color(0,0,0,0)
+    end
+
+    local lastThrottle = 0
+
+    -- On the server, think hook decides when to emit particles and networks to the client
+    hook.add("think", "exhaust_controller", function()
+        local throttle = wire.ports.Throttle or 0
+        local throttleDelta = throttle - lastThrottle
+        lastThrottle = throttle
+
+        -- Emit mostly on acceleration or high throttle
+        if throttle > 0 and (throttleDelta > 0.02 or throttle > 0.8) then
+            local owner = player()
+            if not (owner and owner:isValid()) then return end
+
+            -- Position and direction are relative to the chip
+            local pos = chip():localToWorld(EXHAUST_POS)
+            local dir = chip():getForward() * -1
+
+            local emissionRate, color = getExhaustParams(throttle)
+
+            -- Send data to the chip's owner to create the particles
+            net.start("exhaust_particles")
+            net.writeVector(pos)
+            net.writeVector(dir)
+            net.writeFloat(throttle)
+            net.writeUInt(math.floor(emissionRate), 16)
+            net.writeColor(color)
+            net.send(owner)
+        end
+    end)
+end
+
+if CLIENT then
+    -- Create a single, persistent 2D particle emitter for this chip.
+    local Emitter = particle.create(Vector(0,0,0), false)
+
+    -- Load the material once and store it.
+    local ParticleMaterial = material.load("particles/smokey")
+
+    --[[ Particle Configuration ]]--
+    -- General
+    local PARTICLE_LIFETIME = 0.25
+    local PARTICLE_COLLIDE = true
+    local PARTICLE_BOUNCE = 1
+
+    -- Size & Length
+    local PARTICLE_SIZE = 2
+    local PARTICLE_END_SIZE = PARTICLE_SIZE * 2
+    local PARTICLE_START_LENGTH = 5
+    local PARTICLE_END_LENGTH = 15
+
+    -- Color & Alpha
+    local PARTICLE_END_ALPHA = 0
+
+    -- Physics
+    local PARTICLE_GRAVITY = Vector(0, 0, 20)
+    local PARTICLE_AIR_RESISTANCE = 250
+    local PARTICLE_ANGULAR_VELOCITY = Angle(0, 0, 0)
+    local PARTICLE_RANDOM_ANGLES = true
+
+    -- Velocity
+    local VELOCITY_BASE_SPEED = 100
+    local VELOCITY_THROTTLE_SCALE = 200
+    local VELOCITY_RANDOM_MIN = Vector(-10, -10, 0)
+    local VELOCITY_RANDOM_MAX = Vector(10, 10, 20)
+
+    -- Clean up the emitter when the chip is removed.
+    hook.add("destruct", "exhaust_cleanup", function()
+        if Emitter and Emitter:isValid() then
+            Emitter:destroy()
+        end
+    end)
+
+    -- Network receiver for creating the exhaust particles
+    net.receive("exhaust_particles", function()
+        if not (Emitter and Emitter:isValid()) then return end
+
+        -- Read data from the server
+        local pos = net.readVector()
+        local dir = net.readVector()
+        local throttle = net.readFloat()
+        local emissionRate = net.readUInt(16)
+        local color = net.readColor()
+
+        -- Determine how many particles we can actually create
+        local num_to_create = math.min(emissionRate, Emitter:getParticlesLeft())
+
+        for i = 1, num_to_create do
+            -- Add a particle to our emitter
+            local p = Emitter:add(
+                ParticleMaterial,
+                pos,
+                PARTICLE_SIZE,
+                PARTICLE_END_SIZE,
+                PARTICLE_START_LENGTH,
+                PARTICLE_END_LENGTH,
+                color.a,
+                PARTICLE_END_ALPHA,
+                PARTICLE_LIFETIME
+            )
+
+            if p then
+                -- Configure the newly created particle
+                local random_vel = Vector(
+                    math.random(VELOCITY_RANDOM_MIN.x, VELOCITY_RANDOM_MAX.x),
+                    math.random(VELOCITY_RANDOM_MIN.y, VELOCITY_RANDOM_MAX.y),
+                    math.random(VELOCITY_RANDOM_MIN.z, VELOCITY_RANDOM_MAX.z)
+                )
+                local base_vel = dir * (VELOCITY_BASE_SPEED + throttle * VELOCITY_THROTTLE_SCALE)
+                p:setVelocity(base_vel + random_vel)
+
+                if PARTICLE_RANDOM_ANGLES then
+                    p:setAngles(Angle(math.random(0, 360), math.random(0, 360), math.random(0, 360)))
+                end
+
+                p:setColor(color)
+                p:setGravity(PARTICLE_GRAVITY)
+                p:setAirResistance(PARTICLE_AIR_RESISTANCE)
+                p:setAngleVelocity(PARTICLE_ANGULAR_VELOCITY)
+                p:setBounce(PARTICLE_BOUNCE)
+                p:setCollide(PARTICLE_COLLIDE)
+            end
+        end
+    end)
+end
