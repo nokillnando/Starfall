@@ -215,13 +215,21 @@ else -- SERVER
             -- Width is applied in the main think loop.
             local peakLateralForce = Fz * ((Fz * activeTireData.Load_A1) + activeTireData.Load_A2) * activeTireData.CoF
             local peakLongitudinalForce = peakLateralForce * 1.1
+            
+            -- [ASPECT RATIO SIMULATION]
+            -- 50 is treated as the neutral baseline.
+            -- Lower (e.g. 30) = stiffer (higher Lat_B multiplier) = snappier turn-in.
+            -- Higher (e.g. 70) = softer (lower Lat_B multiplier) = more sluggish/flexible.
+            local aspectStiffnessMult = 50 / math.max(10, wheelData.AspectRatio or 50)
         
             local B, C, D, E, x
-            B, C, D, E = activeTireData.Lat_B, activeTireData.Lat_C, peakLateralForce, activeTireData.Lat_E
+            B = activeTireData.Lat_B * aspectStiffnessMult
+            C, D, E = activeTireData.Lat_C, peakLateralForce, activeTireData.Lat_E
             x = lateralSlipAngle
             local latForce = D * math.sin(C * math.atan(B * x - E * (B * x - math.atan(B * x))))
         
-            B, C, D, E = activeTireData.Lon_B, activeTireData.Lon_C, peakLongitudinalForce, activeTireData.Lon_E
+            B = activeTireData.Lon_B * aspectStiffnessMult
+            C, D, E = activeTireData.Lon_C, peakLongitudinalForce, activeTireData.Lon_E
             x = longitudinalSlipRatio
             local lonForce = D * math.sin(C * math.atan(B * x - E * (B * x - math.atan(B * x))))
         
@@ -350,17 +358,20 @@ else -- SERVER
                             local nameIndex = wheelCounts[countKey]
                             local wheelName = axleName .. "_" .. side .. "_" .. nameIndex
                             local tireProps = Config.TireSetup[axleName] or {}
+                            local wheelPhysObj = wheelEntity:getPhysicsObject()
                             
-                                -- [SIMCADE] Set physical material to ice
-                                wheelEntity:setMaterial("gmod_ice")
-                                
-                                Wheels[wheelName] = {
-                                    Entity = wheelEntity, PhysObj = wheelEntity:getPhysicsObject(),
-                                    CompoundName = tireProps.Compound,
-                                    Width = tireProps.Width,
-                                    AspectRatio = tireProps.AspectRatio,
-                                    Load = 0,
-                                }
+                            -- [SIMCADE] Set physical material to prevent Source Engine friction
+                            if wheelPhysObj and wheelPhysObj:isValid() then
+                                wheelPhysObj:setMaterial(Config.WheelPhysicsMaterial or "jeeptire")
+                            end
+                            
+                            Wheels[wheelName] = {
+                                Entity = wheelEntity, PhysObj = wheelPhysObj,
+                                CompoundName = tireProps.Compound,
+                                Width = tireProps.Width,
+                                AspectRatio = tireProps.AspectRatio,
+                                Load = 0,
+                            }
                             lastAppliedForces[wheelName] = {cancel=Vector(0,0,0), grip=Vector(0,0,0), gripLocal=Vector(0,0,0)}
                             table.insert(OrderedWheelNames, wheelName)
                             NumWheels = NumWheels + 1
@@ -505,7 +516,9 @@ else -- SERVER
                         local frontRatioNormalized = Config.WeightRatioFront / totalRatio
                         local staticLoad = Config.TotalVehicleMass * Config.Gravity * (string.find(name, "Front") and frontRatioNormalized or (1 - frontRatioNormalized)) / (NumWheels / 2)
                         
-                        local rightSign = string.find(name, "Right") and 1 or -1
+                        local rightSign = string.find(name, "Right") and 1 or (string.find(name, "Left") and -1 or 0)
+                        -- [BIKE FIX] Center wheels (rightSign=0) skip lateral weight transfer entirely.
+                        -- A single centered wheel has no lateral offset to transfer weight to.
                         local isFrontWheel = string.find(name, "Front")
     
                         -- Aero
@@ -635,7 +648,7 @@ else -- SERVER
                         
                         -- 3. Damping
                         if comps.IsStatic then
-                            wheelPhys:setDamping(200, 200)
+                            wheelPhys:setDamping(100, 100)
                         else
                             wheelPhys:setDamping(0, comps.Damping or 0)
                         end
