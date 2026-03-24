@@ -2,7 +2,7 @@
 --@author [C17] Red Fox
 --@shared
 
-local Version = "1.1"
+local Version = "1.11"
 
 if CLIENT then
     
