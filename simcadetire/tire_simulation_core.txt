@@ -131,13 +131,22 @@ if CLIENT then
     
                         if ent == baseEntity then
                             -- [VISUALIZER BASE]
-                            right = ent:localToWorldVector(activeConfig.RightAxis) * length
-                            up = ent:localToWorldVector(activeConfig.UpAxis) * length
-                            fwd = ent:localToWorldVector(activeConfig.ForwardAxis) * length
+                            -- Manual localToWorldVector using entity basis vectors
+                            -- (getForward/getRight/getUp don't require physics objects)
+                            -- NOTE: Source Engine's getRight() returns -Y, so we negate it.
+                            local ef, er, eu = ent:getForward(), -ent:getRight(), ent:getUp()
+                            local function toWorld(v)
+                                return ef * v.x + er * v.y + eu * v.z
+                            end
+                            right = toWorld(activeConfig.RightAxis) * length
+                            up = toWorld(activeConfig.UpAxis) * length
+                            fwd = toWorld(activeConfig.ForwardAxis) * length
                         else
                             -- [VISUALIZER WHEEL]
-                            local vehicleRight = baseEntity:localToWorldVector(activeConfig.RightAxis)
-                            local rawRight = ent:getRight()
+                            -- Transform activeConfig.RightAxis through the base entity's orientation
+                            local bef, ber, beu = baseEntity:getForward(), -baseEntity:getRight(), baseEntity:getUp()
+                            local vehicleRight = bef * activeConfig.RightAxis.x + ber * activeConfig.RightAxis.y + beu * activeConfig.RightAxis.z
+                            local rawRight = -ent:getRight()
                             if rawRight:dot(vehicleRight) < 0 then
                                 rawRight = -rawRight
                             end
