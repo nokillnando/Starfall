@@ -2,7 +2,7 @@
 --@author [C17] Red Fox
 --@shared
 
-local Version = "1.11"
+local Version = "1.12"
 
 if CLIENT then
     
@@ -93,7 +93,8 @@ if CLIENT then
         
         -- HUD / Visualizer Logic
         if player() == owner() then
-            if activeConfig.ShowAxisVisualizer then
+            local needsHud = activeConfig.ShowAxisVisualizer or activeConfig.ShowTelemetry3D or activeConfig.ShowPacejkaGraph
+            if needsHud then
                 enableHud(owner(), true)
     
                 -- Request the base entity from the server
@@ -118,9 +119,148 @@ if CLIENT then
                     end
                 end)
     
+                net.receive("telemetryUpdate", function()
+                    local count = net.readUInt(8)
+                    for i = 1, count do
+                        if wheelEntities[i] then
+                            wheelEntities[i].Telemetry_Mag = net.readFloat()
+                            wheelEntities[i].Telemetry_Peak = net.readFloat()
+                            wheelEntities[i].Telemetry_Slip = net.readFloat()
+                        end
+                    end
+                end)
+
                 local font = render.createFont("Trebuchet24", 24, nil, false, nil, nil, true)
+                local mathFont = render.createFont("Roboto Mono", 16, 500, true)
+                local smoothTelemetry = {}
+                
+                hook.add("drawHud", "TireSim_TelemetryVisual", function()
+                    if not (baseEntity and baseEntity:isValid()) then return end
+                    
+                    -- Calculate high-framerate smoothing universally
+                    for i, wData in ipairs(wheelEntities) do
+                        if wData.Entity and wData.Entity:isValid() and wData.Telemetry_Peak and wData.Telemetry_Peak > 0 then
+                            smoothTelemetry[i] = smoothTelemetry[i] or {mag=0, slip=0}
+                            smoothTelemetry[i].mag = smoothTelemetry[i].mag + (math.abs(wData.Telemetry_Mag or 0) - smoothTelemetry[i].mag) * 0.4
+                            smoothTelemetry[i].slip = smoothTelemetry[i].slip + (math.abs(wData.Telemetry_Slip or 0) - smoothTelemetry[i].slip) * 0.4
+                        end
+                    end
+                    
+                    -- [TELEMETRY ON-WHEEL PILLARS]
+                    if activeConfig.ShowTelemetry3D then
+                        for i, wData in ipairs(wheelEntities) do
+                            if wData.Entity and wData.Entity:isValid() and wData.Telemetry_Peak and wData.Telemetry_Peak > 0 then
+                                local ratio = math.min(1.5, smoothTelemetry[i].mag / wData.Telemetry_Peak)
+                                local pos = wData.Entity:getPos()
+                                local w, h = render.getGameResolution()
+                                local scale = (h or 1080) / 1080
+                                
+                                local sPos = pos:toScreen()
+                                if sPos.visible then
+                                    local barWidth = 10 * scale
+                                    local barMaxHeight = 40 * scale
+                                    local currentHeight = barMaxHeight * math.min(1.0, ratio)
+                                    
+                                    local c = Color(0,255,0)
+                                    if ratio > 0.85 then c = Color(255,255,0) end
+                                    if ratio >= 1.0 then c = Color(255,0,0) end
+                                    
+                                    -- Outline
+                                    render.setColor(Color(0,0,0,200))
+                                    render.drawRectOutline(sPos.x - barWidth/2 - 1, sPos.y - barMaxHeight - 1, barWidth + 2, barMaxHeight + 2)
+                                    -- Background
+                                    render.setColor(Color(0,0,0,150))
+                                    render.drawRect(sPos.x - barWidth/2, sPos.y - barMaxHeight, barWidth, barMaxHeight)
+                                    -- Fill
+                                    render.setColor(c)
+                                    render.drawRect(sPos.x - barWidth/2, sPos.y - currentHeight, barWidth, currentHeight)
+                                    
+                                    -- Label
+                                    render.setFont(mathFont)
+                                    render.setColor(Color(255,255,255))
+                                    render.drawSimpleText(sPos.x, sPos.y - barMaxHeight - 10 * scale, tostring(math.floor(ratio*100)) .. "%", 1, 1)
+                                end
+                            end
+                        end
+                    end
+                    
+                    -- [PACEJKA GRAPH 2D]
+                    if activeConfig.ShowPacejkaGraph then
+                        local w, h = render.getGameResolution()
+                        if not h or h == 0 then h = 1080 end
+                        local scale = h / 1080
+                        
+                        -- Draw the math curve for the Primary Front Tire compound
+                        local activeTireData = nil
+                        for axName, axProps in pairs(activeConfig.TireSetup or {}) do
+                            if string.find(axName, "Front") then
+                                activeTireData = activeConfig.InternalProperties[axProps.Compound]
+                                break
+                            end
+                        end
+                        if not activeTireData then activeTireData = activeConfig.InternalProperties.Sport end
+                        
+                        local graphX = 50 * scale
+                        local graphY = 820 * scale
+                        local graphWidth = 350 * scale
+                        local graphHeight = 200 * scale
+                        
+                        render.setColor(Color(0, 0, 0, 150))
+                        render.drawRect(graphX, graphY, graphWidth, graphHeight)
+                        
+                        -- Draw Pacejka mathematical curve
+                        local B = activeTireData.Lat_B
+                        local C = activeTireData.Lat_C
+                        local E = activeTireData.Lat_E
+                        local D = graphHeight * 0.8
+                        
+                        render.setColor(Color(255, 255, 255, 100))
+                        local prevX, prevY
+                        for x_slip = 0, 1, 0.02 do
+                            local simSlip = x_slip * 0.5 -- 0 to 0.5 radians (0-30 degrees slip)
+                            local fY = D * math.sin(C * math.atan(B * simSlip - E * (B * simSlip - math.atan(B * simSlip))))
+                            local screenX = graphX + (x_slip * graphWidth)
+                            local screenY = graphY + graphHeight - fY
+                            if prevX then
+                                render.drawLine(prevX, prevY, screenX, screenY)
+                            end
+                            prevX = screenX; prevY = screenY
+                        end
+                        
+                        render.setFont(mathFont)
+                        render.setColor(Color(255, 255, 255, 200))
+                        render.drawSimpleText(graphX + 5 * scale, graphY - 25 * scale, "Tire Traction vs Slip Angle (Pacejka Curve)", 0, 0)
+                        render.drawSimpleText(graphX + 5 * scale, graphY + 5 * scale, "X-Axis: Slip Angle (sliding sideways from 0° -> 30°)", 0, 0)
+                        render.drawSimpleText(graphX + 5 * scale, graphY + 25 * scale, "Y-Axis: Total Grip Force provided by tire", 0, 0)
+                        
+                        -- Draw live dots for ALL active wheels onto the single comparative graph
+                        for i, wEnt in ipairs(wheelEntities) do
+                            if wEnt.Telemetry_Peak and wEnt.Telemetry_Peak > 0 then
+                                local ratio = math.min(1.0, smoothTelemetry[i].mag / wEnt.Telemetry_Peak)
+                                local simSlip = smoothTelemetry[i].slip or 0
+                                local x_slip = math.clamp(simSlip / 0.5, 0, 1) 
+                                
+                                local dotX = graphX + (x_slip * graphWidth)
+                                
+                                -- Now physically calculate the exact Pacejka Y value for this slip!
+                                local fY = D * math.sin(C * math.atan(B * simSlip - E * (B * simSlip - math.atan(B * simSlip))))
+                                local dotY = graphY + graphHeight - fY
+                                
+                                local c = Color(0,255,0)
+                                if string.find(wEnt.Name, "Rear") then c = Color(0,200,255) end
+                                if ratio > 0.85 then c = Color(255,255,0) end
+                                if ratio >= 1.0 then c = Color(255,0,0) end
+                                
+                                render.setColor(c)
+                                render.drawFilledCircle(dotX, dotY, 4 * scale)
+                                render.drawSimpleText(dotX + 6 * scale, dotY, wEnt.Name, 0, 1)
+                            end
+                        end
+                    end
+                end)
     
                 hook.add("drawHud", "TireSim_AxisVisual", function()
+                    if not activeConfig.ShowAxisVisualizer then return end
                     if not (baseEntity and baseEntity:isValid()) then return end
     
                     local function drawAxes(ent, length, labelSuffix, name)
@@ -219,11 +359,10 @@ else -- SERVER
         
         local InternalProperties = Config.InternalProperties or {}
         
-        local function GetGripForces(wheelData, activeTireData, lateralSlipAngle, longitudinalSlipRatio, load)
+        local function GetGripForces(wheelData, activeTireData, lateralSlipAngle, load)
             local Fz = load
             -- Width is applied in the main think loop.
             local peakLateralForce = Fz * ((Fz * activeTireData.Load_A1) + activeTireData.Load_A2) * activeTireData.CoF
-            local peakLongitudinalForce = peakLateralForce * 1.1
             
             -- [ASPECT RATIO SIMULATION]
             -- 50 is treated as the neutral baseline.
@@ -237,12 +376,7 @@ else -- SERVER
             x = lateralSlipAngle
             local latForce = D * math.sin(C * math.atan(B * x - E * (B * x - math.atan(B * x))))
         
-            B = activeTireData.Lon_B * aspectStiffnessMult
-            C, D, E = activeTireData.Lon_C, peakLongitudinalForce, activeTireData.Lon_E
-            x = longitudinalSlipRatio
-            local lonForce = D * math.sin(C * math.atan(B * x - E * (B * x - math.atan(B * x))))
-        
-            return latForce, lonForce
+            return latForce
         end
         
         wire.adjustInputs(
@@ -447,6 +581,8 @@ else -- SERVER
         end)
     
         local lastVel = Vector(0,0,0)
+        local thinkCounter = 0
+        local lastTelemetrySend = 0
     
         hook.add("think", "TireSim_Main", function()
             local Base = getValidBase()
@@ -553,6 +689,7 @@ else -- SERVER
                         local trace = trace.line(wheelData.Entity:getPos(), wheelData.Entity:getPos() - baseUp * traceDist, VehicleFilter)
                         
                         local latForceMag = 0
+                        local slipMetric = 0
                         local gripPct = 100
                         local rollingResistance = 0
                         
@@ -565,17 +702,21 @@ else -- SERVER
                             local surfaceGripMultiplier = activeTireData.SurfaceMultipliers[trace.MatType] or activeTireData.SurfaceMultipliers.Default
                             gripPct = math.clamp(100 * surfaceGripMultiplier, 0, 100)
                             
+                            local widthFactor = wheelData.Width / 225
+                            local gripBias = isFrontWheel and Config.FrontGripBias or Config.RearGripBias
+                            local finalGripMultiplier = (gripPct / 100) * widthFactor * gripBias
+                            
+                            -- Always calculate peak force for HUD telemetry, even when parked
+                            local fz = wheelData.Load
+                            local peakLatRaw = fz * ((fz * activeTireData.Load_A1) + activeTireData.Load_A2) * activeTireData.CoF
+                            wheelData.PeakForce = peakLatRaw * finalGripMultiplier * Config.OverallGripMultiplier
+                            
                             if trueSpeed > 15 then
                                 local safeSpeed = math.max(trueSpeed, 300)
                                 local lateralSlipAngle = math.atan(lateralVel / safeSpeed) * math.min(trueSpeed / 300, 1.0)
-                                local longitudinalSlipRatio = math.clamp(localAccel.x / Config.Gravity, -1, 1) * -0.1
+                                slipMetric = lateralSlipAngle
                                 
-                                local latForceRaw
-                                latForceRaw, _ = GetGripForces(wheelData, activeTireData, lateralSlipAngle, longitudinalSlipRatio, wheelData.Load)
-                                
-                                local widthFactor = wheelData.Width / 225
-                                local gripBias = isFrontWheel and Config.FrontGripBias or Config.RearGripBias
-                                local finalGripMultiplier = (gripPct / 100) * widthFactor * gripBias
+                                local latForceRaw = GetGripForces(wheelData, activeTireData, lateralSlipAngle, wheelData.Load)
                                 
                                 -- Target Magnitude
                                 local targetMag = latForceRaw * finalGripMultiplier * Config.OverallGripMultiplier
@@ -604,11 +745,13 @@ else -- SERVER
                             end
                         else
                             latForceMag = 0
+                            wheelData.PeakForce = 0
                             wheelData.IsStatic = false
+                            slipMetric = 0
                         end
                         
                         lastAppliedForces[name] = { mag = latForceMag }
-                        wheelData.LastComponents = { Mag = latForceMag, IsStatic = wheelData.IsStatic, Damping = rollingResistance }
+                        wheelData.LastComponents = { Mag = latForceMag, IsStatic = wheelData.IsStatic, Damping = rollingResistance, Slip = math.abs(slipMetric) }
                         
                         loads_t[i] = wheelData.Load
                         grip_pcts_t[i] = gripPct
@@ -620,6 +763,33 @@ else -- SERVER
                 wire.ports.Loads, wire.ports.GripPcts, wire.ports.AbsoluteForces, wire.ports.AngularDamping = loads_t, grip_pcts_t, forces_t, damping_t
                 wire.ports.CPULoadPct = cpuLoadPct
                 wire.ports.TickSkip = skipTicks
+                
+                -- [TELEMETRY NETWORKING] 
+                if Config.ShowTelemetry3D or Config.ShowPacejkaGraph then
+                    -- Interval limit ensures we don't trigger the Starfall 'net burst limit' safeguard
+                    local now = timer.systime()
+                    if now - lastTelemetrySend >= 0.03 then -- capped at ~33Hz
+                        if net.getBytesLeft and net.getBytesLeft() > 256 then
+                            net.start("telemetryUpdate")
+                            net.writeUInt(NumWheels, 8)
+                            for _, name in ipairs(OrderedWheelNames) do
+                                local wData = Wheels[name]
+                                if wData and wData.Entity and wData.Entity:isValid() then
+                                    net.writeFloat(wData.LastComponents and wData.LastComponents.Mag or 0)
+                                    net.writeFloat(wData.PeakForce or 0)
+                                    net.writeFloat(wData.LastComponents and wData.LastComponents.Slip or 0)
+                                else
+                                    -- Always write to keep the buffer sequence aligned
+                                    net.writeFloat(0)
+                                    net.writeFloat(0)
+                                    net.writeFloat(0)
+                                end
+                            end
+                            net.send(owner())
+                            lastTelemetrySend = now
+                        end
+                    end
+                end
             end 
             
             -- Force Apply Block 

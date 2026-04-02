@@ -7,18 +7,25 @@ dofile("tire_simulation_core.txt")
 -- ============================================================================
 -- TIRE COMPOUND DEFINITIONS
 -- ============================================================================
--- [SIMCADE SHAPING]
--- These curves define the "Personality" of the tire.
--- Lat/Lon_B = Stiffness (Slope at 0)
--- Lat/Lon_C = Shape Factor (Peak position)
--- Lat/Lon_E = Curvature (Falloff after peak)
--- Load_A1/A2 = Load Sensitivity (How much grip is gained per N of load)
+-- [PACEJKA MAGIC FORMULA TUNING]
+-- These variables define the exact mathematical shape of the tire's traction circle.
+-- CoF:     Maximum overall grip limit (Coefficient of Friction).
+-- Lat_B:   Stiffness Factor. Determines how quickly the tire reaches its peak grip.
+--          Higher = stiffer, snappier turn-in. Lower = softer, flexes more before gripping.
+-- Lat_C:   Shape Factor. Determines what happens after the peak.
+--          ~1.0 = sharp peak, ~1.3 = plateau peak, ~1.5+ = broad gentle peak.
+-- Lat_E:   Curvature Factor. Controls how violently the tire snaps when sliding.
+--          0.1 = smooth breakaway, 0.9 = sudden, violent loss of traction.
+-- Load_A1/A2: Load Sensitivity. How much grip is naturally gained when applying downward force.
+
+--Github Link:
+--https://github.com/nokillnando/Starfall/tree/main/simcadetire
 
 local InternalProperties = {
     Comfort = {
         CoF = 0.55, 
         BaseRollingResistance = 0.15,
-        Lat_B = 8, Lat_C = 1.3, Lat_E = 0.1, Lon_B = 9, Lon_C = 1.5, Lon_E = 0.85, -- [SIMCADE] Flatter peak
+        Lat_B = 8, Lat_C = 1.3, Lat_E = 0.1, -- [SIMCADE] Flatter peak
         Load_A1 = -0.0000004, Load_A2 = 2.0, 
         SurfaceMultipliers = {
             [67]=1.0, [84]=1.0, [87]=0.95, [77]=0.9, [71]=0.85, [86]=0.85, [89]=0.9, [74]=0.6, [68]=0.7,
@@ -28,7 +35,7 @@ local InternalProperties = {
     Sport = {
         CoF = 1.25, 
         BaseRollingResistance = 0.1,
-        Lat_B = 10, Lat_C = 1.35, Lat_E = 0.1, Lon_B = 12, Lon_C = 1.8, Lon_E = 0.97, -- [SIMCADE] Flatter peak
+        Lat_B = 10, Lat_C = 1.35, Lat_E = 0.1, -- [SIMCADE] Flatter peak
         Load_A1 = -0.0000005, Load_A2 = 2.2, 
         SurfaceMultipliers = {
             [67]=1.0, [84]=1.05, [87]=0.9, [77]=0.85, [71]=0.8, [86]=0.8, [89]=0.85, [74]=0.3, [68]=0.5,
@@ -38,7 +45,7 @@ local InternalProperties = {
     Slick = {
         CoF = 1.7, 
         BaseRollingResistance = 0.07,
-        Lat_B = 12, Lat_C = 1.4, Lat_E = 0.1, Lon_B = 16, Lon_C = 1.9, Lon_E = 0.95, -- [SIMCADE] Smoother breakaway
+        Lat_B = 12, Lat_C = 1.4, Lat_E = 0.1, -- [SIMCADE] Smoother breakaway
         Load_A1 = -0.0000001, Load_A2 = 1.8, 
         SurfaceMultipliers = {
             [67]=1.1, [84]=1.2, [87]=0.6, [77]=0.5, [71]=0.4, [86]=0.4, [89]=0.7, [74]=0.01, [68]=0.05,
@@ -48,7 +55,7 @@ local InternalProperties = {
     Rally = {
         CoF = 1.1, 
         BaseRollingResistance = 0.17,
-        Lat_B = 9, Lat_C = 1.5, Lat_E = 0.1, Lon_B = 10, Lon_C = 1.6, Lon_E = 0.9, -- [SIMCADE] More forgiving
+        Lat_B = 9, Lat_C = 1.5, Lat_E = 0.1, -- [SIMCADE] More forgiving
         Load_A1 = -0.0000004, Load_A2 = 2.1, 
         SurfaceMultipliers = {
             [67]=0.85, [84]=0.8, [87]=0.9, [77]=0.75, [71]=0.9, [86]=0.85, [89]=0.7, [74]=1.1, [68]=1.2,
@@ -63,7 +70,9 @@ local InternalProperties = {
 -- ============================================================================
 local UserConfig = {
     -- Display Settings
-    ShowAxisVisualizer = false, -- Draws 3D axes on wheels/base (Only owner sees this)
+    ShowAxisVisualizer = false, -- Draws 3D debug arrows on wheels/base for alignment
+    ShowTelemetry3D = true,     -- [NEW] Draws live 3D grip pillars above every wheel
+    ShowPacejkaGraph = true,    -- [NEW] Draws the math grip curve on your 2D HUD exactly as defined by your compound
     ShowWheelHolograms = false, -- Draws dummy wheel models for debug
     VisualizerLength = 2,       -- Length of debug axes
     AllowPrintFilter = false,   -- Print when new entities are added to filter
@@ -78,9 +87,9 @@ local UserConfig = {
     UpAxis = Vector(0, 0, 1),
     
     -- Vehicle Specs
-    TotalVehicleMass = 1200,   -- Virtual Mass in KG (Affects load transfer/grip)
-    WeightRatioFront = 0.5,    -- Ratio of weight on front axle (0.0 - 1.0)
-    WeightRatioRear = 0.5,     -- Ratio of weight on rear axle (0.0 - 1.0)
+    TotalVehicleMass = 700,   -- Virtual Mass in KG (Affects load transfer/grip)
+    WeightRatioFront = 0.63,    -- Ratio of weight on front axle (0.0 - 1.0)
+    WeightRatioRear = 0.37,     -- Ratio of weight on rear axle (0.0 - 1.0)
     CenterOfMassHeight = 25,   -- Virtual CG Height (Inches)
     TireRadius = 16,           -- Inches (Used for trace distance)
     
@@ -89,13 +98,19 @@ local UserConfig = {
     
     -- Tire Setup
     TireSetup = {
-        Front = { Compound = "Sport", Width = 205, AspectRatio = 55 },
-        Rear  = { Compound = "Sport", Width = 225, AspectRatio = 50 },
+        Front = { Compound = "Sport", Width = 155, AspectRatio = 70 },
+        Rear  = { Compound = "Sport", Width = 155, AspectRatio = 70 },
     },
+    
+    -- Wheel Physics Material
+    -- WARNING: This chip was designed and tuned with "jeeptire" in mind.
+    -- Changing this material may significantly alter handling behavior as it affects
+    -- the base friction that Source Engine applies before custom forces are calculated.
+    WheelPhysicsMaterial = "jeeptire",  -- Default: "jeeptire" (Recommended)
     
     -- Tuning / Handling
     OverallGripMultiplier = 0.010,  -- Global Grip Scale
-    FrontGripBias = 0.75,           -- Grip Multiplier Front (<1.0 = more understeer)
+    FrontGripBias = 0.5,           -- Grip Multiplier Front (<1.0 = more understeer)
     RearGripBias = 0.75,            -- Grip Multiplier Rear (>1.0 = more stability)
     YawStabilityFactor = 0.1,       -- "Simcade Assist": Dampens inertia spins (0.0 = disable)
     GripDampingFactor = 1.0,        -- Smooths force application (Lower = snappier/sharper)
