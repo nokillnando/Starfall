@@ -153,27 +153,30 @@ if CLIENT then
     local spawnedHolograms = {}
     local networkedEntities = {}
 
+    local function updateHoloTransforms(holo)
+        if not isValid(holo) then return end
+        
+        local targetParent = base
+        if holo.MeshTargetParentName and networkedEntities[holo.MeshTargetParentName] and isValid(networkedEntities[holo.MeshTargetParentName]) then
+            targetParent = networkedEntities[holo.MeshTargetParentName]
+        end
+        
+        holo:setParent(targetParent)
+
+        -- Use individual mesh offsets if they exist, otherwise global, or default to 0 if not loaded yet
+        local meshOffsetPos = (holo.MeshConfig and holo.MeshConfig.offsetPos) or activeConfig.offsetPos or Vector(0, 0, 0)
+        local meshOffsetAng = (holo.MeshConfig and holo.MeshConfig.offsetAngle) or activeConfig.offsetAngle or Angle(0, 0, 0)
+        
+        holo:setPos(targetParent:localToWorld(meshOffsetPos))
+        holo:setAngles(targetParent:localToWorldAngles(meshOffsetAng))
+    end
+
     net.receive("sendBase", function()
         local ent = net.readEntity()
         base = isValid(ent) and ent or chip()
 
         for i, holo in ipairs(spawnedHolograms) do
-            if isValid(holo) then
-                local targetParent = base
-                
-                if holo.MeshTargetParentName and networkedEntities[holo.MeshTargetParentName] and isValid(networkedEntities[holo.MeshTargetParentName]) then
-                    targetParent = networkedEntities[holo.MeshTargetParentName]
-                end
-                
-                holo:setParent(targetParent)
-                
-                -- Use individual mesh offsets if they exist, otherwise global, or default to 0 if not loaded yet
-                local meshOffsetPos = (holo.MeshConfig and holo.MeshConfig.offsetPos) or activeConfig.offsetPos or Vector(0, 0, 0)
-                local meshOffsetAng = (holo.MeshConfig and holo.MeshConfig.offsetAngle) or activeConfig.offsetAngle or Angle(0, 0, 0)
-                
-                holo:setPos(targetParent:localToWorld(meshOffsetPos))
-                holo:setAngles(targetParent:localToWorldAngles(meshOffsetAng))
-            end
+            updateHoloTransforms(holo)
         end
     end)
     
@@ -184,16 +187,7 @@ if CLIENT then
         
         for i, holo in ipairs(spawnedHolograms) do
             if isValid(holo) and holo.MeshTargetParentName == parentName then
-                local targetParent = base
-                if isValid(ent) then targetParent = ent end
-                
-                holo:setParent(targetParent)
-                
-                local meshOffsetPos = (holo.MeshConfig and holo.MeshConfig.offsetPos) or activeConfig.offsetPos or Vector(0, 0, 0)
-                local meshOffsetAng = (holo.MeshConfig and holo.MeshConfig.offsetAngle) or activeConfig.offsetAngle or Angle(0, 0, 0)
-                
-                holo:setPos(targetParent:localToWorld(meshOffsetPos))
-                holo:setAngles(targetParent:localToWorldAngles(meshOffsetAng))
+                updateHoloTransforms(holo)
             end
         end
     end)
@@ -324,24 +318,19 @@ if CLIENT then
                       G, math.floor(spawned/totalToSpawn*100), W, "%)")
             end
 
-            local targetParent = base
             local assignedParentName = v.Parent
-            if assignedParentName and type(assignedParentName) == "string" then
-                if networkedEntities[assignedParentName] and isValid(networkedEntities[assignedParentName]) then
-                    targetParent = networkedEntities[assignedParentName]
-                end
-            else
+            if type(assignedParentName) ~= "string" then
                 assignedParentName = nil
             end
 
-            local meshOffsetPos = v.offsetPos or offsetPos
-            local meshOffsetAng = v.offsetAngle or offsetAngle
-
-            local holo = hologram.create(targetParent:localToWorld(meshOffsetPos), targetParent:localToWorldAngles(meshOffsetAng), "models/Combine_Helicopter/helicopter_bomb01.mdl")
+            local holo = hologram.create(base:getPos(), base:getAngles(), "models/Combine_Helicopter/helicopter_bomb01.mdl")
             holo.MeshTargetParentName = assignedParentName
             holo.MeshConfig = v
             table.insert(spawnedHolograms, holo)
-            holo:setParent(targetParent)
+            
+            -- Apply proper transforms and parenting via central function
+            updateHoloTransforms(holo)
+            
             holo:setFilterMag(v.LowPolyTexture)
             holo:setFilterMin(v.LowPolyTexture)
             holo:setMesh(holomesh)
