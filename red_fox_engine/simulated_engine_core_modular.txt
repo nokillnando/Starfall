@@ -1,0 +1,3678 @@
+-- Red Fox Engine Core v2.22 (Starfall Port)
+-- Ported from Expression 2 & Standardized to TireSim Pattern
+
+local Core = {}
+_G.RedFoxEngineCore = Core
+local Version = "3.01" -- v3 Alpha
+
+-- Math Helpers
+local function clamp(val, min, max) return math.clamp(val, min, max) end
+local function round(val, decimals) return math.round(val, decimals) end
+local function sign(val) return val > 0 and 1 or (val < 0 and -1 or 0) end
+
+-- Generalized N-point Bezier helper for Torque Curve (P0 = 0)
+function Core.getTorqueMultiplier(torqueTable, factor)
+    if not torqueTable or #torqueTable == 0 then return 1 end
+    local N = #torqueTable
+    local result = 0
+    local invF = 1 - factor
+    for i = 1, N do
+        -- Calculate binomial coefficient C(N, i) dynamically
+        local C = 1
+        for j = 1, i do C = C * (N - j + 1) / j end
+        result = result + C * (invF^(N - i)) * (factor^i) * torqueTable[i]
+    end
+    return result
+end
+
+if SERVER then
+
+    -- Server Initialization
+    local function initServer(config)
+        -- ============================================================================
+        -- CUSTOM SOUND SYSTEM
+        -- ============================================================================
+        -- Generic API for addons to play dynamic sounds by name
+        
+        function Core.playCustomSound(name, path, pitch, volume, loopTime, attachment)
+            if not name or not path then return end
+            net.start("EngineCustomSound")
+            net.writeString(name)
+            net.writeString(path)
+            net.writeFloat(pitch or 1)
+            net.writeFloat(volume or 1)
+            net.writeFloat(loopTime or 0) -- 0 = continuous seamless loop
+            net.writeEntity(attachment or (wire.ports.Engine or Entity(0)))
+            net.send()
+        end
+
+        function Core.updateCustomSound(name, pitch, volume)
+            if not name then return end
+            net.start("EngineCustomSoundUpdate")
+            net.writeString(name)
+            net.writeFloat(pitch or 1)
+            net.writeFloat(volume or 1)
+            net.send()
+        end
+
+        function Core.stopCustomSound(name)
+            if not name then return end
+            net.start("EngineCustomSoundStop")
+            net.writeString(name)
+            net.send()
+        end
+
+        -- ============================================================================
+        -- SETUP
+        -- ============================================================================
+        local c = config
+        
+        -- Wire Setup
+        local coreInputNames = { "Pod", "Chassis", "Engine", "FrontWheels", "RearWheels" }
+        local coreInputTypes = { "wirelink", "entity", "entity", "array", "array" }
+        local coreOutputNames = { "RPM", "Gear", "Clutch", "Throttle_Delay", "Clutch_Delay", "Torque", "Flywheel_PowerInertia", "Flywheel_RPM", "Brake", "Active", "Ignition", "Throttle", "Speed_KPH", "Turbo_PSI", "Redline", "MaxTorque", "BrakeF", "BrakeR", "SpeedN", "Braking", "GearMode", "Turbo_Boost", "InReverse", "Driver" }
+        local coreOutputTypes = { "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "entity" }
+        
+        -- ====== AUTO-WIRE: Addon Wire Inputs/Outputs ======
+        -- Automatically create wire inputs and outputs for addons
+        if config.Addons then
+            local addonInputNames = {}
+            local addonInputTypes = {}
+            local addonOutputNames = {}
+            local addonOutputTypes = {}
+            
+            -- Sort addon names to ensure deterministic Wire IO order (prevents unlinking on reload)
+            local sortedAddonNames = {}
+            for name, _ in pairs(config.Addons) do table.insert(sortedAddonNames, name) end
+            table.sort(sortedAddonNames)
+            
+            for _, addonName in ipairs(sortedAddonNames) do
+                local addon = config.Addons[addonName]
+                if addon.Enabled then
+                    -- Collect wire inputs
+                    if addon.WireInputs then
+                        for _, wireSpec in ipairs(addon.WireInputs) do
+                            -- Skip if conditional and condition is false
+                            if not (wireSpec.condition and not addon[wireSpec.condition]) then
+                                table.insert(addonInputNames, wireSpec.name or wireSpec[1])
+                                table.insert(addonInputTypes, wireSpec.type or wireSpec[2] or "normal")
+                            end
+                        end
+                    end
+                    
+                    -- Collect wire outputs
+                    if addon.WireOutputs then
+                        for _, wireSpec in ipairs(addon.WireOutputs) do
+                            table.insert(addonOutputNames, wireSpec.name or wireSpec[1])
+                            table.insert(addonOutputTypes, wireSpec.type or wireSpec[2] or "normal")
+                        end
+                    end
+                end
+            end
+            
+            -- Merge addon inputs with core inputs
+            for i = 1, #addonInputNames do
+                table.insert(coreInputNames, addonInputNames[i])
+                table.insert(coreInputTypes, addonInputTypes[i])
+            end
+            
+            -- Merge addon outputs with core outputs
+            for i = 1, #addonOutputNames do
+                table.insert(coreOutputNames, addonOutputNames[i])
+                table.insert(coreOutputTypes, addonOutputTypes[i])
+            end
+        end
+
+        -- Apply Wire Configuration (Single Call to prevent unlinking)
+        wire.adjustInputs(coreInputNames, coreInputTypes)
+        wire.adjustOutputs(coreOutputNames, coreOutputTypes)
+
+        -- State Initialization
+        local s = {
+            RPM = 0, Gear = 0, Clutch = 0, Throttle = 0, Active = false, 
+            Torque = 0, Flywheel_RPM = 0, Turbo_RPM = 0,
+            Flywheel_PowerInertia = 0,
+            Ignition = 0, IsSlipping = false, Speed = 0,
+            InReverse = false, GearMode = 0,
+            Throttle_Delay = 0, Clutch_Delay = 0,
+            IsInManualMode = false, IsInSportMode = false,
+            Timers = {},
+            LastSyncedValues = {}  -- Track last sent values for delta-based sending
+        }
+        
+        -- Helper: Timer check
+        local function clk(name, duration)
+            if s.Timers[name] and timer.curtime() < s.Timers[name] then return false end
+            if duration then s.Timers[name] = timer.curtime() + (duration/1000) end
+            return true
+        end
+        
+        -- ============================================================================
+        -- DYNAMIC FORCE SCALING (Simcade Tire Pattern)
+        -- ============================================================================
+        -- Forces applied every frame but engine calcs run at reduced update rate
+        -- Forces must be scaled by tick interval so they work correctly at any tick rate
+        local thinkCounter = 0
+        local skipTicks = 0
+        local tickInterval = 1/66  -- Default 66 tick
+        local tickMult = 1         -- Force multiplier to compensate for tick rate
+        local function initDynamicScaling()
+            tickInterval = game.getTickInterval()
+            local targetInterval = 1 / math.max(1, config.UpdateRate or 66)
+            skipTicks = math.max(0, math.floor(targetInterval / tickInterval + 0.5) - 1)
+            -- tickMult scales forces to maintain consistent output at different tick rates
+            -- At 33 tick: tickInterval = 1/33 ≈ 0.03, tickMult ≈ 2.0x
+            -- At 66 tick: tickInterval = 1/66 ≈ 0.015, tickMult = 1.0x
+            tickMult = (1/66) / tickInterval  -- Normalized to 66 tick as baseline
+        end
+        initDynamicScaling()
+
+        -- Helper function: Read any key from Pod
+        -- Usage: getKeyState(pod, "N") returns true/false if N key pressed
+        local function getKeyState(pod, keyName)
+            if not pod or not keyName then return false end
+            return (pod[keyName] or 0) > 0
+        end
+
+        local function getDriverFromPod(pod)
+            if not pod or not isValid(pod) then return nil end
+
+            -- Wirelink outputs (preferred)
+            local driver = pod["Driver"]
+            if isValid(driver) then return driver end
+
+            -- Try to resolve pod entity from wirelink outputs
+            local ent = pod["Entity"] or pod["Vehicle"] or pod["Pod"]
+            if not isValid(ent) then
+                local ok, result = pcall(function()
+                    if pod.entity then
+                        return pod:entity()
+                    end
+                    return nil
+                end)
+                if ok and isValid(result) then
+                    ent = result
+                end
+            end
+
+            if isValid(ent) and ent.getDriver then
+                local ok, result = pcall(function()
+                    return ent:getDriver()
+                end)
+                if ok and isValid(result) then
+                    return result
+                end
+            end
+            return nil
+        end
+
+        -- Driver key state tracking (networked from client)
+        s.DriverKeyState = {}
+        local function getDriverKeyState(ply)
+            local st = s.DriverKeyState[ply]
+            if not st then
+                st = { manual = false, sport = false, pressedKeys = {}, downKeys = {} }
+                s.DriverKeyState[ply] = st
+            elseif not st.pressedKeys then
+                st.pressedKeys = {}
+            end
+            if not st.downKeys then st.downKeys = {} end
+            return st
+        end
+
+        net.receive("EngineToggleKeys", function(len, ply)
+            if not isValid(ply) then return end
+
+            local pod = wire and wire.ports and wire.ports.Pod
+            local driver = getDriverFromPod(pod)
+            if not isValid(driver) or driver ~= ply then return end
+
+            local manualDown = net.readBool()
+            local sportDown = net.readBool()
+            local st = getDriverKeyState(ply)
+            st.manual = manualDown
+            st.sport = sportDown
+        end)
+
+        net.receive("EngineAddonKeyPress", function(len, ply)
+            if not isValid(ply) then return end
+
+            local pod = wire and wire.ports and wire.ports.Pod
+            local driver = getDriverFromPod(pod)
+            if not isValid(driver) or driver ~= ply then return end
+
+            local keyName = net.readString()
+            if type(keyName) ~= "string" or keyName == "" then return end
+
+            local st = getDriverKeyState(ply)
+            st.pressedKeys[keyName] = true
+            st.downKeys[keyName] = true
+        end)
+
+        net.receive("EngineAddonKeyRelease", function(len, ply)
+            if not isValid(ply) then return end
+
+            local pod = wire and wire.ports and wire.ports.Pod
+            local driver = getDriverFromPod(pod)
+            if not isValid(driver) or driver ~= ply then return end
+
+            local keyName = net.readString()
+            if type(keyName) ~= "string" or keyName == "" then return end
+
+            local st = getDriverKeyState(ply)
+            if st and st.downKeys then
+                st.downKeys[keyName] = false
+            end
+        end)
+
+        -- Debug axes: periodic broadcast of chassis, engine, and wheel entities (no client request required)
+        if config.DebugAxes then
+            timer.create("Engine_Debug_Broadcast", 0.5, 0, function()
+                local chassis = wire and wire.ports and wire.ports.Chassis
+                if not isValid(chassis) then return end
+
+                local engine = wire and wire.ports and wire.ports.Engine
+                local front = wire.ports.FrontWheels or {}
+                local rear = wire.ports.RearWheels or {}
+
+                net.start("EngineDebugBase")
+                net.writeEntity(chassis)
+                net.writeEntity(isValid(engine) and engine or chip())
+                local count = (front and #front or 0) + (rear and #rear or 0)
+                net.writeUInt(count, 8)
+                for i, w in ipairs(front) do
+                    local name = "front_right"
+                    if isValid(w) and isValid(chassis) then
+                        local localPos = chassis:worldToLocal(w:getPos())
+                        if localPos.y >= 0 then name = "front_left" end
+                    elseif i == 1 then
+                        name = "front_left" -- Fallback
+                    end
+                    net.writeString(name)
+                    net.writeEntity(w)
+                end
+                for i, w in ipairs(rear) do
+                    local name = "rear_right"
+                    if isValid(w) and isValid(chassis) then
+                        local localPos = chassis:worldToLocal(w:getPos())
+                        if localPos.y >= 0 then name = "rear_left" end
+                    elseif i == 1 then
+                        name = "rear_left" -- Fallback
+                    end
+                    net.writeString(name)
+                    net.writeEntity(w)
+                end
+                net.send()
+            end)
+        end
+
+        -- Debug axes: respond to client requests with chassis, engine, and wheel entities
+        net.receive("EngineDebugRequestBase", function(len, ply)
+            if not isValid(ply) then return end
+            local chassis = wire and wire.ports and wire.ports.Chassis
+            if not (chassis and chassis:isValid()) then return end
+
+            local engine = wire and wire.ports and wire.ports.Engine
+            local front = wire.ports.FrontWheels or {}
+            local rear = wire.ports.RearWheels or {}
+
+            net.start("EngineDebugBase")
+            net.writeEntity(chassis)
+            net.writeEntity(isValid(engine) and engine or entity(0))
+            local count = (front and #front or 0) + (rear and #rear or 0)
+            net.writeUInt(count, 8)
+            for i, w in ipairs(front) do
+                local name = i == 1 and "front_left" or "front_right"
+                net.writeString(name)
+                net.writeEntity(w)
+            end
+            for i, w in ipairs(rear) do
+                local name = i == 1 and "rear_left" or "rear_right"
+                net.writeString(name)
+                net.writeEntity(w)
+            end
+            net.send(ply)
+        end)
+
+        local function consumeDriverKey(driver, keyName)
+            if not isValid(driver) then return false end
+            local st = s.DriverKeyState and s.DriverKeyState[driver]
+            if not st or not st.pressedKeys then return false end
+            if st.pressedKeys[keyName] then
+                st.pressedKeys[keyName] = false
+                return true
+            end
+            return false
+        end
+        -- ============================================================================
+        -- MAIN LOOP
+        -- ============================================================================
+        hook.add("think", "EngineMain", function()
+            if quotaAverage() > 0.9 then return end -- Quota Safety
+            
+            thinkCounter = thinkCounter + 1
+            local shouldUpdateEngine = (thinkCounter % (skipTicks + 1) == 0)
+            
+            
+            local Chassis = wire.ports.Chassis
+            local Engine = wire.ports.Engine
+            if not isValid(Chassis) or not isValid(Engine) then return end
+            
+            -- Time Scaling for Internal Physics
+            -- If we are skipping ticks (low UpdateRate), we must scale internal integration steps
+            -- so physics (RPM, Inertia) advance by the correct amount of "simulated time"
+            local EngineTimeScale = (skipTicks + 1)
+            
+            -- ====== AUTO-WIRE: Addon Wire Inputs ======
+            -- Automatically read wire inputs into addon table values
+            if c.Addons then
+                for addonName, addon in pairs(c.Addons) do
+                    if addon.Enabled and addon.WireInputs then
+                        for _, wireSpec in ipairs(addon.WireInputs) do
+                            -- Skip if conditional and condition is false
+                            if wireSpec.condition and not addon[wireSpec.condition] then
+                                -- Skip this input
+                            else
+                                local wireName = wireSpec.name or wireSpec[1]
+                                local targetField = wireSpec.target or wireName
+                                local value = wire.ports[wireName]
+                                
+                                if value ~= nil then
+                                    addon[targetField] = value
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+
+            -- 1. INPUTS
+            local Key_W, Key_S, Key_Space, Key_Shift, Key_Alt, Key_M1, Key_M2, Key_R = false, false, false, false, false, false, false, false
+            local Pod = wire.ports.Pod
+            if Pod and isValid(Pod) then
+                Key_W = (Pod["W"] or 0) > 0; Key_S = (Pod["S"] or 0) > 0
+                Key_Space = (Pod["Space"] or 0) > 0; Key_Shift = (Pod["Shift"] or 0) > 0
+                Key_Alt = (Pod["Alt"] or 0) > 0; Key_M1 = (Pod["Mouse1"] or 0) > 0
+                Key_M2 = (Pod["Mouse2"] or 0) > 0; Key_R = (Pod["R"] or 0) > 0
+            end
+            local Driver = getDriverFromPod(Pod)
+            s.Driver = Driver
+            s.Chassis = Chassis
+            s.Engine = Engine
+            
+            -- Store key inputs in state for addon access (physics control, etc)
+            s.KeyInputs = {
+                W = Key_W and 1 or 0,
+                S = Key_S and 1 or 0,
+                A = (Pod and (Pod["A"] or 0) > 0) and 1 or 0,
+                D = (Pod and (Pod["D"] or 0) > 0) and 1 or 0,
+                Space = Key_Space and 1 or 0,
+                Shift = Key_Shift and 1 or 0,
+                Alt = Key_Alt and 1 or 0,
+                M1 = Key_M1 and 1 or 0,
+                M2 = Key_M2 and 1 or 0,
+                R = Key_R and 1 or 0,
+            }
+
+            -- Input Mapping (E2 Parity)
+            -- Key_F (Ignition) -> Pod "Light" (Flashlight) input
+            -- E2: Key_F = POD:number("Light")
+            local Key_F = (Pod and (Pod["Light"] or 0) > 0) or false
+
+            -- E2: ReverseWSonReverse swaps W/S in ClassicAuto reverse
+            -- Allow addons to override via a generic state/config flag
+            local skipWSInversion = (s.SkipWSInversion == true) or (c.SkipWSInversion == true)
+            if not skipWSInversion and c.AutoGear and c.ClassicAuto and c.ReverseWSonReverse and s.GearMode == 1 then
+                local tmp = Key_W
+                Key_W = Key_S
+                Key_S = tmp
+            end
+
+            -- Manual mode toggle (ClassicAuto only)
+            if c.ManualModeEnabled and (c.ClassicAuto or c.UseRPMBasedGear) and isValid(Driver) then
+                local st = s.DriverKeyState and s.DriverKeyState[Driver]
+                local ManualState = st and st.manual or false
+                if ManualState ~= s.IsInManualMode then
+                    s.IsInManualMode = ManualState
+                    local msg = "Manual Mode: " .. (s.IsInManualMode and "Enabled" or "Disabled")
+                    if isValid(Driver) and Driver:isPlayer() then
+                        if SERVER then
+                            pcall(printHud, Driver, msg)
+                        elseif Driver == player() then
+                            pcall(printHud, msg)
+                        end
+                    end
+                end
+            end
+
+            -- Comfort/Sport mode toggle
+            if c.UseComfortSportMode and isValid(Driver) then
+                local st = s.DriverKeyState and s.DriverKeyState[Driver]
+                local SportState = st and st.sport or false
+                if SportState ~= s.IsInSportMode then
+                    s.IsInSportMode = SportState
+                    local msg = "Sport Mode: " .. (s.IsInSportMode and "Enabled" or "Disabled")
+                    if isValid(Driver) and Driver:isPlayer() then
+                        if SERVER then
+                            pcall(printHud, Driver, msg)
+                        elseif Driver == player() then
+                            pcall(printHud, msg)
+                        end
+                    end
+                end
+            end
+
+            -- Ignition State Machine (Real Car Logic)
+            -- 0 = Off
+            -- 1 = On (Electronics/Ignition) - first press of key
+            -- 2 = Cranking (Starter) - second press of key, hold to crank
+            -- 3 = Active (Engine Running Self-Sustaining) - after holding crank for x ms
+            
+            local CrankHoldTime = 500  -- ms to hold state 2 before engine catches
+            
+            -- Rising edge of Key_F (key pressed)
+            if Key_F and not s.LastF then
+                if s.Ignition == 0 then
+                    s.Ignition = 1  -- First press: turn ignition on
+                elseif s.Ignition == 1 then
+                    if s.Active then
+                        s.Ignition = 0  -- Press while engine running: turn off
+                    else
+                        s.Ignition = 2  -- Press while not running: start cranking
+                        s.CrankHoldTimer = 0
+                    end
+                end
+            end
+            
+            -- While cranking, accumulate hold time
+            if s.Ignition == 2 and Key_F then
+                s.CrankHoldTimer = (s.CrankHoldTimer or 0) + (1/60 * 1000)  -- ms
+                if s.CrankHoldTimer >= CrankHoldTime then
+                    s.Ignition = 3  -- Engine catches after holding
+                end
+            end
+            
+            -- Release key while cranking
+            if not Key_F and s.LastF and s.Ignition == 2 then
+                s.Ignition = 1  -- Back to ignition on state
+                s.CrankHoldTimer = 0
+            end
+            
+            -- When engine becomes active, stay in active state
+            if s.Ignition == 3 and s.Active then
+                s.Ignition = 1  -- Engine running, back to normal on state
+            end
+            
+            s.LastF = Key_F
+            
+            -- Restoration: Speed & Direction
+            local Velocity = Chassis:getVelocity()
+            s.Speed = Velocity:getLength() * 0.09144
+            local EngineDir = Engine:getUp()
+
+            -- "Active" means Engine is self-sustaining
+            s.Active = s.RPM > 350
+
+            -- ====== ADDON HOOK: OnIgnition ======
+            -- Allow addons to override ignition behavior (e.g., electric engines skip cranking)
+            if c.Addons then
+                for name, addon in pairs(c.Addons) do
+                    if addon.Enabled and addon.OnIgnition then
+                        local result = addon.OnIgnition(s, c, {
+                            ignition = s.Ignition,
+                            key_f = Key_F,
+                            last_f = s.LastF,
+                            active = s.Active,
+                            rpm = s.RPM
+                        })
+                        if result then
+                            if result.ignition ~= nil then s.Ignition = result.ignition end
+                            if result.active ~= nil then s.Active = result.active end
+                            if result.rpm ~= nil then s.RPM = result.rpm end
+                        end
+                    end
+                end
+            end
+
+            -- ====== ADDON HOOK: OnEngineUpdate ======
+            -- Generic update hook for addons (run every tick)
+            if c.Addons then
+                for name, addon in pairs(c.Addons) do
+                    if addon.Enabled and addon.OnEngineUpdate then
+                        addon.OnEngineUpdate(s, c)
+                    end
+                end
+            end
+            
+            -- If an addon provided display overrides during OnIgnition, force an immediate net update
+            if c.AddonDisplay then
+                s.ForceNetNow = true
+            end
+            
+            -- Continuous sound triggers (AFTER OnIgnition hook so addons can prevent sounds)
+            -- Bell sound: loops while in state 1 (ignition on) and engine not active
+            -- Addons can override this condition via custom state flags
+            local defaultBellCondition = (s.Ignition == 1 and not s.Active)
+            local shouldPlayBell = s.ShouldPlayBell ~= nil and s.ShouldPlayBell or defaultBellCondition
+            
+            if shouldPlayBell then
+                -- ====== ADDON HOOK: OnEngineSound ======
+                -- Allow addons to provide custom sound data (path, pitch, volume)
+                -- Called every frame to allow dynamic pitch/volume updates
+                local soundData = {
+                    soundType = "bell",
+                    path = c.Sounds and c.Sounds.Bell or "",
+                    pitch = c.BellPitch or 1,
+                    volume = c.BellVolume or 0.5,
+                    loopTime = (c.BellLoopTime or 300) / 1000
+                }
+                
+                if c.Addons then
+                    for name, addon in pairs(c.Addons) do
+                        if addon.Enabled and addon.OnEngineSound then
+                            local customSound = addon.OnEngineSound(s, c, soundData)
+                            if customSound then
+                                soundData = customSound
+                                break  -- Use first addon's custom sound
+                            end
+                        end
+                    end
+                end
+                
+                -- Only send sound if addon didn't return nil (silence)
+                if soundData then
+                    -- Send initial play message or continuous updates
+                    if not s.BellPlaying then
+                        net.start("EngineSound")
+                        net.writeBool(true)  -- Bell/Ignition sound
+                        net.writeString(soundData.path or "")
+                        net.writeFloat(soundData.pitch or 1)
+                        net.writeFloat(soundData.volume or 0.5)
+                        net.writeFloat(soundData.loopTime or 0.3)
+                        net.writeEntity(Engine or Entity(0))  -- Send engine entity for attachment
+                        net.send()
+                        s.BellPlaying = true
+                    else
+                        -- Send continuous updates for dynamic pitch/volume (rate limited to 50ms)
+                        if clk("BellUpdate", 50) then
+                            net.start("EngineSoundUpdate")
+                            net.writeBool(true)  -- Bell sound
+                            net.writeFloat(soundData.pitch or 1)
+                            net.writeFloat(soundData.volume or 0.5)
+                            net.send()
+                        end
+                    end
+                end
+            else
+                if s.BellPlaying then
+                    net.start("EngineSoundStop")
+                    net.writeBool(true)  -- Stop Bell
+                    net.send()
+                    s.BellPlaying = false
+                end
+            end
+            
+            -- Starter sound: loops while in state 2 (cranking)
+            if s.Ignition == 2 then
+                if not (s.StarterPlaying or false) then
+                    -- ====== ADDON HOOK: OnEngineSound ======
+                    local soundData = {
+                        soundType = "starter",
+                        path = c.Sounds and c.Sounds.Starter or "",
+                        pitch = c.StarterPitch or 1,
+                        volume = c.StarterVolume or 0.75,
+                        loopTime = (c.StarterLoopTime or 200) / 1000
+                    }
+                    
+                    if c.Addons then
+                        for name, addon in pairs(c.Addons) do
+                            if addon.Enabled and addon.OnEngineSound then
+                                local customSound = addon.OnEngineSound(s, c, soundData)
+                                if customSound then
+                                    soundData = customSound
+                                    break
+                                end
+                            end
+                        end
+                    end
+                    
+                    if soundData then
+                        net.start("EngineSound")
+                        net.writeBool(false)  -- Starter sound
+                        net.writeString(soundData.path or "")
+                        net.writeFloat(soundData.pitch or 1)
+                        net.writeFloat(soundData.volume or 0.75)
+                        net.writeFloat(soundData.loopTime or 0.2)
+                        net.send()
+                        s.StarterPlaying = true
+                    end
+                end
+            else
+                if s.StarterPlaying then
+                    net.start("EngineSoundStop")
+                    net.writeBool(false)  -- Stop Starter
+                    net.send()
+                    s.StarterPlaying = false
+                end
+            end
+            
+            -- Gear change sound
+            if s.Gear ~= (s.LastGearSound or 0) then
+                net.start("GearChangeSound")
+                net.send()
+                s.LastGearSound = s.Gear
+            end
+
+            -- Resolve state 3 after Active is updated to avoid sticking
+            if s.Ignition == 3 then
+                s.CrankCatchTimer = (s.CrankCatchTimer or 0) + (1/60 * 1000)
+                if s.Active then
+                    s.Ignition = 1
+                    s.CrankCatchTimer = 0
+                elseif s.CrankCatchTimer >= (CrankHoldTime or 500) then
+                    s.Ignition = 1
+                    s.CrankCatchTimer = 0
+                end
+            else
+                s.CrankCatchTimer = 0
+            end
+
+            -- Starter Logic (Cranking - gradual RPM boost, not instant)
+            if s.Ignition == 2 then
+                -- Gradually increase RPM during cranking (like E2: +25 per tick)
+                s.RPM = s.RPM + 25
+            end
+            
+            -- If Ignition Off, kill engine
+            if s.Ignition == 0 then
+                s.Active = false
+                s.RPM = 0  -- Force RPM to 0 when engine is off
+            end
+
+            -- Get wheel arrays (needed for both calculations and force application)
+            local FrontWheels = wire.ports.FrontWheels or {}
+            local RearWheels = wire.ports.RearWheels or {}
+            
+            -- Determine Drive Axis (used for wheel RPM and force application)
+            local function getAxis(ent, name)
+                if type(name) == "Vector" then
+                    -- Transform local vector to world space using entity's orientation
+                    local fwd = ent:getForward()
+                    local right = ent:getRight()
+                    local up = ent:getUp()
+                    return fwd * name.x + right * name.y + up * name.z
+                end
+                if name == "Up" then return ent:getUp()
+                elseif name == "Down" then return -ent:getUp()
+                elseif name == "Forward" then return ent:getForward()
+                elseif name == "Backward" then return -ent:getForward()
+                elseif name == "Right" then return ent:getRight()
+                elseif name == "Left" then return -ent:getRight()
+                else return ent:getUp() end
+            end
+            
+            -- EngineDirection should follow the Engine entity orientation (E2 parity)
+            -- Must recalculate every frame to follow engine rotation
+            local EngineDirection = getAxis(Engine, c.EngineAxis)
+            
+            -- ============================================================================
+            -- WHEEL RPM & BRAKE FORCES (Run Every Frame)
+            -- ============================================================================
+            -- Wheel RPMs are calculated at UpdateRate frequency and cached in state
+            -- Use cached FrontRPMs/RearRPMs for this frame's force applications
+            local FrontRPMs = s.FrontRPMs or {}
+            local RearRPMs = s.RearRPMs or {}
+            local Flywheels_RPM = s.Flywheels_RPM or {}
+
+            -- Apply braking torque (runs every frame, uses cached BrakeF/BrakeR from gate)
+            if s.Brake == 1 then
+                local brakeF = s.BrakeF or 0
+                local brakeR = s.BrakeR or 0
+                local brakeForcesFront = nil
+                local brakeForcesRear = nil
+                
+                -- ====== ADDON HOOK: OnBrakeApply ======
+                -- Allow addons to modify brake force (e.g., ABS, brake balance)
+                if c.Addons then
+                    for name, addon in pairs(c.Addons) do
+                        if addon.Enabled and addon.OnBrakeApply then
+                            local modifiedBrake = addon.OnBrakeApply(s, c, {
+                                brakeForceF = brakeF,
+                                brakeForceR = brakeR,
+                                frontRPMs = FrontRPMs,
+                                rearRPMs = RearRPMs,
+                                speed = s.Speed or 0,
+                                speedN = s.SpeedN or 0
+                            })
+                            if modifiedBrake then
+                                brakeF = modifiedBrake.brakeForceF or brakeF
+                                brakeR = modifiedBrake.brakeForceR or brakeR
+                                -- Support for per-wheel braking (4-Channel ABS / ESP / TCS)
+                                if modifiedBrake.brakeForcesFront then brakeForcesFront = modifiedBrake.brakeForcesFront end
+                                if modifiedBrake.brakeForcesRear then brakeForcesRear = modifiedBrake.brakeForcesRear end
+                            end
+                        end
+                    end
+                end
+                
+                for i, w in ipairs(FrontWheels) do
+                    if isValid(w) then
+                        local phys = w:getPhysicsObject()
+                        if isValid(phys) then
+                            local wheelRPM = FrontRPMs[i] or 0
+                            local force = 5 * wheelRPM * tickMult
+                            local brakeMult = c.BrakeMult or 1
+                            -- Use per-wheel brake force if available, otherwise scalar
+                            local finalBrake = (brakeForcesFront and brakeForcesFront[i]) or brakeF
+                            phys:applyTorque((EngineDirection) * force * finalBrake * brakeMult)
+                        end
+                    end
+                end
+                for i, w in ipairs(RearWheels) do
+                    if isValid(w) then
+                        local phys = w:getPhysicsObject()
+                        if isValid(phys) then
+                            local wheelRPM = RearRPMs[i] or 0
+                            local force = 5 * wheelRPM * tickMult
+                            local brakeMult = c.BrakeMult or 1
+                            -- Use per-wheel brake force if available, otherwise scalar
+                            local finalBrake = (brakeForcesRear and brakeForcesRear[i]) or brakeR
+                            phys:applyTorque((EngineDirection) * force * finalBrake * brakeMult)
+                        end
+                    end
+                end
+            end
+
+            -- ============================================================================
+            -- BRAKE INPUT DETECTION (Runs Every Frame)
+            -- ============================================================================
+            -- Brake detection must run every frame for responsive braking
+            local BrakeInput = false
+            
+            if c.AutoGear then
+                -- Auto: hold brake when stopped and no throttle input
+                if s.Speed <= (c.StoppedPhaseBrakeSpeed or 5) and not Key_W and not Key_S then
+                    BrakeInput = true
+                -- Forward braking (S) when not in reverse
+                elseif (not s.InReverse) and Key_S then
+                    BrakeInput = true
+                -- Reverse braking (W) when in reverse
+                elseif s.InReverse and Key_W then
+                    BrakeInput = true
+                -- Reverse throttle should NOT apply brake
+                elseif s.InReverse and Key_S and not Key_W then
+                    BrakeInput = false
+                end
+            else
+                -- Manual mode: brake logic respects ReverseWSonReverse
+                if s.InReverse then
+                    if c.ReverseWSonReverse then
+                        BrakeInput = Key_S  -- If W=throttle in reverse, then S=brake in reverse
+                    else
+                        BrakeInput = Key_W  -- If S=throttle in reverse, then W=brake in reverse
+                    end
+                else
+                    BrakeInput = Key_S  -- Always S for forward braking
+                end
+            end
+            
+            -- Handbrake (Space) always sets brake
+            if Key_Space then BrakeInput = true end
+            
+            -- ====== ADDON HOOK: OnBrakeOverride ======
+            -- Allow addons to override brake input (e.g., electric vehicles with custom regen)
+            if c.Addons then
+                for name, addon in pairs(c.Addons) do
+                    if addon.Enabled and addon.OnBrakeOverride then
+                        local result = addon.OnBrakeOverride(s, c, {
+                            brakeInput = BrakeInput,
+                            key_w = Key_W,
+                            key_s = Key_S,
+                            key_space = Key_Space,
+                            speed = s.Speed,
+                            inReverse = s.InReverse
+                        })
+                        if result and result.brakeInput ~= nil then
+                            BrakeInput = result.brakeInput
+                        end
+                    end
+                end
+            end
+            
+            s.Brake = BrakeInput and 1 or 0
+            
+            -- Braking flag (separate from Brake, indicates braking action)
+            if s.Gear >= 1 and Key_S then
+                s.Braking = 1
+            elseif s.InReverse then
+                -- In reverse: braking key depends on ReverseWSonReverse
+                if c.ReverseWSonReverse then
+                    s.Braking = Key_W and 1 or 0  -- W is brake when S is throttle in reverse (ReverseWSonReverse=false means S=throttle)
+                else
+                    s.Braking = Key_S and 1 or 0  -- S is brake when W is throttle in reverse (ReverseWSonReverse=true means W=throttle)
+                end
+            else
+                s.Braking = 0
+            end
+
+            -- Calculate Speed (Every Frame - needed for brake phase scaling)
+            s.Speed = 0
+            s.Direction = 1
+            s.SpeedN = 0
+            if isValid(Chassis) then
+                s.Speed = Chassis:getVelocity():getLength() * 0.06858
+                local velLocal = Chassis:worldToLocal(Chassis:getVelocity() + Chassis:getPos())
+                -- Use configurable direction axis (default to X-forward if nil)
+                local dirAxis = c.ChassisFeedDirectionAxis or Vector(1, 0, 0)
+                -- Project local velocity onto direction axis
+                s.SpeedN = velLocal:dot(dirAxis) * 0.06858
+                s.Direction = (s.SpeedN >= 0) and 1 or -1
+            end
+
+            -- Brake phase scaling (Every Frame - needed for responsive braking)
+            local BrakeF = 0
+            local BrakeR = 0
+            if s.Brake == 1 then
+                if s.Speed <= (c.StoppedPhaseBrakeSpeed or 5) then
+                    -- Stopped phase: very low speeds (hold vehicle stopped)
+                    BrakeF = c.StoppedBrakeMult or 1
+                    BrakeR = c.StoppedBrakeMult or 1
+                elseif s.Speed >= (c.ThirdPhaseBrakeSpeed or 100) then
+                    -- Third phase: high speeds (reduced brake force to prevent lock-up)
+                    BrakeF = c.ThirdPhaseBrakeF or 0.3
+                    BrakeR = c.ThirdPhaseBrakeR or 0.05
+                elseif s.Speed >= (c.SecondPhaseBrakeSpeed or 60) then
+                    -- Second phase: medium-high speeds (moderate brake force)
+                    BrakeF = c.SecondPhaseBrakeF or 0.4
+                    BrakeR = c.SecondPhaseBrakeR or 0.15
+                elseif s.Speed >= (c.FirstPhaseBrakeSpeed or 10) then
+                    -- First phase: low-medium speeds (high brake force)
+                    BrakeF = c.FirstPhaseBrakeF or 0.9
+                    BrakeR = c.FirstPhaseBrakeR or 0.7
+                else
+                    -- Below first phase threshold: use first phase values anyway
+                    BrakeF = c.FirstPhaseBrakeF or 0.9
+                    BrakeR = c.FirstPhaseBrakeR or 0.7
+                end
+            end
+            if Key_Space then
+                BrakeF = 0
+                BrakeR = c.HandbrakePowerMult or 3
+            end
+            s.BrakeF = BrakeF
+            s.BrakeR = BrakeR
+
+            -- ============================================================================
+            -- ENGINE CALCULATIONS (Gated by UpdateRate to reduce CPU usage)
+            -- Only recalculate transmission, torque, RPM, etc. at UpdateRate frequency
+            -- Forces are applied every frame outside this gate for smooth physics
+            -- ============================================================================
+            if shouldUpdateEngine then
+                
+            -- Calculate wheel RPM from angular velocity (Gated for CPU savings)
+            local RPM_Sum = 0
+            local RPM_Count = 0
+            s.FrontRPMs = {}
+            s.RearRPMs = {}
+            s.Flywheels_RPM = {}
+            
+            
+            
+            for _, w in pairs(FrontWheels) do
+                if isValid(w) then
+                    local angVel = w:getAngleVelocity()
+                    local localEngineDir = w:worldToLocal(EngineDirection + w:getPos())
+                    local rpm = -angVel:dot(localEngineDir) / 8
+                    RPM_Sum = RPM_Sum + rpm
+                    RPM_Count = RPM_Count + 1
+                    table.insert(s.FrontRPMs, rpm)
+                    table.insert(s.Flywheels_RPM, rpm)
+                end
+            end
+            for _, w in pairs(RearWheels) do
+                if isValid(w) then
+                    local angVel = w:getAngleVelocity()
+                    local localEngineDir = w:worldToLocal(EngineDirection + w:getPos())
+                    local rpm = -angVel:dot(localEngineDir) / 8
+                    RPM_Sum = RPM_Sum + rpm
+                    RPM_Count = RPM_Count + 1
+                    table.insert(s.RearRPMs, rpm)
+                    table.insert(s.Flywheels_RPM, rpm)
+                end
+            end
+                
+            -- 3. TRANSMISSION
+            -- ====== ADDON HOOK: HandleCustomTransmission ======
+            -- Allow addons to replace entire transmission logic
+            local transmissionHandled = false
+            if c.Addons then
+                for name, addon in pairs(c.Addons) do
+                    if addon.Enabled and addon.HandleCustomTransmission then
+                        addon.HandleCustomTransmission(s, c, {
+                            Pod = Pod,
+                            Chassis = Chassis,
+                            FrontWheels = FrontWheels,
+                            RearWheels = RearWheels,
+                            Key_W = Key_W, Key_S = Key_S, Key_M1 = Key_M1, Key_M2 = Key_M2,
+                            Key_R = Key_R, Key_Space = Key_Space, Key_Shift = Key_Shift, Key_Alt = Key_Alt,
+                            KeyPressed = function(keyName)
+                                return consumeDriverKey(Driver, keyName)
+                            end
+                        })
+                        transmissionHandled = true
+                        break  -- Use first enabled custom transmission only
+                    end
+                end
+            end
+            
+            if not transmissionHandled then
+                -- Default transmission logic
+                if c.AutoGear then
+                    local ManualModeAllowed = c.UseRPMBasedGear or s.GearMode == 3 or s.GearMode == 1
+                    local ManualModeActive = s.IsInManualMode and ManualModeAllowed
+                    -- ClassicAuto: P/R/N/D Mode Selection
+                    if c.ClassicAuto then
+                        if not ManualModeActive then
+                            if Key_M1 and not s.LastM1 then s.GearMode = math.min(s.GearMode + 1, 3) end
+                            if Key_M2 and not s.LastM2 then s.GearMode = math.max(s.GearMode - 1, 0) end
+                            s.LastM1 = Key_M1; s.LastM2 = Key_M2
+                        else
+                            -- Manual mode within ClassicAuto: use M1/M2 to change gears (forward + reverse)
+                            local up = Key_M1 and not s.LastM1
+                        local down = Key_M2 and not s.LastM2
+                        local GearChange = (up and 1 or 0) - (down and 1 or 0)
+                        local reverseCount = math.max(1, #c.ReverseGearRatios)
+
+                        if GearChange ~= 0 then
+                            if s.Gear > 0 then
+                                if s.Gear == 1 and GearChange < 0 and s.SpeedN <= (c.SpeedToReverse or 5) then
+                                    s.Gear = -1
+                                    s.InReverse = true
+                                    s.GearMode = 1
+                                else
+                                    s.Gear = math.clamp(s.Gear + GearChange, 1, #c.Gearbox_Ratios)
+                                    s.InReverse = false
+                                    s.GearMode = 3
+                                end
+                            elseif s.Gear < 0 then
+                                if s.Gear == -1 and GearChange > 0 and s.SpeedN >= -(c.SpeedToReverse or 5) then
+                                    s.Gear = 1
+                                    s.InReverse = false
+                                    s.GearMode = 3
+                                else
+                                    s.Gear = math.clamp(s.Gear + GearChange, -reverseCount, -1)
+                                    s.InReverse = true
+                                    s.GearMode = 1
+                                end
+                            end
+
+                            s.Throttle_Delay = 1
+                            s.Clutch_Delay = 1
+                            timer.remove("Gear_Change")
+                            timer.create("Gear_Change", c.Gearbox_Delay / 1000, 1, function()
+                                s.Throttle_Delay = 0
+                                s.Clutch_Delay = 0
+                            end)
+                        end
+                        s.LastM1 = Key_M1; s.LastM2 = Key_M2
+                    end
+
+                    if s.GearMode == 0 then s.Gear = 0; s.Brake = 1 -- Park
+                    elseif s.GearMode == 1 then -- Reverse
+                        -- E2 parity: only gate initial reverse engagement by SpeedToReverse
+                        local reverseCount = math.max(1, #c.ReverseGearRatios)
+                        if not ManualModeActive then
+                            if s.Gear >= 0 then
+                                if s.Speed <= (c.SpeedToReverse or 5) then
+                                    s.Gear = -1
+                                    s.InReverse = true
+                                else
+                                    s.Gear = 0
+                                    s.InReverse = false
+                                end
+                            else
+                                s.Gear = math.clamp(s.Gear, -reverseCount, -1)
+                                s.InReverse = true
+                            end
+                        else
+                            if s.Gear >= 0 then
+                                if s.Speed <= (c.SpeedToReverse or 5) then
+                                    s.Gear = -1
+                                else
+                                    s.Gear = 0
+                                end
+                            else
+                                s.Gear = math.clamp(s.Gear, -reverseCount, -1)
+                            end
+                            s.InReverse = s.Gear < 0
+                        end
+                    elseif s.GearMode == 2 then s.Gear = 0 -- Neutral
+                    elseif s.GearMode == 3 then -- Drive (automatic forward shifting below)
+                        s.InReverse = false; if s.Gear < 1 then s.Gear = 1 end
+                    end
+                else
+                    -- Non-ClassicAuto: Direct automatic control (no P/R/N/D selector)
+                    if ManualModeActive then
+                        local up = Key_M1 and not s.LastM1
+                        local down = Key_M2 and not s.LastM2
+                        local GearChange = (up and 1 or 0) - (down and 1 or 0)
+                        local reverseCount = math.max(1, #c.ReverseGearRatios)
+
+                        if GearChange ~= 0 then
+                            if s.Gear > 0 then
+                                if s.Gear == 1 and GearChange < 0 and s.SpeedN <= (c.SpeedToReverse or 5) then
+                                    s.Gear = -1
+                                    s.InReverse = true
+                                else
+                                    s.Gear = math.clamp(s.Gear + GearChange, 1, #c.Gearbox_Ratios)
+                                    s.InReverse = false
+                                end
+                            elseif s.Gear < 0 then
+                                if s.Gear == -1 and GearChange > 0 and s.SpeedN >= -(c.SpeedToReverse or 5) then
+                                    s.Gear = 1
+                                    s.InReverse = false
+                                else
+                                    s.Gear = math.clamp(s.Gear + GearChange, -reverseCount, -1)
+                                    s.InReverse = true
+                                end
+                            end
+
+                            s.Throttle_Delay = 1
+                            s.Clutch_Delay = 1
+                            timer.remove("Gear_Change")
+                            timer.create("Gear_Change", c.Gearbox_Delay / 1000, 1, function()
+                                s.Throttle_Delay = 0
+                                s.Clutch_Delay = 0
+                            end)
+                        end
+                        s.LastM1 = Key_M1; s.LastM2 = Key_M2
+                    else
+                        -- E2 Line 631-640: Reverse engagement via S key when speed is low
+                        if Key_S and not s.LastS and s.SpeedN <= (c.SpeedToReverse or 5) then
+                            s.InReverse = true
+                            if s.Gear >= 0 then 
+                                s.Gear = -1
+                                s.Throttle_Delay = 1
+                                s.Clutch_Delay = 1
+                                timer.remove("Gear_Change")
+                                timer.create("Gear_Change", c.Gearbox_Delay / 1000, 1, function()
+                                    s.Throttle_Delay = 0
+                                    s.Clutch_Delay = 0
+                                end)
+                            end
+                        -- E2 Line 643-650: Forward from reverse (W key when in reverse, speed low)
+                        elseif Key_W and not s.LastW and s.InReverse and s.SpeedN >= -(c.SpeedToReverse or 5) then
+                            s.InReverse = false
+                            if s.Gear <= 0 then
+                                s.Gear = 1
+                                s.Throttle_Delay = 1
+                                s.Clutch_Delay = 1
+                                timer.remove("Gear_Change")
+                                timer.create("Gear_Change", c.Gearbox_Delay / 1000, 1, function()
+                                    s.Throttle_Delay = 0
+                                    s.Clutch_Delay = 0
+                                end)
+                            end
+                        end
+                        s.LastS = Key_S
+                        s.LastW = Key_W
+                    end
+
+                    -- Ensure a gear is engaged if not in reverse
+                    if not s.InReverse and s.Gear < 1 then s.Gear = 1 end
+                end
+                
+                    -- Automatic Forward Shifting (runs when in Drive mode or non-ClassicAuto)
+                -- Only shift if: not in reverse, not in neutral/park
+                if not ManualModeActive and not s.InReverse and s.Gear >= 1 then
+                    
+                    if c.UseRPMBasedGear then
+                        -- =================================================================================
+                        -- HYBRID WINDOW LOGIC (Best of both worlds)
+                        -- 1. Uses Wheel Speed (decoulped from engine revs)
+                        -- 2. Uses RPM Windows (Hysteresis) to hold gears uphill
+                        -- 3. Uses Traction Loss check to safe-guard drifting
+                        -- =================================================================================
+                        
+                        local ThrottleInput = s.Throttle or 0
+                        local LoadFactor = math.max(ThrottleInput, (s.Turbo_Boost or 1) - 1)
+                        local CurrentGearIndex = math.max(1, s.Gear)
+                        
+                        -- =================================================================================
+                        -- DISCRETE WINDOW LOGIC (User Requested)
+                        -- 1. Comfort/Sport are HARD LIMITS switched by Throttle (No Lerp)
+                        -- 2. Upshift Guard: Only Upshift if NewRPM > DownshiftThreshold (Prevent Hunting)
+                        -- =================================================================================
+                        
+                        -- 1. Determine Mode (Discrete)
+                        local IsSportInput = (ThrottleInput > 0.5) or s.IsInSportMode or c.AlwaysSportMode
+                        
+                        local UpLimitPct, DownLimitPct
+                        
+                        if IsSportInput then
+                            -- Sport Mode
+                            UpLimitPct = (c.SportUpshiftRPM or 90) / 100
+                            DownLimitPct = (c.SportDownshiftRPM or 55) / 100
+                        else
+                            -- Comfort Mode
+                            UpLimitPct = (c.ComfortUpshiftRPM or 45) / 100
+                            DownLimitPct = (c.ComfortDownshiftRPM or 25) / 100
+                        end
+                        
+                        -- Absolute RPM Limits
+                        local LimitUpshift = c.Engine_Redline * UpLimitPct
+                        local LimitDownshift = c.Engine_Redline * DownLimitPct
+                        
+                        -- 2. Calculate Current State (Wheel Based)
+                        local WheelRPM = s.Flywheel_RPM or 0
+                        local TransmissionShaftRPM = WheelRPM * c.Gearbox_FinalDrive
+                        
+                        -- Current Projected Engine RPM
+                        local CurrentGearRatio = c.Gearbox_Ratios[CurrentGearIndex] or 1
+                        local CurrentProjectedRPM = TransmissionShaftRPM * CurrentGearRatio
+                        
+                        local TargetGear = s.Gear
+                        
+                        -- 3. Decision Logic
+                        if CurrentProjectedRPM > LimitUpshift then
+                            -- POTENTIAL UPSHIFT
+                            if CurrentGearIndex ~= #c.Gearbox_Ratios then -- Not in top gear
+                                local NextGearIndex = CurrentGearIndex + 1
+                                local NextGearRatio = c.Gearbox_Ratios[NextGearIndex]
+                                local NextProjectedRPM = TransmissionShaftRPM * NextGearRatio
+                                
+                                -- VALIDATION (Anti-Loop):
+                                local SafeToUpshift = (NextProjectedRPM > LimitDownshift)
+                                local MustUpshift = (CurrentProjectedRPM > c.Engine_Redline * 0.98) -- Near Hard Limit
+                                
+                                if SafeToUpshift or MustUpshift then
+                                    TargetGear = NextGearIndex
+                                else
+                                    TargetGear = s.Gear 
+                                end
+                            end
+                            
+                        elseif CurrentProjectedRPM < LimitDownshift then
+                            -- DOWNSHIFT NEEDED
+                            if CurrentGearIndex > 1 then
+                                local PrevGearIndex = CurrentGearIndex - 1
+                                local PrevGearRatio = c.Gearbox_Ratios[PrevGearIndex]
+                                local PrevProjectedRPM = TransmissionShaftRPM * PrevGearRatio
+                                
+                                -- Safety Check: Don't Money Shift
+                                if PrevProjectedRPM < c.Engine_Redline then
+                                    TargetGear = PrevGearIndex
+                                end
+                            end
+                        else
+                            -- IN WINDOW. HOLD.
+                            TargetGear = s.Gear
+                        end
+                        
+                        -- 4. Drift/Slip Guard
+                        local IsSlipping = false
+                        local GroundSpeed = math.abs(s.SpeedN or 0)
+                        -- Use Config value, fallback to ABS value, fallback to default
+                        local RPMToSpeed = c.WheelRPMToSpeed or (c.ABS and c.ABS.WheelRPMToSpeed) or 0.15 
+                        local WheelSpeedKPH = math.abs(WheelRPM) * RPMToSpeed
+                        
+                        if WheelSpeedKPH > (GroundSpeed * 1.3 + 15) then
+                            IsSlipping = true
+                        end
+                        
+                        -- Apply Drift Guard
+                        if IsSlipping and TargetGear > s.Gear then
+                             TargetGear = s.Gear
+                        end
+                        
+                        -- 5. Execute Shift
+                        if s.Gear ~= TargetGear then
+                            -- Only shift if cooldown allows
+                            local isUpshift = TargetGear > s.Gear
+                            local isDownshift = TargetGear < s.Gear
+                            
+                            -- Anti-Hunt Latch / Cooldown
+                            local timeSinceShift = timer.systime() - (s.LastShiftTime or 0)
+                            local cooldown = c.DownshiftCooldown or 0.35
+                            
+                            if timeSinceShift >= cooldown then
+                                -- REACTION DELAY LOGIC (Timestamp based for robustness at low tick rates)
+                                -- If we haven't started waiting yet, start now.
+                                if not s.ShiftReactionTime then
+                                     s.ShiftReactionTime = timer.curtime() + (c.Min_Gear_Time / 1000)
+                                end
+                                
+                                -- Check if reaction time has passed
+                                if timer.curtime() >= s.ShiftReactionTime then
+                                    -- Execute Shift
+                                    s.ShiftReactionTime = nil -- Reset reaction timer
+                                    
+                                    timer.remove("Gear_Change")
+                                    timer.create("Gear_Change", c.Gearbox_Delay / 1000, 1, function()
+                                        s.Throttle_Delay = 0
+                                        s.Clutch_Delay = 0
+                                    end)
+                                    
+                                    if isUpshift then 
+                                        s.Gear = s.Gear + 1 
+                                        s.LastUpshiftTime = timer.systime()
+                                    else 
+                                        s.Gear = s.Gear - 1 
+                                        s.LastDownshiftTime = timer.systime()
+                                    end
+                                    
+                                    s.Throttle_Delay = 1
+                                    s.Clutch_Delay = 1
+                                    s.LastShiftTime = timer.systime()
+                                    
+                                    -- Post-shift hold time (optional, but good for stability)
+                                    -- We reuse ShiftReactionTime to force a delay before *next* shift?
+                                    -- No, let 'cooldown' handle that. But we can ensure reaction time needs to be re-waited.
+                                    s.ShiftReactionTime = nil 
+                                end
+                            end
+                        else
+                             -- We are in the target gear, reset reaction timer
+                             s.ShiftReactionTime = nil
+                        end
+
+                    else
+                        -- =================================================================================
+                        -- SPEED-BASED LOGIC (Legacy/Simple Mode)
+                        -- Uses pre-defined KPH thresholds for shifting. Simple and predictable.
+                        -- =================================================================================
+                        
+                        local GearSpeeds = c.GearSpeeds or {}
+                        local MaxGears = #c.Gearbox_Ratios
+                        local CurrentSpeed = math.abs(s.SpeedN or 0) -- Use Forward Speed KPH
+                        
+                        -- Upshift: Speed > GearSpeed[s.Gear]
+                        if s.Gear < MaxGears then
+                            local UpshiftSpeed = GearSpeeds[s.Gear] or 999
+                            if CurrentSpeed >= UpshiftSpeed then
+                                -- Check Timer
+                                if not timer.exists("Gear_Timer") or timer.timeleft("Gear_Timer") <= 0 then
+                                    timer.remove("Gear_Timer")
+                                    timer.remove("Gear_Change")
+                                    
+                                    timer.create("Gear_Change", c.Gearbox_Delay / 1000, 1, function()
+                                        s.Throttle_Delay = 0
+                                        s.Clutch_Delay = 0
+                                    end)
+                                    
+                                    s.Gear = s.Gear + 1
+                                    s.Throttle_Delay = 1
+                                    s.Clutch_Delay = 1
+                                    
+                                    timer.create("Gear_Timer", c.Min_Gear_Time / 1000, 1, function() end)
+                                end
+                            end
+                        end
+                        
+                        -- Downshift: Speed < GearSpeed[s.Gear-1] - Warning: Needs Hysteresis
+                        -- Logic: If we are in Gear 3.
+                        -- Upshift 2->3 was at 55.
+                        -- Downshift 3->2 should be at < 50 (Hysteresis 5kph)
+                        
+                        if s.Gear > 1 then
+                            local PrevGearIndex = s.Gear - 1
+                            local ShiftPoint = GearSpeeds[PrevGearIndex] or 0
+                            -- Downshift if speed drops below the point where we would have shifted UP to this gear, minus buffer
+                            if CurrentSpeed < (ShiftPoint - 5) then
+                                -- Check Timer
+                                if not timer.exists("Gear_Timer") or timer.timeleft("Gear_Timer") <= 0 then
+                                    timer.remove("Gear_Timer")
+                                    timer.remove("Gear_Change")
+                                    
+                                    timer.create("Gear_Change", c.Gearbox_Delay / 1000, 1, function()
+                                        s.Throttle_Delay = 0
+                                        s.Clutch_Delay = 0
+                                    end)
+                                    
+                                    s.Gear = s.Gear - 1
+                                    s.Throttle_Delay = 1
+                                    s.Clutch_Delay = 1
+                                    
+                                    timer.create("Gear_Timer", c.Min_Gear_Time / 1000, 1, function() end)
+                                end
+                            end
+                        end
+                        
+                    end -- End RPM vs Speed Logic
+
+                end
+
+                -- Automatic Reverse Shifting (supports multiple reverse ratios)
+                if not ManualModeActive and s.InReverse and s.Gear <= -1 then
+                    local reverseCount = math.max(1, #c.ReverseGearRatios)
+                    if c.UseRPMBasedGear then
+                        local RPMPercent = (s.RPM / c.Engine_Redline) * 100
+                        local SportModeActive = (c.UseComfortSportMode and (s.IsInSportMode or Key_Shift))
+                            or c.AlwaysSportMode
+                            or (not c.UseComfortSportMode and c.UseRPMBasedGear)
+
+                        local UpshiftRPM = SportModeActive and c.SportUpshiftRPM or c.ComfortUpshiftRPM
+                        local DownshiftRPM = SportModeActive and c.SportDownshiftRPM or c.ComfortDownshiftRPM
+
+                        if RPMPercent >= UpshiftRPM and s.Gear > -reverseCount and s.Throttle > 0.25 then
+                            if not timer.exists("Reverse_Gear_Timer") or timer.timeleft("Reverse_Gear_Timer") == nil or timer.timeleft("Reverse_Gear_Timer") <= 0 then
+                                timer.remove("Reverse_Gear_Timer")
+                                timer.remove("Reverse_Change")
+                                timer.create("Reverse_Gear_Timer", (c.Min_Reverse_Gear_Time or c.Min_Gear_Time) / 1000, 1, function() end)
+                                timer.create("Reverse_Change", c.Gearbox_Delay / 1000, 1, function()
+                                    s.Throttle_Delay = 0
+                                    s.Clutch_Delay = 0
+                                end)
+                                s.Gear = s.Gear - 1
+                                s.Throttle_Delay = 1
+                                s.Clutch_Delay = 1
+                            end
+                        elseif RPMPercent <= DownshiftRPM and s.Gear < -1 and s.Throttle < 0.1 then
+                            local currentIdx = math.abs(s.Gear)
+                            local nextIdx = math.abs(s.Gear + 1)
+                            local CurrentRatio = (c.ReverseGearRatios[currentIdx] or 1) * c.Gearbox_FinalDrive
+                            local NextRatio = (c.ReverseGearRatios[nextIdx] or 1) * c.Gearbox_FinalDrive
+                            local RatioStep = NextRatio / CurrentRatio
+                            local PredictedRPM = s.RPM * RatioStep
+
+                            if PredictedRPM < c.Engine_Redline then
+                                if not timer.exists("Reverse_Gear_Timer") or timer.timeleft("Reverse_Gear_Timer") == nil or timer.timeleft("Reverse_Gear_Timer") <= 0 then
+                                    timer.remove("Reverse_Gear_Timer")
+                                    timer.remove("Reverse_Change")
+                                    timer.create("Reverse_Gear_Timer", (c.Min_Reverse_Gear_Time or c.Min_Gear_Time) / 1000, 1, function() end)
+                                    timer.create("Reverse_Change", c.Gearbox_Delay / 1000, 1, function()
+                                        s.Throttle_Delay = 0
+                                        s.Clutch_Delay = 0
+                                    end)
+                                    s.Gear = s.Gear + 1
+                                    s.Throttle_Delay = 1
+                                    s.Clutch_Delay = 1
+                                end
+                            end
+                        end
+                    else
+                        for i = 1, #(c.ReverseGearSpeeds or {}) do
+                            if s.Speed <= c.ReverseGearSpeeds[i] then
+                                if s.Gear ~= -i then
+                                    if not timer.exists("Reverse_Gear_Timer") or timer.timeleft("Reverse_Gear_Timer") == nil or timer.timeleft("Reverse_Gear_Timer") <= 0 then
+                                        timer.remove("Reverse_Gear_Timer")
+                                        timer.remove("Reverse_Change")
+                                        timer.create("Reverse_Gear_Timer", (c.Min_Reverse_Gear_Time or c.Min_Gear_Time) / 1000, 1, function() end)
+                                        timer.create("Reverse_Change", c.Gearbox_Delay / 1000, 1, function()
+                                            s.Throttle_Delay = 0
+                                            s.Clutch_Delay = 0
+                                        end)
+                                        s.Gear = -i
+                                        s.Throttle_Delay = 1
+                                        s.Clutch_Delay = 1
+                                    end
+                                end
+                                break
+                            end
+                        end
+                    end
+                end
+            else
+                -- Manual Logic (E2 Parity) - Allow rapid gear input, delays apply to physics only
+                -- E2 Line 475: Gearbox_Gear += (changed(Key_M1) & Key_M1) - (changed(Key_M2) & Key_M2)
+                -- Gear changes happen immediately on input, but Throttle_Delay/Clutch_Delay prevent physics response
+                local reverseCount = math.max(1, #c.ReverseGearRatios)
+                if Key_M1 and not s.LastM1 then
+                    s.Gear = math.min(s.Gear + 1, #c.Gearbox_Ratios)
+                    s.Throttle_Delay = 1
+                    s.Clutch_Delay = 1
+                    timer.remove("Gear_Change")
+                    timer.create("Gear_Change", c.Gearbox_Delay / 1000, 1, function()
+                        s.Throttle_Delay = 0
+                        s.Clutch_Delay = 0
+                    end)
+                end
+                if Key_M2 and not s.LastM2 then
+                    s.Gear = math.max(s.Gear - 1, -reverseCount)
+                    s.Throttle_Delay = 1
+                    s.Clutch_Delay = 1
+                    timer.remove("Gear_Change")
+                    timer.create("Gear_Change", c.Gearbox_Delay / 1000, 1, function()
+                        s.Throttle_Delay = 0
+                        s.Clutch_Delay = 0
+                    end)
+                end
+                s.InReverse = s.Gear < 0
+                s.LastM1 = Key_M1; s.LastM2 = Key_M2
+                
+                -- Gear Reset (R key) - E2 Parity (line 476: Gearbox_Gear *= !(changed(Key_R) & Key_R))
+                if Key_R and not s.LastR then
+                    s.Gear = 0  -- Reset to neutral
+                end
+                s.LastR = Key_R
+            end
+            end  -- END: if not transmissionHandled (close default transmission block)
+
+            -- Gear Ratio Lookup
+            local GearRatio = 0
+            if s.Gear > 0 then GearRatio = (c.Gearbox_Ratios[s.Gear] or 1) * c.Gearbox_FinalDrive
+            elseif s.Gear < 0 then GearRatio = (c.ReverseGearRatios[math.abs(s.Gear)] or -1) * c.Gearbox_FinalDrive end
+
+            -- 5. CLUTCH & THROTTLE
+            -- E2 Lines 1140-1205: Master Clutch Control with Brake-Phase Hard Lock
+            -- Default: clutch disengaged unless a condition engages it
+            s.Clutch = 0
+            
+            -- PRIORITY 1: Absolute Safety & Manual Overrides (E2 Line 1148)
+            if s.Gear == 0 or s.Clutch_Delay == 1 or Key_Alt or Key_Space then
+                s.Clutch = 1
+            end
+            
+            -- PRIORITY 2: Driving Logic (E2 Lines 1151-1189)
+            -- Absolute brake-phase override (works in Auto & Manual)
+            local speedN = s.SpeedN or 0
+            if s.Braking == 1 and math.abs(speedN) <= (c.StoppedPhaseBrakeSpeed or 5) and not (Key_W or Key_S) then
+                -- Treat as if holding brake pedal → clutch fully engaged with brakes
+                s.Clutch = 1
+            else
+                if c.AutoGear then
+                    -- Auto mode clutch logic (E2 Lines 1156-1173)
+                    if s.Braking == 1 then
+                        -- Progressive clutch slip during braking (E2 Line 1166)
+                        if math.abs(speedN) <= ((c.StoppedPhaseBrakeSpeed or 5) + 15) then
+                            s.Clutch = 1 - math.clamp((math.abs(speedN) - (c.StoppedPhaseBrakeSpeed or 5)) / 15, 0, 1)
+                        end
+                    elseif not (Key_W or Key_S) and s.Speed <= (c.StoppedPhaseBrakeSpeed or 5) then
+                        -- Auto-hold when stopped with no input (E2 Line 1172)
+                        s.Clutch = 1
+                    end
+                else
+                    -- Manual mode clutch logic (E2 Lines 1175-1187)
+                    if s.Braking == 1 then
+                        if math.abs(speedN) <= ((c.StoppedPhaseBrakeSpeed or 5) + 15) then
+                            s.Clutch = 1 - math.clamp((math.abs(speedN) - (c.StoppedPhaseBrakeSpeed or 5)) / 15, 0, 1)
+                        end
+                    elseif not (Key_W or Key_S) and s.Speed <= (c.StoppedPhaseBrakeSpeed or 5) then
+                        s.Clutch = 1
+                    end
+                end
+            end
+            
+            -- Autohold at standstill (E2 Line 1189)
+            if s.Clutch == 0 and s.Speed < 1 and not (Key_W or Key_S) then
+                s.Clutch = 1
+            end
+            
+            -- FINAL STEP: Low RPM Anti-Stall (E2 Lines 1192-1205)
+            -- Only apply if AutoGear is enabled OR (UseClutchLerpInManual enabled and AutoGear is disabled)
+            if s.Clutch < 1 and (c.AutoGear or (c.UseClutchLerpInManual and not c.AutoGear)) then
+                local RpmClutch = 0
+                if s.InReverse then
+                    RpmClutch = math.max(0, (c.ClutchLerpReverse or 0.5) - (s.RPM / c.Engine_Redline))
+                else
+                    RpmClutch = math.max(0, (c.ClutchLerp or 0.4) - (s.RPM / c.Engine_Redline))
+                end
+                s.Clutch = math.max(s.Clutch, RpmClutch)
+            end
+
+            -- ============================================================================
+            -- WHEEL RPM CALCULATION (E2 Parity)
+            -- ============================================================================
+            
+            -- Calculate Flywheel_RPM based on PowerDistribution (E2 Lines 1133-1139)
+            if c.PowerDistribution == 0 then -- RWD
+                local sum = 0
+                for _, rpm in ipairs(RearRPMs) do sum = sum + rpm end
+                s.Flywheel_RPM = (#RearRPMs > 0) and (sum / #RearRPMs) or 0
+            elseif c.PowerDistribution == 100 then -- FWD
+                local sum = 0
+                for _, rpm in ipairs(FrontRPMs) do sum = sum + rpm end
+                s.Flywheel_RPM = (#FrontRPMs > 0) and (sum / #FrontRPMs) or 0
+            else -- AWD
+                local sum = 0
+                for _, rpm in ipairs(Flywheels_RPM) do sum = sum + rpm end
+                s.Flywheel_RPM = (#Flywheels_RPM > 0) and (sum / #Flywheels_RPM) or 0
+            end
+            
+            -- ====== ADDON HOOK: HandleCustomEngine ======
+            -- Allow addons to replace entire engine logic (e.g., electric drivetrain)
+            local engineHandled = false
+            if c.Addons then
+                for name, addon in pairs(c.Addons) do
+                    if addon.Enabled and addon.HandleCustomEngine then
+                        local handled = addon.HandleCustomEngine(s, c, {
+                            Pod = Pod,
+                            Chassis = Chassis,
+                            FrontWheels = FrontWheels,
+                            RearWheels = RearWheels,
+                            Key_W = Key_W, Key_S = Key_S, Key_M1 = Key_M1, Key_M2 = Key_M2,
+                            Key_R = Key_R, Key_Space = Key_Space, Key_Shift = Key_Shift, Key_Alt = Key_Alt,
+                            GearRatio = GearRatio,
+                            KeyPressed = function(keyName)
+                                return consumeDriverKey(Driver, keyName)
+                            end
+                        })
+                        engineHandled = handled ~= false
+                        break
+                    end
+                end
+            end
+
+            -- Initialize defaults for outputs if a custom engine is used
+            local Engine_Throttle = s.Throttle or 0
+            local Engine_Torque = s.Torque or 0
+
+            if not engineHandled then
+            -- ============================================================================
+            -- E2 ENGINE PHYSICS (Exact Port)
+            -- ============================================================================
+            
+            -- Real RPM (E2 Line 1207)
+            local Engine_RealRPM = (s.RPM * s.Clutch) + ((s.Flywheel_RPM * GearRatio) * (1 - s.Clutch))
+            
+            -- Throttle Input (E2 Lines 1211-1236)
+            Engine_Throttle = 0
+            if s.Active then
+                if c.AutoGear then
+                    if Key_S and s.Brake > 0 and not s.InReverse then
+                        Engine_Throttle = 0
+                    elseif Key_W and s.InReverse then
+                        Engine_Throttle = 0
+                    else
+                        Engine_Throttle = ((Key_W or Key_S) and (Key_Shift and 1 or 0.5) or 0)
+                    end
+                else
+                    -- Manual mode: ReverseWSonReverse controls which key to use in reverse
+                    if s.InReverse then
+                        if c.ReverseWSonReverse then
+                            Engine_Throttle = Key_W and (Key_Shift and 1 or 0.5) or 0  -- Use W for reverse
+                        else
+                            Engine_Throttle = Key_S and (Key_Shift and 1 or 0.5) or 0  -- Use S for reverse
+                        end
+                    else
+                        Engine_Throttle = Key_W and (Key_Shift and 1 or 0.5) or 0  -- Always use W for forward
+                    end
+                end
+            end
+            
+            -- Idle Throttle (E2 Lines 1239-1242)
+            s.IdleThrottle = s.IdleThrottle or 0
+            if math.min(s.RPM, Engine_RealRPM) < c.Engine_Idle then
+                s.IdleThrottle = s.IdleThrottle + (c.Engine_IdleRev or 0.1)
+            else
+                s.IdleThrottle = s.IdleThrottle - (c.Engine_IdleRev or 0.1)
+            end
+            s.IdleThrottle = clamp(s.IdleThrottle, 0, 0.5) * (s.Active and 1 or 0)
+            
+            Engine_Throttle = math.max(Engine_Throttle, s.IdleThrottle)
+            
+            -- Apply Active Multiplier
+            Engine_Throttle = Engine_Throttle * (s.Active and 1 or 0)
+            
+            -- Throttle Cuts (E2 Lines 1253-1258)
+            if s.Clutch_Delay == 1 then
+                Engine_Throttle = 0
+            else
+                Engine_Throttle = Engine_Throttle * ((s.Throttle_Delay == 1) and 0 or 1)
+            end
+            
+            -- Power Cut Limiter (E2 Lines 1260-1262)
+            s.PowerCut = s.PowerCut or 0
+            if (c.Engine_RevLimiter or 1) > 0 and Engine_RealRPM > c.Engine_Redline then
+                s.PowerCut = s.PowerCut + 1
+            else
+                s.PowerCut = s.PowerCut - 1
+            end
+            s.PowerCut = clamp(s.PowerCut, 0, 1) * math.floor(Engine_Throttle + 0.5)
+            
+            -- Reset delays (E2 Line 1264) - Now handled by Gear_Change timer callback
+            -- No need for clk check since callbacks handle it automatically
+            
+            -- Torque Curve (E2 Lines 1266-1268)
+            local Factor = clamp(s.RPM / c.Engine_Redline, 0, 1)
+            local T = c.Engine_TorqueTable or {1,1,1,1,1}
+            Engine_Torque = Core.getTorqueMultiplier(T, Factor)
+            Engine_Torque = clamp(Engine_Torque, 0, 1)
+            
+            -- Turbo / Forced Induction (E2 Lines 1270-1293)
+            local hasTurboAddon = false
+            if c.Addons then
+                for name, addon in pairs(c.Addons) do
+                    if addon.Enabled and addon.OnTurboCalculation then
+                        hasTurboAddon = true
+                        break
+                    end
+                end
+            end
+
+            if c.Turbo or hasTurboAddon then
+                s.Turbo_RPM = s.Turbo_RPM or 0
+                local Turbo_PSI = 0
+                local Turbo_Boost = 1
+                local Turbo_Flow = 0
+
+                if c.Turbo then
+                    Turbo_PSI = c.Turbo_PSIMax * s.Turbo_RPM / c.Turbo_MaxRPM
+                    Turbo_Boost = (Turbo_PSI + c.Turbo_AirPressure) / c.Turbo_AirPressure
+                    Turbo_Flow = math.max(s.RPM, 1) * Turbo_Boost / c.Turbo_MaxFlow
+                    local Turbo_Drag = (c.Turbo_MaxFlow * c.Turbo_DragScale) * (s.Turbo_RPM / c.Turbo_MaxRPM) * (1 - Engine_Throttle) / c.Turbo_Inertia
+                    local turboChange = (c.Turbo_FlowScale * (Turbo_Flow ^ c.Turbo_Exp)) / c.Turbo_Inertia - Turbo_Drag
+                    s.Turbo_RPM = clamp(s.Turbo_RPM + turboChange * EngineTimeScale, 1, c.Turbo_MaxRPM)
+                    Engine_Torque = Engine_Torque * (Turbo_Boost / 1.25)
+                end
+
+                s.Turbo_PSI = Turbo_PSI
+                s.Turbo_Boost = Turbo_Boost
+
+                -- ====== ADDON HOOK: OnTurboCalculation ======
+                -- Allow addons to override turbo/supercharger/twincharger boost logic
+                local disableBOV = false
+                if c.Addons then
+                    for name, addon in pairs(c.Addons) do
+                        if addon.Enabled and addon.OnTurboCalculation then
+                            local turboData = {
+                                turboRPM = s.Turbo_RPM,
+                                turboPSI = Turbo_PSI,
+                                turboBoost = Turbo_Boost,
+                                turboFlow = Turbo_Flow,
+                                engineRPM = s.RPM,
+                                throttle = Engine_Throttle,
+                                torqueMultiplier = Engine_Torque  -- Current torque curve value
+                            }
+                            local result = addon.OnTurboCalculation(s, c, turboData)
+                            if result then
+                                if result.turboRPM ~= nil then s.Turbo_RPM = result.turboRPM end
+                                if result.turboPSI ~= nil then s.Turbo_PSI = result.turboPSI; Turbo_PSI = result.turboPSI end
+                                if result.turboBoost ~= nil then s.Turbo_Boost = result.turboBoost; Turbo_Boost = result.turboBoost end
+                                if result.turboFlow ~= nil then Turbo_Flow = result.turboFlow end
+                                if result.torqueMultiplier ~= nil then Engine_Torque = result.torqueMultiplier end
+                                if result.disableBOV ~= nil then disableBOV = result.disableBOV end
+                            end
+                        end
+                    end
+                end
+                s.DisableBOV = disableBOV
+
+                -- Store for sound calculations
+                s.Turbo_Flow = Turbo_Flow
+                s.LastEngine_Throttle = s.LastEngine_Throttle or Engine_Throttle
+
+                -- BOV (Blow-Off Valve) trigger: only for turbos
+                if c.Turbo and not s.DisableBOV then
+                    local BOV_Threshold = 0.5  -- Minimum Turbo_RPM ratio to trigger BOV
+                    local boostActive = (s.Turbo_Boost or 1) > (c.BOVBoostThreshold or 1.05)
+                    if boostActive and s.LastEngine_Throttle > 0 and Engine_Throttle == 0 and (s.Turbo_RPM / c.Turbo_MaxRPM) > BOV_Threshold then
+                        net.start("TurboBOVSound")
+                        net.writeFloat(c.TurboBOVPitch or 1)
+                        net.writeFloat(c.TurboBOVVolume or 1)
+                        net.send()
+                    end
+                end
+                s.LastEngine_Throttle = Engine_Throttle
+            else
+                s.Turbo_PSI = 0
+                s.Turbo_Boost = 1
+                s.Turbo_Flow = 0
+            end
+            
+            -- Flywheel Power Inertia (E2 Lines 1295-1296)
+            if not c.Engine_PeakTorque then
+                c.Engine_Displacement = c.Engine_Displacement or round((c.Engine_Cylinders * math.pi * c.Engine_Bore^2 * c.Engine_Stroke / 4000000), 1)
+                c.Engine_PeakTorque = round((c.Engine_Stroke / c.Engine_Bore * c.Engine_Displacement * c.Engine_Airflow) * (c.Engine_Stroke / c.Engine_Bore), 2)
+                
+                -- Apply Torque Multiplier (if defined)
+                if c.TorqueMultiplier and c.TorqueMultiplier ~= 1 then
+                    c.Engine_PeakTorque = c.Engine_PeakTorque * c.TorqueMultiplier
+                end
+            end
+            local TargetPower = c.Engine_PeakTorque * Engine_Torque
+            -- E2 Line 1295: Flywheel_PowerInertia += ((Target - Current) / Engine_FlywheelMass)
+            -- E2 Line 1295: Flywheel_PowerInertia += ((Target - Current) / Engine_FlywheelMass)
+            -- Apply Time Scaling to inertia build-up
+            s.Flywheel_PowerInertia = s.Flywheel_PowerInertia + ((TargetPower - s.Flywheel_PowerInertia) / c.Engine_FlywheelMass) * EngineTimeScale
+            -- E2 Line 1296: Ensures FPI is at minimum equal to current engine torque capacity
+            s.Flywheel_PowerInertia = math.max(s.Flywheel_PowerInertia, TargetPower)
+            
+           
+            -- Critical Power Calculation (E2 Lines 1298-1315)
+            s.Flywheel_Power = 0  -- Store in state for use in force application every frame
+            local Gearbox_Feedback = 0
+            
+            if s.Clutch < 1 then
+                -- Engine Inertia (measures RPM mismatch)
+                local Engine_Inertia = clamp(Engine_RealRPM, 0, c.Engine_Redline) - (s.Flywheel_RPM * GearRatio)
+                Engine_Inertia = Engine_Inertia * (1 - s.Clutch)
+                Engine_Inertia = Engine_Inertia / c.Engine_Redline
+                
+                -- Engine braking when off throttle
+                Engine_Throttle = Engine_Throttle - ((0.285 * (Engine_RealRPM / c.Engine_Redline)) * ((Engine_Throttle <= 0) and 1 or 0))
+                
+                -- Build Flywheel Power
+                s.Flywheel_Power = s.Flywheel_PowerInertia
+                s.Flywheel_Power = s.Flywheel_Power * GearRatio
+                s.Flywheel_Power = s.Flywheel_Power * (1 - s.Clutch)
+                
+                -- Apply throttle + inertia (E2 Line 1309)
+                local PowerCutLimit = (1 - s.PowerCut) ^ 2
+                local ThrottleWithInertia = clamp(Engine_Throttle, -1, PowerCutLimit) + Engine_Inertia
+                s.Flywheel_Power = s.Flywheel_Power * math.min(ThrottleWithInertia, 1)
+                
+                -- RPM mismatch damping (E2 Line 1310)
+                local RPM_Ratio = (Engine_RealRPM / math.max(s.RPM, 1)) - 1
+                local DampingFactor = clamp(1 - (RPM_Ratio * Engine_Throttle), -1, 1)
+                s.Flywheel_Power = s.Flywheel_Power * (DampingFactor ^ c.Engine_FlywheelMass)
+                
+                -- Cut power if needed
+                if s.PowerCut > 0 or not s.Active then
+                    s.Flywheel_Power = 0
+                end
+                
+                -- ====== ADDON HOOK: ModifyPower ======
+                -- Allow addons to modify power before it's applied
+                if c.Addons then
+                    for name, addon in pairs(c.Addons) do
+                        if addon.Enabled and addon.ModifyPower then
+                            local modifiedPower = addon.ModifyPower(s, c, s.Flywheel_Power)
+                            if modifiedPower then
+                                s.Flywheel_Power = modifiedPower
+                            end
+                        end
+                    end
+                end
+                
+                -- Gearbox feedback (E2 Lines 1345-1346)
+                Gearbox_Feedback = ((s.Flywheel_RPM * GearRatio) - s.RPM) / c.Engine_FlywheelMass
+            end
+            
+            Gearbox_Feedback = Gearbox_Feedback * (1 - s.Clutch)
+            
+            -- Engine Feedback (E2 Lines 1351-1352)
+            local Internal_Throttle = Engine_Throttle
+            if s.RevLimitActiveTime and timer.curtime() < s.RevLimitActiveTime then
+                Internal_Throttle = 0  -- Simulate ignition cut for physics
+            end
+
+            local sign_throttle = (Internal_Throttle > 0 and 1) or (Internal_Throttle < 0 and -1) or 0
+            local throttle_factor = (sign_throttle ~= 0) and math.abs(Internal_Throttle * Engine_Torque) or (s.Active and 0.03 or 0.13)
+            local Engine_Feedback = (sign_throttle * c.Engine_Redline - s.RPM) * throttle_factor / 4
+            Engine_Feedback = Engine_Feedback * s.Clutch
+            
+            -- Update RPM (E2 Lines 1354-1357)
+            -- Update RPM (E2 Lines 1354-1357)
+            local RPM_Increase = Gearbox_Feedback + Engine_Feedback
+            local RPM_Limit = (c.Engine_Redline - s.RPM) / (c.Engine_FlywheelMass * (c.Engine_Stroke / c.Engine_Bore))
+            -- Apply Time Scaling to RPM integration properly (Scale increase, but clamp to Limit to avoid overshoot)
+            s.RPM = s.RPM + math.min(RPM_Increase * EngineTimeScale, RPM_Limit)
+            
+            -- Rev limiter
+            if (c.Engine_RevLimiter or 1) > 0 then
+                local LimitRPM = c.Engine_RevLimitRPM or c.Engine_Redline
+                local DropRPM = c.Engine_RevLimitDrop or (LimitRPM * 0.05)
+                local DelayTime = c.Engine_RevLimitDelay or 0
+                
+                -- ====== ADDON HOOK: OnRevLimit ======
+                -- Allow addons to dynamically alter the RPM limit, Drop amount, or Delay.
+                if c.Addons then
+                    for name, addon in pairs(c.Addons) do
+                        if addon.Enabled and addon.OnRevLimit then
+                            local result = addon.OnRevLimit(s, c, LimitRPM, DropRPM, DelayTime)
+                            if result then
+                                if result.limitRPM ~= nil then LimitRPM = result.limitRPM end
+                                if result.dropRPM ~= nil then DropRPM = result.dropRPM end
+                                if result.delayTime ~= nil then DelayTime = result.delayTime end
+                            end
+                        end
+                    end
+                end
+                
+                -- Check if we are currently serving an ignition cut delay
+                if s.RevLimitActiveTime and timer.curtime() < s.RevLimitActiveTime then
+                    s.Flywheel_Power = 0  -- Cut power output to wheels
+                    -- Engine_Feedback is already handling the deceleration due to Internal_Throttle = 0
+                else
+                    if s.RPM > LimitRPM then
+                        s.RPM = LimitRPM - DropRPM
+                        if DelayTime > 0 then
+                            s.RevLimitActiveTime = timer.curtime() + DelayTime
+                        end
+                        s.RPM = s.RPM * (0.995 + math.random() * 0.01)
+                    end
+                end
+                
+                -- Absolute safety cap to prevent physics explosion
+                s.RPM = math.min(s.RPM, math.max(LimitRPM, c.Engine_Redline) + 1500)
+            end
+            
+            -- ====== ADDON HOOK: ModifyRPM ======
+            -- Allow addons to modify RPM after updates
+            if c.Addons then
+                for name, addon in pairs(c.Addons) do
+                    if addon.Enabled and addon.ModifyRPM then
+                        local modifiedRPM = addon.ModifyRPM(s.RPM, s, c)
+                        if modifiedRPM then
+                            s.RPM = modifiedRPM
+                        end
+                    end
+                end
+            end
+            
+            else
+                -- Custom engine path: ensure required fields are valid numbers
+                s.RPM = s.RPM or 0
+                s.Flywheel_Power = s.Flywheel_Power or 0
+                s.Flywheel_PowerInertia = s.Flywheel_PowerInertia or 0
+                s.Clutch = s.Clutch or 0
+                s.Turbo_PSI = s.Turbo_PSI or 0
+                s.Turbo_Boost = s.Turbo_Boost or 1
+            end
+
+            -- Store calculated values in state for outputs
+            s.Throttle = Engine_Throttle
+            s.Torque = Engine_Torque
+            
+            -- Wire Outputs (Gated at UpdateRate to reduce CPU load)
+            -- Matches Simcade Tire architecture - outputs only update when calculations run
+            wire.ports.RPM = s.RPM or 0
+            wire.ports.Gear = s.Gear or 0
+            wire.ports.Clutch = s.Clutch or 0
+            wire.ports.Throttle_Delay = s.Throttle_Delay or 0
+            wire.ports.Clutch_Delay = s.Clutch_Delay or 0
+            wire.ports.Speed_KPH = s.Speed or 0
+            wire.ports.Torque = s.Torque or 0
+            wire.ports.Flywheel_RPM = s.Flywheel_RPM or 0
+            wire.ports.Brake = s.Brake or 0
+            wire.ports.BrakeF = s.BrakeF or 0
+            wire.ports.BrakeR = s.BrakeR or 0
+            wire.ports.Flywheel_PowerInertia = s.Flywheel_PowerInertia or 0
+            wire.ports.Active = s.Active and 1 or 0
+            wire.ports.Ignition = s.Ignition or 0
+            wire.ports.Throttle = s.Throttle or 0
+            wire.ports.Turbo_PSI = s.Turbo_PSI or 0
+            wire.ports.Redline = c.Engine_Redline or 0
+            wire.ports.MaxTorque = c.Engine_PeakTorque or 0
+            wire.ports.SpeedN = s.SpeedN or 0
+            wire.ports.Braking = s.Braking or 0
+            wire.ports.GearMode = s.GearMode or 0
+            wire.ports.Turbo_Boost = s.Turbo_Boost or 1
+            wire.ports.InReverse = s.InReverse and 1 or 0
+            if Driver and isValid(Driver) then
+                wire.ports.Driver = Driver
+            end
+            
+            -- ====== AUTO-WIRE: Addon Wire Outputs ======
+            -- Automatically write addon wire outputs from addon table values
+            if c.Addons then
+                for addonName, addon in pairs(c.Addons) do
+                    if addon.Enabled and addon.WireOutputs then
+                        for _, wireSpec in ipairs(addon.WireOutputs) do
+                            local wireName = wireSpec.name or wireSpec[1]
+                            local sourceField = wireSpec.source or wireName
+                            local value = addon[sourceField]
+                            
+                            if value ~= nil then
+                                -- Convert booleans to numbers for wire compatibility
+                                if type(value) == "boolean" then
+                                    wire.ports[wireName] = value and 1 or 0
+                                elseif type(value) == "number" then
+                                    wire.ports[wireName] = value
+                                elseif type(value) == "Vector" then
+                                    wire.ports[wireName] = value
+                                elseif type(value) == "Angle" then
+                                    wire.ports[wireName] = value
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+                
+            end -- END shouldUpdateEngine gate
+            
+            -- ============================================================================
+            -- POWER APPLICATION TO WHEELS (Runs Every Frame)
+            -- ============================================================================
+            
+            if s.Flywheel_Power and math.abs(s.Flywheel_Power) > 0.1 and s.Active then
+                local FrontPowerRatio = (c.PowerDistribution or 50) / 100
+                local RearPowerRatio = 1 - FrontPowerRatio
+                
+                -- Front wheels
+                if #FrontWheels > 0 and FrontPowerRatio > 0 then
+                    local FrontPower = s.Flywheel_Power * FrontPowerRatio
+                    local PowerPerWheel = FrontPower / #FrontWheels
+                    for i, w in pairs(FrontWheels) do
+                        if isValid(w) then
+                            local phys = w:getPhysicsObject()
+                            if isValid(phys) then
+                                -- PhysObj:applyTorque expects WORLD vector, not local
+                                local forceMult = (c.ForceMult or 1) * 39.37 * 2 * tickMult
+                                local torqueDir = (c.TorqueInvert and -1 or 1)
+                                local wheelScale = 1
+                                if s.FrontWheelPowerScale and s.FrontWheelPowerScale[i] then
+                                    wheelScale = s.FrontWheelPowerScale[i]
+                                end
+                                -- Use EngineDirection in world space
+                                local torque = EngineDirection * (PowerPerWheel * wheelScale) * forceMult * torqueDir
+                                
+                                -- Safety Clamp (Increased for functionality)
+                                local limit = 50000 
+                                if torque.x ~= torque.x then torque = Vector(0,0,0) end -- NaN check
+                                torque = Vector(
+                                    clamp(torque.x, -limit, limit),
+                                    clamp(torque.y, -limit, limit),
+                                    clamp(torque.z, -limit, limit)
+                                )
+                                phys:applyTorque(torque)
+                            end
+                        end
+                    end
+                end
+                
+                -- Rear wheels  
+                if #RearWheels > 0 and RearPowerRatio > 0 then
+                    local RearPower = s.Flywheel_Power * RearPowerRatio
+                    local PowerPerWheel = RearPower / #RearWheels
+                    for i, w in pairs(RearWheels) do
+                        if isValid(w) then
+                            local phys = w:getPhysicsObject()
+                            if isValid(phys) then
+                                -- PhysObj:applyTorque expects WORLD vector
+                                local forceMult = (c.ForceMult or 1) * 39.37 * 2 * tickMult
+                                local torqueDir = (c.TorqueInvert and -1 or 1)
+                                local wheelScale = 1
+                                if s.RearWheelPowerScale and s.RearWheelPowerScale[i] then
+                                    wheelScale = s.RearWheelPowerScale[i]
+                                end
+                                local torque = EngineDirection * (PowerPerWheel * wheelScale) * forceMult * torqueDir
+                                -- Safety Clamp
+                                local limit = 50000
+                                if torque.x ~= torque.x then torque = Vector(0,0,0) end -- NaN check
+                                torque = Vector(
+                                    clamp(torque.x, -limit, limit),
+                                    clamp(torque.y, -limit, limit),
+                                    clamp(torque.z, -limit, limit)
+                                )
+                                phys:applyTorque(torque)
+                            end
+                        end
+                    end
+                end
+                
+                -- Chassis reaction forces (E2 Lines 1342-1343)
+                -- Applies acceleration feedback to chassis for realistic weight transfer
+                if isValid(Chassis) and isValid(Engine) then
+                    local ChassisPhys = Chassis:getPhysicsObject()
+                    if isValid(ChassisPhys) then
+                        -- E2: C:applyOffsetForce(ChassisFeedDirection * -Flywheel_Power, E:pos() - (ChassisFeedDirection * ChassisAccFeed))
+                        -- E2: C:applyOffsetForce(ChassisFeedDirection * Flywheel_Power, E:pos() + (ChassisFeedDirection * ChassisAccFeed))
+                        local ChassisFeedDirection = getAxis(Chassis, c.ChassisFeedDirectionAxis)
+                        local ChassisFeedForwardDirection = getAxis(Chassis, c.ChassisFeedForwardAxis)
+                        local ChassisAccFeed = c.ChassisAccFeedMult or 39.37
+                        
+                        -- Apply opposing forces at offset positions to create rotation moment
+                        -- Force magnitude scaled by Flywheel_Power (acceleration force) and tick rate
+                        -- If braking, scale down accel feed to avoid double pitching moments
+                        local brakeInput = s.Brake or 0
+                        local throttleInput = s.Throttle or 0
+                        local accelScale = 1 - math.clamp(brakeInput, 0, 1)
+                        local forceMagnitude = s.Flywheel_Power * tickMult * accelScale
+                        ChassisPhys:applyForceOffset(
+                            ChassisFeedDirection * -forceMagnitude, 
+                            Engine:getPos() - (ChassisFeedForwardDirection * ChassisAccFeed)
+                        )
+                        ChassisPhys:applyForceOffset(
+                            ChassisFeedDirection * forceMagnitude, 
+                            Engine:getPos() + (ChassisFeedForwardDirection * ChassisAccFeed)
+                        )
+                        
+                        -- Braking feedback (E2: if braking, apply reverse moment)
+                        if s.Braking == 1 and throttleInput <= 0.05 then
+                            local BrakeFeedMult = math.abs(c.BrakeFeedBMult or 0.5)
+                            local brakeForceMagnitude = math.abs(s.Flywheel_Power) * BrakeFeedMult * tickMult
+                            ChassisPhys:applyForceOffset(
+                                ChassisFeedDirection * brakeForceMagnitude, 
+                                Engine:getPos() - (ChassisFeedForwardDirection * ChassisAccFeed)
+                            )
+                            ChassisPhys:applyForceOffset(
+                                ChassisFeedDirection * -brakeForceMagnitude, 
+                                Engine:getPos() + (ChassisFeedForwardDirection * ChassisAccFeed)
+                            )
+                        end
+                    end
+                end
+            end
+            
+            -- ====== ADDON HOOK: OnPhysicsUpdate ======
+            -- Allow addons to modify physics (torque reactions, air control, etc)
+            -- Runs every frame for smooth physics behavior
+            if c.Addons and isValid(Chassis) and isValid(Engine) then
+                local ChassisPhys = Chassis:getPhysicsObject()
+                local EnginePhys = Engine:getPhysicsObject()
+                
+                if isValid(ChassisPhys) then
+                    local physicsData = {
+                        Chassis = Chassis,
+                        ChassisPhys = ChassisPhys,
+                        Engine = Engine,
+                        EnginePhys = EnginePhys,
+                        tickMult = tickMult,
+                        FrontWheels = FrontWheels,
+                        RearWheels = RearWheels,
+                        EngineDirection = EngineDirection,
+                        ChassisDirection = getAxis(Chassis, c.ChassisFeedDirectionAxis),
+                        ChassisForward = getAxis(Chassis, c.ChassisFeedForwardAxis),
+                    }
+                    
+                    for name, addon in pairs(c.Addons) do
+                        if addon.Enabled and addon.OnPhysicsUpdate then
+                            addon.OnPhysicsUpdate(s, c, physicsData)
+                        end
+                    end
+                end
+            end
+            
+            
+            -- Networking (Rate Limited to 20ms for high responsiveness)
+            -- Also send immediately if an addon requested a forced send (e.g., AddonDisplay set)
+            -- OR if any synced addon state has changed (delta-based)
+            -- BUT enforce a minimum 10ms cooldown even for forced sends to prevent burst limit errors
+            local shouldSend = clk("Net", 20)
+            if s.ForceNetNow then
+                -- Allow forced send only if at least 10ms have passed since last send
+                if not s.LastNetSendTime or (timer.curtime() * 1000 - s.LastNetSendTime) >= 10 then
+                    shouldSend = true
+                end
+            elseif anySyncedChanged then
+                -- For synced changes, allow immediate send if at least 5ms have passed to balance responsiveness and safety
+                if not s.LastNetSendTime or (timer.curtime() * 1000 - s.LastNetSendTime) >= 5 then
+                    shouldSend = true
+                end
+            end
+            
+            if shouldSend then
+                s.LastNetSendTime = timer.curtime() * 1000  -- Track last send time in milliseconds
+                -- Reset standard timer to prevent double-send
+                if s.Timers then s.Timers["Net"] = timer.curtime() + 0.02 end
+
+                -- Safety net: avoid writing when stream resources are unavailable
+                if net.canWriteStream and not net.canWriteStream() then
+                    return
+                end
+
+                local bytesLeft = (net.getBytesLeft and net.getBytesLeft()) or math.huge
+                if bytesLeft < 256 then
+                    -- leave some headroom and skip this frame to avoid burst drop
+                    return
+                end
+
+                net.start("E_Up")
+                net.writeFloat(s.RPM)
+                net.writeFloat(s.Throttle)                -- Throttle state (0-1)
+                net.writeFloat(s.Turbo_Boost or 1)        -- Boost pressure multiplier
+                
+                -- ====== AUTO-SYNC: Addon SyncedState Fields ======
+                -- Automatically marshal addon state variables to clients (delta-based to save bandwidth)
+                -- Addons define: SyncedState = { "FieldName1", "FieldName2" }
+                local anySyncedChanged = false
+                if c.Addons then
+                    for addonName, addon in pairs(c.Addons) do
+                        if addon.Enabled and addon.SyncedState then
+                            for _, fieldName in ipairs(addon.SyncedState) do
+                                local val = addon[fieldName]
+                                local key = addonName .. "." .. fieldName
+                                if val ~= nil and val ~= s.LastSyncedValues[key] then
+                                    anySyncedChanged = true
+                                    s.LastSyncedValues[key] = val  -- Update last sent value
+                                    local fieldType = type(val)
+                                    net.writeString(addonName)
+                                    net.writeString(fieldName)
+                                    net.writeString(fieldType)
+                                    
+                                    if fieldType == "number" then
+                                        net.writeFloat(val)
+                                    elseif fieldType == "string" then
+                                        net.writeString(val)
+                                    elseif fieldType == "boolean" then
+                                        net.writeBit(val and 1 or 0)
+                                    elseif fieldType == "Entity" or fieldType == "Vehicle" or fieldType == "Player" then
+                                        net.writeEntity(val)
+                                    elseif fieldType == "Vector" then
+                                        net.writeVector(val)
+                                    elseif fieldType == "Angle" then
+                                        net.writeAngle(val)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+
+                net.writeString("")  -- Null terminator for sync end
+                
+                -- ====== ADDON HOOK: NetworkWrite ======
+                -- Allow addons to send custom data to clients
+                if c.Addons then
+                    for name, addon in pairs(c.Addons) do
+                        if addon.Enabled and addon.NetworkWrite then
+                            addon.NetworkWrite(s, c, net)
+                        end
+                    end
+                end
+
+                -- ====== OPTIONAL: Send AddonDisplay overrides to clients ======
+                -- This table is used by the client HUD to prefer addon-provided values
+                if c.AddonDisplay then
+                    net.writeString("AddonDisplay")
+                    for k, v in pairs(c.AddonDisplay) do
+                        net.writeString(k)
+                        local t = type(v)
+                        net.writeString(t)
+                        if t == "number" then
+                            net.writeFloat(v)
+                        elseif t == "string" then
+                            net.writeString(v)
+                        elseif t == "boolean" then
+                            net.writeBit(v and 1 or 0)
+                        end
+                    end
+                    -- Terminator
+                    net.writeString("")
+                else
+                    -- No addon display block
+                    net.writeString("")
+                end
+
+                net.send()
+
+                -- Clear one-shot forced send flag after sending
+                s.ForceNetNow = false
+            end
+
+        end)
+    end
+    
+    Core.initServer = initServer
+
+end
+
+if CLIENT then
+
+    local function initClient(config)
+        local sounds = {}
+        local initialized = false
+        local initStep = 0
+        local soundEnt = chip()
+        local TargetRPM = 0
+        local CurrentRPM = 0
+
+        -- Version Check Logic
+        local function checkVersionOnSpawn(cfg)
+            if not cfg.AllowCheckVersion then return end
+            -- GitHub raw URL for the main simulated_engine_core_modular.txt
+            local githubURL = "https://raw.github.com/nokillnando/Starfall/main/red_fox_engine/simulated_engine_core_modular.txt"
+            local localVersion = Version
+            local maxRetries = 10
+    
+            local function doVersionCheck()
+                if not http.canRequest() then
+                    maxRetries = maxRetries - 1
+                    if maxRetries <= 0 then return end
+                    timer.simple(0.5, doVersionCheck)
+                    return
+                end
+    
+                http.get(githubURL,
+                    function(data)
+                        if not (data and data ~= "") then
+                            if cfg.AllowCheckVersion then
+                                print(Color(255,255,255), "Red Fox Engine version check failed - no data received")
+                            end
+                            return
+                        end
+    
+                        local versionStart = data:find('local Version = "')
+                        if not versionStart then
+                            if cfg.AllowCheckVersion then
+                                print(Color(255,255,255), "Red Fox Engine version check failed - version string not found")
+                            end
+                            return
+                        end
+    
+                        versionStart = versionStart + 17
+                        local versionEnd = data:find('"', versionStart)
+                        if not versionEnd or versionEnd <= versionStart then
+                            if cfg.AllowCheckVersion then
+                                print(Color(255,255,255), "Red Fox Engine version check failed - could not parse remote version")
+                            end
+                            return
+                        end
+    
+                        local remoteVersion = data:sub(versionStart, versionEnd - 1)
+                        local remoteParts = string.explode(".", remoteVersion)
+                        local localParts = string.explode(".", localVersion)
+    
+                        local remoteMajor = tonumber(remoteParts[1]) or 0
+                        local remoteMinor = tonumber(remoteParts[2]) or 0
+                        local localMajor = tonumber(localParts[1]) or 0
+                        local localMinor = tonumber(localParts[2]) or 0
+    
+                        if remoteMajor > localMajor or (remoteMajor == localMajor and remoteMinor > localMinor) then
+                            print(Color(255,255,255), "Check config file for updated default variables")
+                            print(Color(255,255,255), "Red Fox Engine Update available! Local: ", Color(0,255,0), localVersion, Color(255,255,255), " | Remote: ", Color(0,255,0), remoteVersion)
+                        else
+                            print(Color(255,255,255), "Local Red Fox Engine is up to date! Version: ", Color(0,255,0), localVersion)
+                        end
+                    end,
+                    function(err)
+                        if cfg.AllowCheckVersion then
+                            print(Color(255,255,255), "Red Fox Engine version check failed - could not connect to remote: ", Color(255,0,0), err)
+                        end
+                    end
+                )
+            end
+            timer.simple(1, doVersionCheck)
+        end
+    
+        checkVersionOnSpawn(config)
+
+        -- Debug axis visualizer: client-side entity tracking (Simcade Tire pattern)
+        local debugBaseEntity = nil
+        local debugEngineEntity = nil
+        local debugWheelEntities = {}
+        local debugLastRecv = 0
+        local debugRecvCount = 0
+
+        timer.create("Engine_Debug_RequestBase", 0.5, 0, function()
+            net.start("EngineDebugRequestBase")
+            net.send()
+        end)
+
+        net.receive("EngineDebugBase", function()
+            debugBaseEntity = net.readEntity()
+            debugEngineEntity = net.readEntity()
+            debugWheelEntities = {}
+
+            local count = net.readUInt(8)
+            for i = 1, count do
+                local name = net.readString()
+                local ent = net.readEntity()
+                table.insert(debugWheelEntities, { Name = name, Entity = ent })
+            end
+
+            debugLastRecv = timer.curtime()
+            debugRecvCount = debugRecvCount + 1
+
+            if debugBaseEntity and debugBaseEntity:isValid() then
+                timer.stop("Engine_Debug_RequestBase")
+            end
+        end)
+
+        -- Debug axis visualizer (global) - uses configured axes from ChassisFeedDirectionAxis and ChassisFeedForwardAxis
+        local function axisVector(ent, name)
+            if type(name) == "Vector" then
+                return ent:localToWorldVector(name)
+            end
+            if name == "Up" then return ent:getUp()
+            elseif name == "Down" then return -ent:getUp()
+            elseif name == "Forward" then return ent:getForward()
+            elseif name == "Backward" then return -ent:getForward()
+            elseif name == "Right" then return ent:getRight()
+            elseif name == "Left" then return -ent:getRight()
+            else return ent:getUp() end
+        end
+
+        if config.DebugAxes then
+            if player() == owner() then
+                enableHud(owner(), true)
+            end
+                
+            local font = render.createFont("Trebuchet24", 24, nil, false, nil, nil, true)
+            hook.add("drawHud", "Engine_DebugAxes", function()
+                local chassis = debugBaseEntity
+                   if not (chassis and chassis:isValid()) then
+                       render.setFont(font)
+                       render.setColor(Color(255, 100, 100))
+                       render.drawSimpleText(20, 40, "Engine DebugAxes: no base entity", 0, 0)
+                       render.setColor(Color(255, 255, 0))
+                       render.drawSimpleText(20, 60, "Recv: " .. tostring(debugRecvCount) .. "  Last: " .. string.format("%.2f", (timer.curtime() - debugLastRecv)), 0, 0)
+                       return
+                   end
+
+                   local length = config.DebugAxisLength or 50
+                   local fAxis = (config.ChassisFeedDirectionAxis or "Forward")
+                   local uAxis = (config.ChassisFeedForwardAxis or "Up")
+                   local engineAxis = (config.EngineAxis or "Forward")
+
+                   -- Convert axis names to vectors (pass-through for Vector)
+                   local function axisStringToVector(name)
+                       if type(name) == "Vector" then return name end
+                       if name == "Up" then return Vector(0, 0, 1)
+                       elseif name == "Down" then return Vector(0, 0, -1)
+                       elseif name == "Forward" then return Vector(1, 0, 0)
+                       elseif name == "Backward" then return Vector(-1, 0, 0)
+                       elseif name == "Right" then return Vector(0, 1, 0)
+                       elseif name == "Left" then return Vector(0, -1, 0)
+                       else return Vector(0, 0, 1) end
+                   end
+                   local fVecLocal = axisStringToVector(fAxis)
+                   local uVecLocal = axisStringToVector(uAxis)
+                   local engineAxisLocal = axisStringToVector(engineAxis)
+
+                local function drawAxes(ent, label)
+                    if not (ent and ent:isValid()) then return end
+                    local pos = ent:getPos()
+
+                    local function toWorldHelper(e, v)
+                        local ef, er, eu = e:getForward(), -e:getRight(), e:getUp()
+                        return ef * v.x + er * v.y + eu * v.z
+                    end
+
+                    if ent == debugEngineEntity then
+                        -- Engine: show ONLY the configured EngineAxis (torque direction)
+                        local engineAxisVector = toWorldHelper(ent, engineAxisLocal) * length
+                        local pAxis = pos + engineAxisVector
+
+                        render.pushViewMatrix({ type = "3D" })
+                        render.setColor(Color(255, 255, 0))  -- Yellow for engine torque axis
+                        render.draw3DLine(pos, pAxis)
+                        render.popViewMatrix()
+
+                        local sAxis = pAxis:toScreen()
+                        local sPos = pos:toScreen()
+
+                        render.setFont(font)
+                        render.setColor(Color(255, 255, 0))
+                        render.drawSimpleText(sAxis.x, sAxis.y, "Torque", 1, 1)
+
+                        if label then
+                            render.setColor(Color(255, 255, 0))
+                            render.drawSimpleText(sPos.x, sPos.y - 30, label, 1, 1)
+                        end
+                        return
+                    end
+
+                    local fwd, up, right
+
+                    if ent == chassis then
+                        -- Chassis: use configured axes
+                        fwd = toWorldHelper(ent, fVecLocal) * length
+                        up = toWorldHelper(ent, uVecLocal) * length
+                        right = fwd:cross(up):getNormalized() * length
+                    else
+                        -- Wheels: use raw entity vectors with right-flip correction
+                        local vehicleRight = toWorldHelper(chassis, fVecLocal):cross(toWorldHelper(chassis, uVecLocal)):getNormalized()
+                        local rawRight = -ent:getRight()
+                        if rawRight:dot(vehicleRight) < 0 then
+                            rawRight = -rawRight
+                        end
+                        right = rawRight * length
+                        up = ent:getUp() * length
+                        fwd = ent:getForward() * length
+                    end
+
+                    local pRight = pos + right
+                    local pUp = pos + up
+                    local pFwd = pos + fwd
+
+                    render.pushViewMatrix({ type = "3D" })
+                    render.setColor(Color(255, 0, 0)); render.draw3DLine(pos, pRight)
+                    render.setColor(Color(0, 255, 0)); render.draw3DLine(pos, pUp)
+                    render.setColor(Color(0, 0, 255)); render.draw3DLine(pos, pFwd)
+                    render.popViewMatrix()
+
+                    local sRight = pRight:toScreen()
+                    local sUp = pUp:toScreen()
+                    local sFwd = pFwd:toScreen()
+                    local sPos = pos:toScreen()
+
+                    render.setFont(font)
+                    render.setColor(Color(255,0,0)); render.drawSimpleText(sRight.x, sRight.y, "R", 1, 1)
+                    render.setColor(Color(0,255,0)); render.drawSimpleText(sUp.x, sUp.y, "U", 1, 1)
+                    render.setColor(Color(0,0,255)); render.drawSimpleText(sFwd.x, sFwd.y, "F", 1, 1)
+
+                    if label then
+                        render.setColor(Color(255, 255, 0))
+                        render.drawSimpleText(sPos.x, sPos.y - 30, label, 1, 1)
+                    end
+                end
+
+                drawAxes(chassis, "Chassis")
+
+                -- Draw Engine axes
+                local engine = debugEngineEntity
+                if engine and engine:isValid() then
+                    drawAxes(engine, "Engine")
+                end
+
+                if config.DebugAxisShowWheels then
+                    for _, wData in ipairs(debugWheelEntities) do
+                        drawAxes(wData.Entity, wData.Name)
+                    end
+                end
+
+                render.setFont(font)
+                render.setColor(Color(0, 255, 0))
+                render.drawSimpleText(20, 40, "Engine DebugAxes: OK", 0, 0)
+                render.setColor(Color(255, 255, 0))
+                render.drawSimpleText(20, 60, "Wheels: " .. tostring(#debugWheelEntities) .. "  Recv: " .. tostring(debugRecvCount), 0, 0)
+            end)
+        end
+        
+        local keyEnum = nil
+        local function buildKeyEnum()
+            if keyEnum then return end
+            keyEnum = {}
+
+            -- Hardcoded enum cache (GMod KEY enum)
+            -- Numbers 0-9
+            keyEnum["0"] = 1; keyEnum["1"] = 2; keyEnum["2"] = 3; keyEnum["3"] = 4; keyEnum["4"] = 5
+            keyEnum["5"] = 6; keyEnum["6"] = 7; keyEnum["7"] = 8; keyEnum["8"] = 9; keyEnum["9"] = 10
+
+            -- Letters A-Z
+            keyEnum.a = 11; keyEnum.b = 12; keyEnum.c = 13; keyEnum.d = 14; keyEnum.e = 15; keyEnum.f = 16
+            keyEnum.g = 17; keyEnum.h = 18; keyEnum.i = 19; keyEnum.j = 20; keyEnum.k = 21; keyEnum.l = 22
+            keyEnum.m = 23; keyEnum.n = 24; keyEnum.o = 25; keyEnum.p = 26; keyEnum.q = 27; keyEnum.r = 28
+            keyEnum.s = 29; keyEnum.t = 30; keyEnum.u = 31; keyEnum.v = 32; keyEnum.w = 33; keyEnum.x = 34
+            keyEnum.y = 35; keyEnum.z = 36
+
+            -- Keypad 0-9
+            keyEnum.pad_0 = 37; keyEnum.pad_1 = 38; keyEnum.pad_2 = 39; keyEnum.pad_3 = 40; keyEnum.pad_4 = 41
+            keyEnum.pad_5 = 42; keyEnum.pad_6 = 43; keyEnum.pad_7 = 44; keyEnum.pad_8 = 45; keyEnum.pad_9 = 46
+            keyEnum.pad_divide = 47; keyEnum.pad_multiply = 48; keyEnum.pad_minus = 49; keyEnum.pad_plus = 50
+            keyEnum.pad_enter = 51; keyEnum.pad_decimal = 52
+
+            -- Punctuation and symbols
+            keyEnum.lbracket = 53; keyEnum.rbracket = 54; keyEnum.semicolon = 55; keyEnum.apostrophe = 56
+            keyEnum.backquote = 57; keyEnum.comma = 58; keyEnum.period = 59; keyEnum.slash = 60
+            keyEnum.backslash = 61; keyEnum.minus = 62; keyEnum.equal = 63
+
+            -- Controls and modifiers
+            keyEnum.enter = 64; keyEnum.space = 65; keyEnum.backspace = 66; keyEnum.tab = 67; keyEnum.capslock = 68
+            keyEnum.numlock = 69; keyEnum.escape = 70; keyEnum.scrolllock = 71; keyEnum.ins = 72; keyEnum.del = 73
+            keyEnum.home = 74; keyEnum["end"] = 75; keyEnum.pgup = 76; keyEnum.pgdn = 77; keyEnum["break"] = 78
+            keyEnum.lshift = 79; keyEnum.rshift = 80; keyEnum.lalt = 81; keyEnum.ralt = 82
+            keyEnum.lctrl = 83; keyEnum.rctrl = 84; keyEnum.lwin = 85; keyEnum.rwin = 86; keyEnum.app = 87
+            keyEnum.up = 88; keyEnum.left = 89; keyEnum.down = 90; keyEnum.right = 91
+
+            -- Function keys
+            keyEnum.f1 = 92; keyEnum.f2 = 93; keyEnum.f3 = 94; keyEnum.f4 = 95; keyEnum.f5 = 96; keyEnum.f6 = 97
+            keyEnum.f7 = 98; keyEnum.f8 = 99; keyEnum.f9 = 100; keyEnum.f10 = 101; keyEnum.f11 = 102; keyEnum.f12 = 103
+        end
+
+        local function resolveKey(key)
+            if type(key) == "number" then return key end
+            if type(key) ~= "string" then return nil end
+
+            buildKeyEnum()
+
+            local lower = string.lower(key)
+            if string.sub(lower, 1, 4) == "key_" then
+                lower = string.sub(lower, 5)
+            end
+            return keyEnum and keyEnum[lower] or nil
+        end
+
+        local function collectTrackedKeys(cfg)
+            local keys = {}
+            if not cfg or not cfg.Addons then return keys end
+            for _, addon in pairs(cfg.Addons) do
+                if addon and addon.Enabled then
+                    if addon.InputKeys then
+                        for _, keyName in ipairs(addon.InputKeys) do
+                            if type(keyName) == "string" and keyName ~= "" then
+                                keys[keyName] = true
+                            end
+                        end
+                    end
+                    if addon.InputKeyFields then
+                        for _, field in ipairs(addon.InputKeyFields) do
+                            local keyName = addon[field]
+                            if type(keyName) == "string" and keyName ~= "" then
+                                keys[keyName] = true
+                            end
+                        end
+                    end
+                end
+            end
+            return keys
+        end
+
+        local function getPodEntity(pod)
+            if not pod then return nil end
+            if isEntity(pod) and isValid(pod) then return pod end
+
+            local ent = pod["Entity"] or pod["Vehicle"] or pod["Pod"]
+            if isValid(ent) then return ent end
+
+            local ok, result = pcall(function()
+                if pod.entity then
+                    return pod:entity()
+                end
+                return nil
+            end)
+            if ok and isValid(result) then return result end
+
+            return nil
+        end
+
+        local manualKey = resolveKey(config.ManualModeKey)
+        local sportKey = resolveKey(config.ComfortSportModeKey)
+
+        local trackedKeyCodes = {}
+        do
+            local trackedKeys = collectTrackedKeys(config)
+            for keyName in pairs(trackedKeys) do
+                local code = resolveKey(keyName)
+                if code then
+                    trackedKeyCodes[keyName] = code
+                end
+            end
+        end
+
+        local manualToggled = false
+        local sportToggled = false
+
+        hook.add("InputPressed", "EngineToggleKeys", function(button)
+            local lp = player()
+            if not isValid(lp) or not lp:inVehicle() then return end
+
+            if button == manualKey then
+                manualToggled = not manualToggled
+                net.start("EngineToggleKeys")
+                net.writeBool(manualToggled)
+                net.writeBool(sportToggled)
+                net.send()
+                return
+            end
+
+            if button == sportKey then
+                sportToggled = not sportToggled
+                net.start("EngineToggleKeys")
+                net.writeBool(manualToggled)
+                net.writeBool(sportToggled)
+                net.send()
+                return
+            end
+
+            for keyName, code in pairs(trackedKeyCodes) do
+                if button == code then
+                    net.start("EngineAddonKeyPress")
+                    net.writeString(keyName)
+                    net.send()
+                    return
+                end
+            end
+        end)
+        
+        hook.add("InputReleased", "EngineToggleKeysRelease", function(button)
+            local lp = player()
+            if not isValid(lp) or not lp:inVehicle() then return end
+
+            for keyName, code in pairs(trackedKeyCodes) do
+                if button == code then
+                    net.start("EngineAddonKeyRelease")
+                    net.writeString(keyName)
+                    net.send()
+                    return
+                end
+            end
+        end)
+        
+        local EngineThrottle = 0  -- Client-side throttle state (0-1)
+        local TurboBoost = 1       -- Client-side turbo boost multiplier
+        local LerpedThrottle = 0   -- Smoothly lerped throttle for sound blending
+        local TurboSoundVolume = 0 -- Track turbo sound volume for smooth fade-out
+        
+
+        local function addSnd(name, path)
+            if not path or path == "" then return end
+            if sounds[name] and sounds[name]:isValid() then return end
+            sounds[name] = sound.create(soundEnt, path, true)
+            if sounds[name] then sounds[name]:play(); sounds[name]:setVolume(0) end
+        end
+
+        local function ensureTurboSound(path)
+            if not path or path == "" then return end
+            if sounds["Turbo"] and sounds["Turbo_Path"] == path then return end
+            if sounds["Turbo"] then sounds["Turbo"]:stop() end
+            sounds["Turbo"] = sound.create(soundEnt, path, true)
+            if sounds["Turbo"] then
+                sounds["Turbo"]:play()
+                sounds["Turbo"]:setVolume(0)
+                sounds["Turbo_Path"] = path
+            end
+        end
+
+        local initTimerName = "Engine_Init_" .. chip():entIndex()
+        if not timer.exists(initTimerName) then
+            timer.create(initTimerName, 0.1, 0, function()
+                if initialized then timer.remove(initTimerName); return end
+                
+                if initStep == 0 then
+                    addSnd("On", config.Sounds.Engine_SoundOn)
+                    initStep = 1
+                elseif initStep == 1 then
+                    addSnd("Off", config.Sounds.Engine_SoundOff)
+                    initStep = 2
+                elseif initStep == 2 then
+                    ensureTurboSound(config.Sounds.TurboSound)
+                    initStep = 3
+                elseif initStep == 3 then
+                    addSnd("Starter", config.Sounds.Starter)
+                    initStep = 4
+                elseif initStep == 4 then
+                    addSnd("Bell", config.Sounds.Bell)
+                    initStep = 5
+                elseif initStep == 5 then
+                    addSnd("GearChange", config.Sounds.GearChange)
+                    initialized = true
+                    timer.remove(initTimerName)
+                end
+            end)
+        end
+
+        net.receive("E_Up", function()
+             TargetRPM = net.readFloat()
+             EngineThrottle = net.readFloat()
+             TurboBoost = net.readFloat()
+             
+             -- ====== AUTO-SYNC: Addon SyncedState Fields ======
+             -- Automatically unmarshal addon state variables from server
+             if config.Addons then
+                 local addonName = net.readString()
+                 while addonName ~= "" do
+                     local fieldName = net.readString()
+                     local fieldType = net.readString()
+                     
+                     if config.Addons[addonName] then
+                         if fieldType == "number" then
+                             config.Addons[addonName][fieldName] = net.readFloat()
+                         elseif fieldType == "string" then
+                             config.Addons[addonName][fieldName] = net.readString()
+                         elseif fieldType == "boolean" then
+                             config.Addons[addonName][fieldName] = (net.readBit() == 1)
+                         elseif fieldType == "Entity" or fieldType == "Vehicle" or fieldType == "Player" then
+                             config.Addons[addonName][fieldName] = net.readEntity()
+                         elseif fieldType == "Vector" then
+                             config.Addons[addonName][fieldName] = net.readVector()
+                         elseif fieldType == "Angle" then
+                             config.Addons[addonName][fieldName] = net.readAngle()
+                         end
+                     else
+                         -- Skip this field's data if addon not found
+                         if fieldType == "number" then
+                             net.readFloat()
+                         elseif fieldType == "string" then
+                             net.readString()
+                         elseif fieldType == "boolean" then
+                             net.readBit()
+                         elseif fieldType == "Entity" or fieldType == "Vehicle" or fieldType == "Player" then
+                             net.readEntity()
+                         elseif fieldType == "Vector" then
+                             net.readVector()
+                         elseif fieldType == "Angle" then
+                             net.readAngle()
+                         end
+                     end
+                     
+                     addonName = net.readString()
+                 end
+             end
+             
+             -- ====== ADDON HOOK: NetworkRead ======
+             -- Allow addons to receive custom data from server
+             if config.Addons then
+                 for name, addon in pairs(config.Addons) do
+                     if addon.Enabled and addon.NetworkRead then
+                         addon.NetworkRead(ClientState, config, net)
+                     end
+                 end
+             end
+
+            -- ====== OPTIONAL: Read AddonDisplay overrides sent from server ======
+            local marker = net.readString()
+            if marker == "AddonDisplay" then
+                config.AddonDisplay = config.AddonDisplay or {}
+                local key = net.readString()
+                while key and key ~= "" do
+                    local valType = net.readString()
+                    if valType == "number" then
+                        config.AddonDisplay[key] = net.readFloat()
+                    elseif valType == "string" then
+                        config.AddonDisplay[key] = net.readString()
+                    elseif valType == "boolean" then
+                        config.AddonDisplay[key] = (net.readBit() == 1)
+                    else
+                        -- Unknown type: skip by reading as string
+                        config.AddonDisplay[key] = net.readString()
+                    end
+                    key = net.readString()
+                end
+            else
+                -- If marker isn't AddonDisplay, assume empty terminator was sent and do nothing
+            end
+             
+            if initialized then
+                -- Update turbo sound if settings change
+                ensureTurboSound(config.Sounds.TurboSound)
+            end
+        end)
+        
+        -- Network handlers for sounds with timer-based looping
+        local function normalizePitch(val)
+            if val == nil then return 100 end
+            if val <= 5 then return val * 100 end
+            return val
+        end
+        local function emitAtChip(path, pitch, volume)
+            if not path or path == "" then return end
+            sound.emitSound(path, chip():getPos(), nil, pitch, volume)
+        end
+        local function playStarterWithSettings(pitch, volume)
+            if not sounds["Starter"] then return end
+            sounds["Starter"]:stop()
+            sounds["Starter"]:play()
+            sounds["Starter"]:setPitch(pitch)
+            sounds["Starter"]:setVolume(volume)
+            if timer.exists("StarterApply") then timer.remove("StarterApply") end
+            timer.create("StarterApply", 0.01, 1, function()
+                if sounds["Starter"] then
+                    sounds["Starter"]:setPitch(pitch)
+                    sounds["Starter"]:setVolume(volume)
+                end
+            end)
+        end
+        local bellLoopPitch = 100
+        local bellLoopVolume = 1
+        local bellLoopTime = 0.3
+        local bellLoopActive = false
+        local bellLastPlay = 0
+        local starterLoopPitch = 100
+        local starterLoopVolume = 1
+        local starterLoopTime = 0.2
+        local starterInterval = 0.2
+        local starterLoopActive = false
+        local starterLastPlay = 0
+        net.receive("EngineSound", function()
+            if not initialized then return end
+            local isBell = net.readBool()
+            local soundPath = net.readString()  -- Read custom sound path from addon
+            local pitch = net.readFloat()
+            local volume = net.readFloat()
+            local loopTime = net.readFloat()
+            local engineEnt = net.readEntity()  -- Get engine entity for sound attachment
+            
+            if isBell then
+                -- Use custom path if provided, otherwise fall back to config
+                local actualPath = (soundPath and soundPath ~= "") and soundPath or (config.Sounds and config.Sounds.Bell)
+                if not actualPath or actualPath == "" then return end
+                
+                -- Update pitch and volume settings
+                local nextPitch = normalizePitch(pitch)
+                local nextVolume = volume
+                local nextLoopTime = loopTime
+                bellLoopPitch = nextPitch
+                bellLoopVolume = nextVolume
+                bellLoopTime = nextLoopTime
+                bellLoopActive = true
+                
+                -- Determine if we should use continuous looping (native GMod) or discrete timer-based looping
+                -- loopTime <= 0 means continuous/seamless loop (e.g. electric motor hum)
+                -- loopTime > 0 means discrete restart interval (e.g. ding-ding-ding bell)
+                local isContinuous = (nextLoopTime <= 0)
+                
+                -- If custom sound path changed, OR loop mode changed, recreate the sound object
+                -- We track isContinuous state in sounds["Bell_IsContinuous"]
+                local shouldRecreate = not sounds["Bell"] 
+                                    or (soundPath ~= "" and sounds["Bell_CustomPath"] ~= soundPath)
+                                    or (sounds["Bell_IsContinuous"] ~= isContinuous)
+                                    
+                if shouldRecreate then
+                    if sounds["Bell"] then sounds["Bell"]:stop() end
+                    local attachEnt = (engineEnt and engineEnt:isValid()) and engineEnt or chip()
+                    -- Create with looping = true ONLY if continuous mode
+                    sounds["Bell"] = sound.create(attachEnt, actualPath, isContinuous)
+                    if sounds["Bell"] then
+                        sounds["Bell_CustomPath"] = soundPath
+                        sounds["Bell_IsContinuous"] = isContinuous
+                    end
+                end
+                
+                bellLastPlay = timer.curtime()
+                
+                if isContinuous then
+                    -- Continuous Mode: Just play once if not playing, and update pitch/volume
+                    -- Do NOT restart constantly
+                    if sounds["Bell"] then
+                        -- Only play if stopped (seamless looping handles the rest)
+                        -- But still apply pitch/volume updates immediately
+                        sounds["Bell"]:setPitch(bellLoopPitch)
+                        sounds["Bell"]:setVolume(bellLoopVolume)
+                        if not sounds["Bell"]:isPlaying() then
+                            sounds["Bell"]:play()
+                        end
+                    end
+                    -- Remove discrete looping timer
+                    if timer.exists("BellLoop") then timer.remove("BellLoop") end
+                else
+                    -- Discrete Mode: Force restart immediately and set up timer
+                    if sounds["Bell"] then
+                        sounds["Bell"]:stop()
+                        sounds["Bell"]:setPitch(bellLoopPitch)
+                        sounds["Bell"]:setVolume(bellLoopVolume)
+                        sounds["Bell"]:play()
+                    end
+                    
+                    -- Set up looping timer (discrete interval)
+                    if timer.exists("BellLoop") then timer.remove("BellLoop") end
+                    timer.create("BellLoop", bellLoopTime, 0, function()
+                        if not bellLoopActive then return end
+                        
+                        if sounds["Bell"] then
+                            sounds["Bell"]:stop()
+                            sounds["Bell"]:setPitch(bellLoopPitch)
+                            sounds["Bell"]:setVolume(bellLoopVolume)
+                            sounds["Bell"]:play()
+                        end
+                        bellLastPlay = timer.curtime()
+                    end)
+                end
+            else
+                -- Starter sound - use custom path if provided
+                local actualPath = (soundPath and soundPath ~= "") and soundPath or (config.Sounds and config.Sounds.Starter)
+                if not actualPath or actualPath == "" then return end
+                
+                local nextPitch = normalizePitch(pitch)
+                local nextVolume = volume
+                local nextLoopTime = loopTime
+                if starterLoopActive and nextPitch == starterLoopPitch and nextVolume == starterLoopVolume and nextLoopTime == starterLoopTime then
+                    return
+                end
+                starterLoopPitch = nextPitch
+                starterLoopVolume = nextVolume
+                starterLoopTime = nextLoopTime
+                local starterDuration = sound.duration(actualPath or "")
+                if starterDuration and starterDuration > 0 then
+                    starterInterval = math.max(starterLoopTime, starterDuration - 0.01)
+                else
+                    starterInterval = starterLoopTime
+                end
+                starterLoopActive = true
+                -- Play with custom path
+                local starterSound = sound.create(chip(), actualPath, false)
+                if starterSound then
+                    starterSound:setPitch(starterLoopPitch)
+                    starterSound:setVolume(starterLoopVolume)
+                    starterSound:play()
+                    sounds["Starter"] = starterSound
+                end
+                starterLastPlay = timer.curtime()
+                -- Set up looping timer
+                if timer.exists("StarterLoop") then timer.remove("StarterLoop") end
+                timer.create("StarterLoop", starterLoopTime, 0, function()
+                    local now = timer.curtime()
+                    if (now - starterLastPlay) >= starterInterval then
+                        if sounds["Starter"] and not sounds["Starter"]:isPlaying() then
+                            playStarterWithSettings(starterLoopPitch, starterLoopVolume)
+                        end
+                        starterLastPlay = now
+                    end
+                end)
+            end
+        end)
+        
+        -- Receive continuous sound updates for dynamic pitch/volume (electric motors)
+        net.receive("EngineSoundUpdate", function()
+            if not initialized then return end
+            local isBell = net.readBool()
+            local pitch = net.readFloat()
+            local volume = net.readFloat()
+            
+            if isBell then
+                if sounds["Bell"] and bellLoopActive then
+                    bellLoopPitch = normalizePitch(pitch)
+                    bellLoopVolume = volume
+                    sounds["Bell"]:setPitch(bellLoopPitch)
+                    sounds["Bell"]:setVolume(bellLoopVolume)
+                end
+            else
+                if sounds["Starter"] and starterLoopActive then
+                    starterLoopPitch = normalizePitch(pitch)
+                    starterLoopVolume = volume
+                    sounds["Starter"]:setPitch(starterLoopPitch)
+                    sounds["Starter"]:setVolume(starterLoopVolume)
+                end
+            end
+        end)
+        
+        net.receive("EngineSoundStop", function()
+            if not initialized then return end
+            local isBell = net.readBool()
+            if isBell then
+                if sounds["Bell"] then
+                    sounds["Bell"]:stop()
+                end
+                if timer.exists("BellLoop") then timer.remove("BellLoop") end
+                bellLoopActive = false
+            elseif not isBell and sounds["Starter"] then
+                sounds["Starter"]:stop()
+                timer.remove("StarterLoop")
+                starterLoopActive = false
+            end
+        end)
+        
+        net.receive("GearChangeSound", function()
+            if not initialized then return end
+            if sounds["GearChange"] then
+                sounds["GearChange"]:stop()
+                sounds["GearChange"]:play()
+                sounds["GearChange"]:setPitch(normalizePitch(config.GearChangePitch or 1))
+                sounds["GearChange"]:setVolume(config.GearChangeVolume or 0.75)
+            end
+        end)
+
+        net.receive("TurboBOVSound", function()
+            if not initialized then return end
+            local bovPitch = net.readFloat()
+            local bovVolume = net.readFloat()
+            if config.Sounds.TurboBOV and config.Sounds.TurboBOV ~= "" then
+                sound.emitSound(config.Sounds.TurboBOV, chip():getPos(), nil, 
+                    85 + 25 * bovPitch, 
+                    math.max(0, 0.5) * bovVolume)
+            end
+        end)
+
+        net.receive("EngineBlowSound", function()
+            if not initialized then return end
+            local soundPath = net.readString()
+            local blowPitch = net.readFloat()
+            local blowVolume = net.readFloat()
+            if soundPath and soundPath ~= "" then
+                sound.emitSound(soundPath, chip():getPos(), nil,
+                    85 + 25 * blowPitch,
+                    math.max(0, 0.5) * blowVolume)
+            end
+        end)
+
+        -- Custom Sound System Handlers
+        net.receive("EngineCustomSound", function()
+            if not initialized then return end
+            
+            local name = net.readString()
+            local path = net.readString()
+            local pitch = net.readFloat()
+            local volume = net.readFloat()
+            local loopTime = net.readFloat()
+            local attachEnt = net.readEntity()
+            
+            if not name or name == "" then return end
+            if not path or path == "" then return end
+            
+            pitch = normalizePitch(pitch)
+            
+            -- Determine loop mode (<= 0 is seamless continuous)
+            local isContinuous = (loopTime <= 0)
+            
+            local soundKey = "Custom_" .. name
+            local currentSound = sounds[soundKey]
+            local currentPath = sounds[soundKey .. "_Path"]
+            local currentContinuous = sounds[soundKey .. "_IsContinuous"]
+            
+            local shouldRecreate = not currentSound
+                                or (currentPath ~= path)
+                                or (currentContinuous ~= isContinuous)
+            
+            if shouldRecreate then
+                if currentSound then currentSound:stop() end
+                
+                local ent = (attachEnt and attachEnt:isValid()) and attachEnt or chip()
+                currentSound = sound.create(ent, path, isContinuous)
+                
+                sounds[soundKey] = currentSound
+                sounds[soundKey .. "_Path"] = path
+                sounds[soundKey .. "_IsContinuous"] = isContinuous
+            end
+            
+            -- Store params
+            sounds[soundKey .. "_Pitch"] = pitch
+            sounds[soundKey .. "_Volume"] = volume
+            sounds[soundKey .. "_LoopTime"] = loopTime
+            sounds[soundKey .. "_Active"] = true
+            
+            local timerName = "CustomSoundLoop_" .. name
+            
+            if isContinuous then
+                -- Continuous mode: Play once, native looping
+                if currentSound then
+                    currentSound:setPitch(pitch)
+                    currentSound:setVolume(volume)
+                    if not currentSound:isPlaying() then
+                        currentSound:play()
+                    end
+                end
+                
+                if timer.exists(timerName) then timer.remove(timerName) end
+            else
+                -- Discrete mode: Timer-based looping
+                if currentSound then
+                    currentSound:stop()
+                    currentSound:setPitch(pitch)
+                    currentSound:setVolume(volume)
+                    currentSound:play()
+                end
+                
+                if timer.exists(timerName) then timer.remove(timerName) end
+                timer.create(timerName, loopTime, 0, function()
+                    if not sounds[soundKey .. "_Active"] then 
+                        timer.remove(timerName)
+                        return 
+                    end
+                    
+                    local snd = sounds[soundKey]
+                    if snd then
+                        snd:stop()
+                        snd:setPitch(sounds[soundKey .. "_Pitch"])
+                        snd:setVolume(sounds[soundKey .. "_Volume"])
+                        snd:play()
+                    end
+                end)
+            end
+        end)
+
+        net.receive("EngineCustomSoundUpdate", function()
+            if not initialized then return end
+            local name = net.readString()
+            local pitch = net.readFloat()
+            local volume = net.readFloat()
+            
+            local soundKey = "Custom_" .. name
+            if sounds[soundKey] then
+                pitch = normalizePitch(pitch)
+                sounds[soundKey .. "_Pitch"] = pitch
+                sounds[soundKey .. "_Volume"] = volume
+                
+                sounds[soundKey]:setPitch(pitch)
+                sounds[soundKey]:setVolume(volume)
+            end
+        end)
+
+        net.receive("EngineCustomSoundStop", function()
+            if not initialized then return end
+            local name = net.readString()
+            local soundKey = "Custom_" .. name
+            
+            if sounds[soundKey] then
+                -- Fade out slightly instead of hard stop? No, API implies Stop.
+                sounds[soundKey]:stop()
+            end
+            
+            sounds[soundKey .. "_Active"] = false
+            
+            local timerName = "CustomSoundLoop_" .. name
+            if timer.exists(timerName) then timer.remove(timerName) end
+        end)
+        
+        hook.add("think", "EngineClient", function()
+             if not initialized then return end
+             
+             -- Linear Interpolation for Smoothness
+             -- Move CurrentRPM towards TargetRPM
+             -- timer.frametime() * 10 gives a smooth slide.
+             CurrentRPM = math.max(0, CurrentRPM + (TargetRPM - CurrentRPM) * timer.frametime() * 10)
+             
+             -- Smooth throttle blending with separate attack/release
+             -- This prevents abrupt sound cutoff and creates smooth crossfade between On/Off sounds
+             local attackRate = config.Engine_SoundBlendAttack or (config.Engine_SoundBlendRate or 8)
+             local releaseRate = config.Engine_SoundBlendRelease or (config.Engine_SoundBlendRate or 8)
+             local blendRate = (EngineThrottle > LerpedThrottle) and attackRate or releaseRate
+             LerpedThrottle = LerpedThrottle + (EngineThrottle - LerpedThrottle) * math.min(timer.frametime() * blendRate, 1)
+             
+             local rpm = CurrentRPM
+             local rpmPercent = math.clamp(rpm / (config.Engine_Redline or 9000), 0, 1)
+             local active = rpm > 350
+             
+             -- E2 Parity with Smooth Blending
+             -- LerpedThrottle provides smooth crossfade between On/Off sounds
+             -- RPM still influences overall volume envelope for natural sound behavior
+             
+             local blendCurve = config.Engine_SoundBlendCurve or (config.Engine_SoundThrottleExponent or 1)
+             local overlap = config.Engine_SoundBlendOverlap or 0
+             local blend = math.clamp(LerpedThrottle, 0, 1) ^ blendCurve
+             local throttleOn = math.clamp(blend + overlap, 0, 1)
+             local throttleOff = math.clamp((1 - blend) + overlap, 0, 1)
+             
+            -- Allow addons to suppress default engine sounds via generic flag
+            local suppressDefaultSounds = (config.SuppressDefaultSounds == true)
+             
+             -- On Sound (Load/Throttle): Responsive to engine load, smooth throttle-based blending
+             if sounds["On"] then
+                 if suppressDefaultSounds then
+                     -- Addon overrides sounds - silence the default engine sounds
+                     sounds["On"]:setVolume(0)
+                 else
+                     -- E2: pitch = (RPM / OnDiv) * 155 + (50 * Active) * PitchMult
+                     -- Starfall scale: 0.5 = 50% pitch, 1 = normal, 2 = 200% (double)
+                     -- E2 pitch max ~205. Divide by ~200 to normalize to ~1.0 max in Starfall
+                     local pitchBase = (rpm / (config.Engine_SoundOnDiv or 30)) * 155 + (active and 50 or 0)
+                     local pitchNorm = (pitchBase / 200) * (config.Engine_SoundOnPitchMult or 1)
+                     -- Volume: throttle state blended with RPM envelope for natural fade in/out
+                     -- OnRPMStart allows earlier onset at lower RPM, OnVolumeMin keeps some idle presence
+                     local onRpmStart = config.Engine_SoundOnRPMStart or 0
+                     local onRpmDenom = math.max((config.Engine_Redline or 9000) - onRpmStart, 1)
+                     local onGateCurve = config.Engine_SoundOnGateCurve or 1
+                     local onRpmGate = math.clamp((rpm - onRpmStart) / onRpmDenom, 0, 1) ^ onGateCurve
+                     local onVolumeMin = config.Engine_SoundOnVolumeMin or 0
+                     local onVolCurve = config.Engine_SoundOnVolumeCurve or 1
+                     local onRpmFactor = onVolumeMin + (1 - onVolumeMin) * (rpmPercent ^ onVolCurve)
+                     local volumeFinal = onRpmFactor * onRpmGate * throttleOn * (config.Engine_SoundOnVolume or 1) * (config.Engine_SoundOverallDiv or 1)
+                     
+                     sounds["On"]:setPitch(math.max(0.1, pitchNorm * 100))
+                     sounds["On"]:setVolume(math.max(0, volumeFinal))
+                 end
+             end
+             
+             -- Off Sound (Coast/Engine Braking): Inverse blend, plays when throttle is OFF
+             if sounds["Off"] then
+                 if suppressDefaultSounds then
+                     -- Addon overrides sounds - silence the default engine sounds
+                     sounds["Off"]:setVolume(0)
+                 else
+                     -- E2: pitch = (RPM / OffDiv) * 155 + (50 * Active) * PitchMult (same pitch formula)
+                     -- Volume uses inverse throttle blend: high when NOT throttling (engine braking/coasting)
+                     local offPitchCurve = config.Engine_SoundOffPitchCurve or 1
+                     local offPitchRpm = (config.Engine_Redline or 9000) * (rpmPercent ^ offPitchCurve)
+                     local pitchBase = (offPitchRpm / (config.Engine_SoundOffDiv or 30)) * 155 + (active and 50 or 0)
+                     local pitchNorm = (pitchBase / 200) * (config.Engine_SoundOffPitchMult or 1)
+                     -- Off volume: (1-throttle) for smooth throttle blend
+                     -- OffRPMInfluence = 0 ignores RPM (consistent coasting), 1 scales by RPM
+                     local offRpmInfluence = config.Engine_SoundOffRPMInfluence or 0
+                     local offRpmFactor = (1 - offRpmInfluence) + (offRpmInfluence * rpmPercent)
+                     local volumeFinal = offRpmFactor * throttleOff * (config.Engine_SoundOffVolume or 1) * (config.Engine_SoundOverallDiv or 1)
+                     
+                     sounds["Off"]:setPitch(math.max(0.1, pitchNorm * 100))
+                     sounds["Off"]:setVolume(math.max(0, volumeFinal))
+                 end
+             end
+             
+             -- Turbo sound (if enabled) - smooth fade in/out based on actual boost
+             if sounds["Turbo"] and config.Turbo then
+                     -- Standard turbo: boost-dependent sound
+                     local boostPercent = math.max(0, TurboBoost - 1)  -- 0 at no boost, increases with pressure
+                     local boostThreshold = config.TurboSoundBoostThreshold or 0.05
+                     
+                     if boostPercent > boostThreshold and active then
+                         -- E2: Turbo pitch = 75 + 50 * boostPercent * TurboPitch
+                         local turboPitch = (75 + 50 * math.clamp(boostPercent, 0, 1)) / 100 * (config.TurboPitch or 1)
+                         -- Turbo volume: smooth fade from 0 at low boost to full at high boost
+                         TurboSoundVolume = math.max(0, boostPercent - boostThreshold) * (config.TurboVolume or 1) * (config.Engine_SoundOverallDiv or 1)
+                         sounds["Turbo"]:setPitch(math.max(0.1, turboPitch))
+                         sounds["Turbo"]:setVolume(math.max(0, TurboSoundVolume))
+                     else
+                         -- Smooth fade-out when boost drops
+                         TurboSoundVolume = TurboSoundVolume * 0.9  -- Gradual fade
+                         sounds["Turbo"]:setVolume(math.max(0, TurboSoundVolume))
+                     end
+             end
+             
+             -- ====== ADDON HOOK: OnSoundUpdate ======
+             -- Allow addons to update their custom sounds (pitch/volume based on RPM etc)
+             -- Runs every frame on client
+             if config.Addons then
+                 local ClientState = {
+                     RPM = CurrentRPM,
+                     Throttle = LerpedThrottle,
+                     Active = active
+                 }
+                 for name, addon in pairs(config.Addons) do
+                    if addon.Enabled and addon.OnSoundUpdate then
+                        addon.OnSoundUpdate(ClientState, config, sounds)
+                    end
+                 end
+             end
+        end)
+        
+        -- ====== ENGINE INFO HUD (3D2D Display) ======
+        -- Shows engine specs and loaded addons when looking directly at the chip
+        local hudFont = render.createFont("Roboto Mono", 26, 400, true)
+        local hudFontSmall = render.createFont("Roboto Mono", 20, 400, true)
+        local hudFontTitle = render.createFont("Roboto", 34, 700, true)
+        
+        local EngineVersion = "3"  -- Version matches config
+        
+        local function calculateEnginePower(config)
+            local ad = config.AddonDisplay or {}
+            local redline = ad.redline or config.Engine_Redline or 9000
+
+            -- Calculate Base Peak Torque (Theoretical 100% VE Torque)
+            local baseTorque = ad.peakTorque
+            if not baseTorque then
+                if ad.displacement and ad.stroke and ad.bore and ad.airflow then
+                    baseTorque = ((ad.stroke / ad.bore) * ad.displacement * ad.airflow) * (ad.stroke / ad.bore)
+                end
+                if not baseTorque then
+                    local bore = config.Engine_Bore or 87
+                    local stroke = config.Engine_Stroke or 84
+                    local cylinders = config.Engine_Cylinders or 4
+                    local airflow = config.Engine_Airflow or 100
+                    local displacement = (math.pi / 4) * (bore ^ 2) * stroke * cylinders / 1000000
+                    baseTorque = ((stroke / bore) * displacement * airflow) * (stroke / bore)
+                end
+            end
+
+            -- Simulate Engine Curve to find EXACT peaks
+            local T = config.Engine_TorqueTable or {1,1,1,1,1}
+            local peakTorque = 0
+            local peakTorqueRPM = 0
+            local peakHP = 0
+            local peakHPRPM = 0
+            
+            for rpm = 0, redline, 50 do
+                local factor = math.clamp(rpm / redline, 0, 1)
+                local mult = _G.RedFoxEngineCore.getTorqueMultiplier(T, factor)
+                mult = math.clamp(mult, 0, 1)
+
+                local currentTorque = baseTorque * mult
+                if currentTorque > peakTorque then
+                    peakTorque = currentTorque
+                    peakTorqueRPM = rpm
+                end
+                
+                -- The E2 standard mapped HP mathematically based on the peakTorque formula with constant 10000
+                local currentHP = (currentTorque * rpm) / 10000
+                if currentHP > peakHP then
+                    peakHP = currentHP
+                    peakHPRPM = rpm
+                end
+            end
+            
+            -- Apply user multipliers
+            if config.TorqueMultiplier and config.TorqueMultiplier ~= 1 then
+                peakTorque = peakTorque * config.TorqueMultiplier
+            end
+
+            -- Overrides
+            if ad.hp then peakHP = ad.hp; peakHPRPM = redline end
+            if ad.peakTorque then peakTorque = ad.peakTorque * (config.TorqueMultiplier or 1); peakTorqueRPM = redline end
+
+            return math.floor(peakHP or 0), math.floor(peakTorque or 0), peakHPRPM, peakTorqueRPM
+        end
+        
+        local function getGearMethod(config)
+            -- UseRPMBasedGear only applies when AutoGear is enabled
+            if not config.AutoGear then
+                return "Manual"
+            elseif config.UseRPMBasedGear then
+                return "RPM-Based"
+            elseif config.ClassicAuto then
+                return "Classic Auto"
+            else
+                return "Speed-Based"  -- AutoGear without RPM-based
+            end
+        end
+        
+        local function getGearCounts(config)
+            local forwardGears = 0
+            local reverseGears = 0
+            
+            -- Count forward gears from Gearbox_Ratios
+            if config.Gearbox_Ratios then
+                forwardGears = #config.Gearbox_Ratios
+            end
+            
+            -- Count reverse gears from ReverseGearRatios
+            if config.ReverseGearRatios then
+                reverseGears = #config.ReverseGearRatios
+            end
+            
+            return forwardGears, reverseGears
+        end
+        
+        local function calculateEngineStats(config)
+            local stats = {}
+            local ad = config.AddonDisplay or {}
+
+            -- Engine Type (addon can override)
+            stats.engineType = ad.engineType or "ICE"
+
+            -- Cylinders (addon can override)
+            stats.cylinders = ad.cylinders or config.Engine_Cylinders or 4
+
+            -- Displacement in liters: prefer addon value, otherwise compute from core
+            if ad.displacement then
+                stats.displacement = math.round(ad.displacement, 1)
+            else
+                local bore = config.Engine_Bore or 87  -- mm
+                local stroke = config.Engine_Stroke or 84  -- mm
+                local cylinders = stats.cylinders
+                local displacement = (math.pi / 4) * (bore ^ 2) * stroke * cylinders / 1000000
+                stats.displacement = math.round(displacement, 1)
+            end
+
+            -- Redline and flywheel mass (addon can override)
+            stats.redline = ad.redline or config.Engine_Redline or 9000
+            stats.flywheelMass = ad.flywheelMass or config.Engine_FlywheelMass or 8
+
+            -- Power and Torque (prefer addon values)
+            if ad.hp or ad.peakTorque then
+                stats.hp = ad.hp or 0
+                stats.maxTorque = ad.peakTorque or 0
+            else
+                local hp, torque, hpRpm, tqRpm = calculateEnginePower(config)
+                stats.hp = hp
+                stats.maxTorque = torque
+                stats.hpRpm = hpRpm
+                stats.torqueRpm = tqRpm
+            end
+
+            -- Preserve addon-provided per-motor and total fields for HUD
+            stats.peakTorquePerMotor = ad.peakTorquePerMotor
+            stats.peakTorqueAtWheelsPerMotor = ad.peakTorqueAtWheelsPerMotor
+            stats.peakTorqueTotal = ad.peakTorqueTotal or stats.maxTorque
+            stats.hpPerMotor = ad.hpPerMotor
+            stats.hpTotal = ad.hpTotal or stats.hp
+            
+            -- Drivetrain and bias
+            -- Allow addons to override drivetrain via AddonDisplay (powerDistribution or drivetrain)
+            local powerDist = ad.powerDistribution or config.PowerDistribution or 0  -- front % (0=RWD, 100=FWD)
+            -- Expose numeric front/rear percentages for HUD
+            stats.frontPercent = tonumber(powerDist) or 0
+            stats.rearPercent = 100 - stats.frontPercent
+
+            if ad.drivetrain then
+                -- Allow addon to set a custom drivetrain label (assumed to be a short type)
+                stats.drivetrain = ad.drivetrain
+            else
+                -- Only set the drivetrain TYPE here; HUD will render numeric percentages separately
+                if stats.frontPercent == 0 then
+                    stats.drivetrain = "RWD"
+                elseif stats.frontPercent == 100 then
+                    stats.drivetrain = "FWD"
+                else
+                    stats.drivetrain = "AWD"
+                end
+            end
+            
+            -- Gear method
+            stats.gearMethod = getGearMethod(config)
+            
+            -- Gear counts
+            stats.forwardGears, stats.reverseGears = getGearCounts(config)
+            
+            -- Version
+            stats.version = EngineVersion
+            
+            return stats
+        end
+        
+        local function getEnabledAddons(config)
+            local addons = {}
+            if config.Addons then
+                for name, addon in pairs(config.Addons) do
+                    if addon.Enabled then
+                        table.insert(addons, name)
+                    end
+                end
+            end
+            table.sort(addons)
+            return addons
+        end
+        
+        -- ====== ENGINE INFO HUD (RenderTarget Implementation) ======
+        -- Renders stats to a texture off-screen (efficient) and displays it in world
+        
+        -- RT Setup
+        local rtName = "RedFoxEngineRT_" .. chip():entIndex()
+        local rtSize = 1024
+        local panelWidth = 700
+        -- Panel height is dynamic, we'll track it
+        local currentPanelHeight = 512 
+        
+        -- Create RT and Material
+        -- Check if RT exists first to avoid recreation spam if config reloads
+        local rt = render.createRenderTarget(rtName)
+        local rtMat = material.create("UnlitGeneric")
+        -- Revert to string-based binding as it handles internal lookup safer
+        rtMat:setTextureRenderTarget("$basetexture", rtName)
+        rtMat:setInt("$flags", 32768) -- Clear flags
+        rtMat:setFloat("$alpha", 1) -- Set alpha float as per user example
+        
+        -- State for RT update
+        local nextFrameTime = 0
+        local fps = 10 -- Update FPS (low is fine for static text)
+        local frameInterval = 1 / fps
+        
+        -- 1. OFF-SCREEN RENDERER (Updates the texture)
+        -- Does NOT require render.hud permission!
+        hook.add("renderoffscreen", "engineInfoRTUpdate", function()
+            -- Rate limit
+            local now = timer.systime()
+            if now < nextFrameTime then return end
+            
+            -- Optimization: Only render if a player is close enough to see it
+            -- We can iterate players or just check local player since this is client-side script
+            local ply = player()
+            local chipEnt = chip()
+            if not isValid(chipEnt) then return end
+            
+            -- Distance Check (Reuse config distance)
+            local guiConfig = config.InfoGUI or {}
+            local maxDistance = guiConfig.Distance or 1000 -- Increased default for debug
+            if ply:getPos():getDistance(chipEnt:getPos()) > maxDistance then return end
+            
+            nextFrameTime = now + frameInterval
+            
+            
+            -- DEBUG
+            -- print("Updating RT")
+            
+            -- Select RT
+            render.selectRenderTarget(rtName)
+            -- Clear to Transparent
+            render.clear(Color(0, 0, 0, 0))
+            
+            -- Prepare Stats
+            local stats = calculateEngineStats(config)
+            local addons = getEnabledAddons(config)
+            
+            -- Calculate Heights
+            local lineHeight = 32
+            local titleHeight = 48
+            local addonCount = #addons
+            local statsLines = 8
+            local totalLines = statsLines + (addonCount > 0 and addonCount + 1 or 0)
+            local panelHeight = titleHeight + (totalLines * lineHeight) + 30
+            currentPanelHeight = panelHeight -- Store for world rendering
+            
+            -- Draw Panel Content (2D coordinates on the 1024x1024 texture)
+            -- Center it horizontally on the RT
+            local x = rtSize / 2
+            local y = 10 -- Padding from top
+            
+            -- Background
+            -- We draw relative to center x
+            render.setColor(Color(20, 20, 25, 240))
+            render.drawRect(x - panelWidth/2, y, panelWidth, panelHeight)
+            
+            -- Header bar
+            render.setColor(Color(231, 76, 60, 255))
+            render.drawRect(x - panelWidth/2, y, panelWidth, titleHeight)
+            
+            -- Title
+            render.setFont(hudFontTitle)
+            render.setColor(Color(255, 255, 255))
+            render.drawSimpleText(x, y + titleHeight/2, "Red Fox Engine v" .. stats.version, 1, 1)
+            
+            -- Content Offset
+            local yPos = y + titleHeight + 15
+            local leftX = x - panelWidth/2 + 30
+            
+            render.setFont(hudFont)
+            
+            -- Helpers
+            local function drawLine(label, value, valueColor)
+                render.setColor(Color(150, 150, 150))
+                render.drawSimpleText(leftX, yPos, label, 0, 1)
+                render.setColor(valueColor or Color(255, 255, 255))
+                render.drawSimpleText(leftX + 160, yPos, value, 0, 1)
+                yPos = yPos + lineHeight
+            end
+            
+            -- Engine Type
+            drawLine("Type:", stats.engineType .. " (" .. stats.cylinders .. "cyl)")
+            
+            -- Displacement
+            drawLine("Displacement:", stats.displacement .. "L")
+            
+            -- Max Torque
+            local torqueText = tostring(stats.maxTorque or 0) .. " Nm"
+            if stats.torqueRpm then torqueText = torqueText .. " @ " .. stats.torqueRpm .. " RPM" end
+            if stats.peakTorquePerMotor then
+                torqueText = torqueText .. " (" .. tostring(stats.peakTorquePerMotor) .. " Nm/motor)"
+            end
+            drawLine("Max Torque:", torqueText, Color(100, 200, 255))
+            
+            -- Redline
+            drawLine("Redline:", stats.redline .. " RPM")
+            
+            -- Flywheel Mass
+            drawLine("Flywheel Mass:", stats.flywheelMass .. " kg")
+            
+            -- Peak Power
+            local hpText = tostring(stats.hp or 0) .. " HP"
+            if stats.hpRpm then hpText = hpText .. " @ " .. stats.hpRpm .. " RPM" end
+            if stats.hpPerMotor then
+                hpText = hpText .. " (" .. tostring(stats.hpPerMotor) .. " HP/motor)"
+            end
+            drawLine("Peak Power:", hpText, Color(100, 255, 150))
+            
+            -- Drivetrain
+            local drivetrainText = stats.drivetrain or "Unknown"
+            if stats.frontPercent ~= nil then
+                drivetrainText = drivetrainText .. string.format("  (%.0f%% F / %.0f%% R)", stats.frontPercent, stats.rearPercent)
+            end
+            drawLine("Drivetrain:", drivetrainText)
+            
+            -- Transmission
+            local gearText = stats.gearMethod
+            if stats.forwardGears and stats.reverseGears then
+                gearText = gearText .. string.format("  (%dF / %dR)", stats.forwardGears, stats.reverseGears)
+            end
+            drawLine("Transmission:", gearText)
+            
+            -- Addons
+            if addonCount > 0 then
+                yPos = yPos + 5
+                render.setColor(Color(231, 76, 60))
+                render.drawSimpleText(leftX, yPos, "Active Addons:", 0, 1)
+                yPos = yPos + lineHeight
+                
+                render.setFont(hudFontSmall)
+                for i, addonName in ipairs(addons) do
+                    render.setColor(Color(100, 255, 150))
+                    render.drawSimpleText(leftX + 20, yPos, "• " .. addonName, 0, 1)
+                    yPos = yPos + (lineHeight - 5)
+                end
+            end
+            
+            -- Reset RT selection
+            render.selectRenderTarget(nil)
+        end)
+        
+        -- 2. HOLOGRAM DISPLAY (Entities handle rendering automatically)
+        -- Much more reliable than manual 3D2D drawing hooks
+        
+        -- Cleanup identifying existing holo
+        if isValid(chip().EngineInfoHolo) then
+            chip().EngineInfoHolo:remove()
+        end
+        
+        -- Create Hologram
+        local guiConfig = config.InfoGUI or {}
+        local guiOffset = guiConfig.Offset or Vector(0, 0, 30)
+        local holoPos = chip():localToWorld(guiOffset)
+        
+        -- Default: face up relative to chip (like the old 3D2D)
+        -- Old code: rotate 90 on X, 90 on Y?
+        -- Let's start with chip angles and adjust.
+        local holoAng = chip():localToWorldAngles(Angle(0,0,0))
+        -- To match the "standing up" panel look:
+        holoAng:rotateAroundAxis(holoAng:getRight(), 90) -- Stand up?
+        -- Actually, let's just use 0,0,0 relative to chip and see.
+        -- User can config Offset/Angle if needed, but for now let's just place it.
+        
+        local holo = holograms.create(holoPos, holoAng, "models/holograms/plane.mdl")
+        
+        if isValid(holo) then
+            chip().EngineInfoHolo = holo -- Store ref for cleanup
+            holo:setParent(chip())
+            holo:suppressEngineLighting(true) -- Match user example
+            if RENDERMODE and RENDERMODE.WORLDGLOW then
+                holo:setRenderMode(2) -- Match user example
+            else
+                holo:setRenderMode(9) -- Fallback if enum missing
+            end
+            
+            -- Set Material to RT
+            -- Use string name for SetMaterial on entities
+            holo:setMaterial("!" .. rtMat:getName())
+            
+            -- Scale
+            -- Use config scale or default
+            local scaleVal = guiConfig.Scale or 6
+            holo:setScale(Vector(scaleVal, scaleVal, 1))
+            
+            -- Face Player Logic (Tick-based)
+            hook.add("think", "engineInfoHoloThink", function()
+                if not isValid(holo) then return end
+                if not isValid(chip()) then return end
+                
+                -- Visibility Check (Distance & Angle)
+                local ply = player()
+                local maxDistance = guiConfig.Distance or 1000
+                local viewAngleDot = guiConfig.ViewAngleDot or 0.9 -- Default 0.9 (approx 25 deg cone)
+                
+                local holoPos = holo:getPos()
+                local plyEye = ply:getEyePos()
+                
+                -- Vector from Player Eyes to Holo Center
+                local toHolo = (holoPos - plyEye):getNormalized()
+                local lookDir = ply:getEyeAngles():getForward()
+                
+                -- Dot Product: 1 = Looking directly at it.
+                -- We check if dot > threshold (visible).
+                -- Also check max distance.
+                -- Note: toHolo is Player->Holo. lookDir is Player->Forward.
+                -- So dot should be positive and close to 1.
+                
+                if ply:getPos():getDistance(chip():getPos()) > maxDistance or toHolo:dot(lookDir) < viewAngleDot then
+                     -- Check if user wants "Always Show if Close"?
+                     -- For now, strict check as requested.
+                     holo:setColor(Color(0,0,0,0)) -- Hide
+                else
+                    holo:setColor(Color(255,255,255,254)) -- Show
+                    
+                    -- Billboard effect: Face Player Eyes
+                    -- logic: (Target - Source):getAngle()
+                    -- Source = Holo, Target = Eyes.
+                    -- This vectors points FROM Holo TO Eyes.
+                    -- Forward axis of Holo points to Eyes.
+                    
+                    local padAng = (plyEye - holoPos):getAngle()
+                    
+                    -- User requested rotation logic:
+                    -- m:setAngles((eyePos() - m:getTranslation()):getAngle() + Angle(90, 0, 0))
+                    -- m:rotate(Angle(0, 90, 0))
+                    
+                    -- Applying + Angle(90, 0, 0) (Pitch 90)
+                    padAng.p = padAng.p + 90
+                    
+                    -- Rotating around Up (Yaw) +90?
+                    -- "m:rotate(Angle(0, 90, 0))" -> Rotate around local Y (Yaw) or Z? 
+                    -- Source Angle(p,y,r). rotate(Angle) usually applies rotation.
+                    -- Local 90 Yaw.
+                    padAng:rotateAroundAxis(padAng:getUp(), 90)
+                    
+                    holo:setAngles(padAng)
+                end
+            end)
+        end
+
+    end
+    
+    Core.initClient = initClient
+end

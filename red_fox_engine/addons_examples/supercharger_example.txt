@@ -1,0 +1,164 @@
+-- Supercharger Addon Example
+-- Replaces turbo lag with instant RPM-driven boost
+--
+-- Usage: Enable in red_fox_engine_config.txt:
+--   Addons.Supercharger.Enabled = true
+--
+-- Differences from Turbo:
+-- - Turbo: Boost builds with exhaust flow (lag), BOV on throttle close
+-- - Supercharger: Instant boost tied to engine RPM, no lag, constant whine
+-- - Twincharger: Both systems active (see twincharger_example.txt)
+
+return {
+    Supercharger = {
+        Enabled = false,  -- Set to true to use
+        
+        -- Supercharger Configuration
+        MaxBoostPSI = 12,           -- Maximum boost pressure (PSI) at low RPM
+        MinBoostPSI = 2,            -- High-RPM boost after dropoff
+        BoostRPMStart = 1000,       -- RPM where boost starts building
+        BoostRPMMax = 6000,         -- RPM where boost falls to MinBoostPSI
+        HighRPMDropoffCurve = 1.6,  -- Higher = stronger high-RPM dropoff
+        AirPressure = 14.7,         -- Atmospheric pressure (PSI)
+        EfficiencyLoss = 0.15,      -- Power loss to drive supercharger (15%)
+        BoostCurve = 1.2,           -- Exponential boost curve (higher = more aggressive)
+        
+        -- Supercharger Sound (constant whine that scales with RPM)
+        SuperchargerSoundPath = "acf_extra/vehiclefx/boost/supercharger.wav",
+        SuperchargerSoundVolume = 1.0,      -- Max volume
+        SuperchargerIdleVolume = 0.35,      -- Audible base whine at idle
+        SuperchargerSoundPitchMin = 1.0,    -- Higher base pitch
+        SuperchargerSoundPitchMax = 2.5,    -- High pitched whine at redline
+        
+        -- Auto-sync for UI (IMPORTANT: Sound config must be synced to client!)
+        SyncedState = { 
+            "SuperchargerRPM", "SuperchargerBoost", "SuperchargerPSI", "SuperchargerThrottle",
+            "SuperchargerSoundPath", "SuperchargerSoundVolume", "SuperchargerIdleVolume",
+            "SuperchargerSoundPitchMin", "SuperchargerSoundPitchMax"
+        },
+        
+        -- Wire outputs
+        WireOutputs = {
+            { name = "SuperchargerBoost", source = "SuperchargerBoost", type = "normal" },
+            { name = "SuperchargerPSI", source = "SuperchargerPSI", type = "normal" },
+        },
+        
+        -- Override turbo calculation with supercharger logic
+        OnTurboCalculation = function(state, config, turboData)
+            local addon = config.Addons.Supercharger
+            
+            -- Supercharger boost is directly tied to engine RPM (no lag)
+            local rpm = turboData.engineRPM or 0
+            local throttle = turboData.throttle or 0
+            
+            -- Calculate boost based on RPM range
+            local boostRange = math.max(addon.BoostRPMMax - addon.BoostRPMStart, 1)
+            local rpmRatio = math.clamp((rpm - addon.BoostRPMStart) / boostRange, 0, 1)
+
+            -- Apply boost curve for realistic supercharger behavior (strong low-end, dropoff at high RPM)
+            local dropoffCurve = addon.HighRPMDropoffCurve or 1.6
+            local dropoff = rpmRatio ^ dropoffCurve
+            local boostFactor = 1 - dropoff  -- High at low RPM, low at high RPM
+
+            -- Throttle affects boost, but superchargers keep some boost even at partial throttle
+            local throttleFactor = math.clamp(0.4 + (throttle * 0.6), 0, 1)
+
+            -- Calculate PSI: high at low RPM, tapering down at high RPM
+            local minBoost = addon.MinBoostPSI or 2
+            local maxBoost = addon.MaxBoostPSI or 12
+            local psi = (maxBoost - (maxBoost - minBoost) * dropoff) * throttleFactor
+            local boost = (psi + addon.AirPressure) / addon.AirPressure
+            
+            -- Efficiency loss: superchargers consume engine power to run
+            -- Reduce torque multiplier slightly to account for parasitic loss
+            local efficiencyFactor = 1 - (addon.EfficiencyLoss * boostFactor)
+            local torqueMultiplier = turboData.torqueMultiplier * (boost / 1.25) * efficiencyFactor
+            
+            -- Store for sync/wire
+            addon.SuperchargerRPM = rpm  -- Supercharger spins at engine speed (simplified)
+            addon.SuperchargerPSI = psi
+            addon.SuperchargerBoost = boost
+            addon.SuperchargerThrottle = throttle
+            
+            return {
+                turboPSI = psi,           -- Override turbo PSI
+                turboBoost = boost,       -- Override turbo boost
+                turboRPM = rpm,           -- Supercharger RPM = engine RPM
+                torqueMultiplier = torqueMultiplier, -- Apply boost with efficiency loss
+                disableBOV = true         -- Superchargers don't use a BOV
+            }
+        end,
+        
+        -- Hook: Send supercharger sound data to clients
+        NetworkWrite = function(state, config, net)
+            local addon = config.Addons.Supercharger
+            net.writeString(addon.SuperchargerSoundPath or "")
+            net.writeFloat(addon.SuperchargerSoundVolume or 1.0)
+            net.writeFloat(addon.SuperchargerIdleVolume or 0.35)
+            net.writeFloat(addon.SuperchargerSoundPitchMin or 1.0)
+            net.writeFloat(addon.SuperchargerSoundPitchMax or 2.5)
+        end,
+        
+        -- Hook: Receive supercharger sound data on client and create sound object
+        NetworkRead = function(state, config, net)
+            local addon = config.Addons.Supercharger
+            addon.SuperchargerSoundPath = net.readString()
+            addon.SuperchargerSoundVolume = net.readFloat()
+            addon.SuperchargerIdleVolume = net.readFloat()
+            addon.SuperchargerSoundPitchMin = net.readFloat()
+            addon.SuperchargerSoundPitchMax = net.readFloat()
+            
+            -- Create or replace sound object on client side
+            if addon.SuperchargerSoundPath and addon.SuperchargerSoundPath ~= "" then
+                if addon._soundObject and addon._soundPath ~= addon.SuperchargerSoundPath then
+                    addon._soundObject:stop()
+                    addon._soundObject = nil
+                end
+
+                if not addon._soundObject then
+                    -- Get engine entity - the chip's parent should be the engine
+                    local engineEnt = chip():getParent()
+                    if engineEnt and engineEnt:isValid() then
+                        addon._soundObject = sound.create(engineEnt, addon.SuperchargerSoundPath, true)
+                        addon._soundPath = addon.SuperchargerSoundPath
+                        if addon._soundObject then
+                            addon._soundObject:play()
+                            addon._soundObject:setVolume(0)
+                        end
+                    end
+                end
+            end
+
+            -- Create a client think hook once to drive pitch/volume updates
+            if not addon._soundThinkHook then
+                addon._soundThinkHook = true
+                hook.add("think", "SuperchargerSound", function()
+                    if not addon._soundObject then return end
+
+                    local rpm = addon.SuperchargerRPM or 0
+                    local throttle = addon.SuperchargerThrottle or 0
+                    local redline = config.Engine_Redline or 9000
+                    local rpmRatio = math.clamp(rpm / redline, 0, 1)
+
+                    local pitchMin = addon.SuperchargerSoundPitchMin or 1.0
+                    local pitchMax = addon.SuperchargerSoundPitchMax or 2.5
+                    local pitch = pitchMin + (rpmRatio * (pitchMax - pitchMin))
+
+                    local idleVolume = addon.SuperchargerIdleVolume or 0.35
+                    local throttleVolume = throttle * (addon.SuperchargerSoundVolume or 1.0)
+                    local rpmVolume = rpmRatio * 0.4
+                    local volume = math.clamp(idleVolume + throttleVolume + rpmVolume, 0, 1)
+
+                    volume = volume * (config.Engine_SoundOverallDiv or 1)
+
+                    if rpm > 100 then
+                        addon._soundObject:setPitch(math.max(0.1, pitch))
+                        addon._soundObject:setVolume(math.max(0, volume))
+                    else
+                        addon._soundObject:setVolume(0)
+                    end
+                end)
+            end
+        end,
+    }
+}

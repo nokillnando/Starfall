@@ -1,0 +1,384 @@
+-- Electric Powertrain Addon Example
+-- Overrides BOTH engine and transmission (no multi-gear gearbox)
+--
+-- Usage: Enable in red_fox_engine_config.txt:
+--   Addons.ElectricPowertrain.Enabled = true
+--
+-- ADDON HOOK CONTEXT (ctx) EXPLANATION:
+-- Each addon hook receives a "ctx" parameter containing hook-specific data:
+--
+-- OnIgnition ctx = { ignition, key_f, last_f, active, rpm }
+--   - Current ignition state, key presses, engine active state
+--
+-- HandleCustomEngine inputs = { Key_W, Key_S, Key_R, Key_Shift, Key_Space, ... }
+--   - All pod inputs, Chassis, Engine, FrontWheels, RearWheels entities
+--
+-- OnBrakeApply ctx = { brakeForceF, brakeForceR, frontRPMs, rearRPMs, speed, speedN }
+--   - Current brake forces and wheel data for modification
+--
+-- OnPhysicsUpdate ctx = { deltaTime, ... }
+--   - Called every physics tick for custom behaviors
+--
+-- The modular addon system allows overriding specific behaviors without touching
+-- the core engine code. Each hook returns modifications or nil to use defaults.
+
+return {
+    ElectricPowertrain = {
+        Enabled = false,  -- Set to true to use
+
+        -- Configuration
+        FrontMotorCount = 1,      -- Motors on front axle
+        RearMotorCount = 2,       -- Motors on rear axle
+        MaxMotorTorque = 900,     -- Peak torque per motor
+        BaseSpeedRPM = 4000,      -- Constant-torque region ends here
+        MaxMotorRPM = 16000,      -- Max motor RPM (constant-power region)
+        DriveRatio = 9.5,         -- Single reduction ratio
+        RegenStrength = 0.3,      -- 0..1, how much regen when holding S
+        RegenBrakeBlend = 0.4,    -- 0..1, how much regen contributes to brake signal
+        EfficiencyMin = 0.85,     -- Minimum efficiency at high RPM/load
+        EfficiencyLossAtMaxRPM = 0.12, -- Efficiency drop at MaxMotorRPM
+        DriveBias = 0.5,          -- 0 = rear bias, 1 = front bias (base split)
+        VectoringStrength = 0.15, -- 0..0.3, axle bias shift on steer
+        PerWheelVectoring = true, -- Enable left/right per-wheel torque scaling
+        
+        -- Electric Motor Sound Paths
+        MotorSoundPath = "acf_engines/electric_small.wav",  -- Motor hum sound
+        MotorSoundPitch = 1.0,      -- Base pitch multiplier
+        MotorSoundVolume = 0.6,     -- Base volume (0-1)
+
+        -- Auto-sync for UI (IMPORTANT: Sound config must be synced to client!)
+        SyncedState = { 
+            "MotorRPM", "MotorTorque", "InReverse",
+            "MotorSoundPath", "MotorSoundPitch", "MotorSoundVolume",  -- Sound config for client
+            "PowerDistribution"
+        },
+
+        -- Hook: Send addon flags to clients
+        NetworkWrite = function(state, config, net)
+            -- Suppress default engine sounds on client
+            net.writeBit(1)
+        end,
+
+        -- Hook: Receive addon flags on client
+        NetworkRead = function(state, config, net)
+            config.SuppressDefaultSounds = (net.readBit() == 1)
+        end,
+
+        -- Wire outputs
+        WireOutputs = {
+            { name = "MotorRPM", source = "MotorRPM", type = "normal" },
+            { name = "MotorTorque", source = "MotorTorque", type = "normal" },
+            { name = "EV_InReverse", source = "InReverse", type = "normal" },
+        },
+
+        -- Electric engines: instant activation, no cranking, no sounds
+        OnIgnition = function(state, config, ctx)
+            local addon = config.Addons and config.Addons.ElectricPowertrain
+            
+            -- Electric powertrain handles its own W/S inversion and sounds
+            state.SkipWSInversion = true
+            config.SkipWSInversion = true
+
+            -- Provide HUD display overrides so core HUD reflects addon specs
+            do
+                if addon then
+                    local motorCount = (addon.FrontMotorCount or 0) + (addon.RearMotorCount or 0)
+                    if motorCount < 1 then motorCount = 1 end
+
+                    -- Peak torque per motor (Nm)
+                    local peakTorquePerMotor = (addon.MaxMotorTorque or 0)
+                    -- Total motor torque (all motors combined)
+                    local peakTorqueTotal = peakTorquePerMotor * motorCount
+
+                    local driveRatio = addon.DriveRatio or 1
+                    -- Torque at wheels per motor and total
+                    local peakTorqueAtWheelsPerMotor = peakTorquePerMotor * driveRatio
+                    local peakTorqueAtWheelsTotal = peakTorqueAtWheelsPerMotor * motorCount
+
+                    local redline = addon.MaxMotorRPM or config.Engine_Redline or 9000
+
+                    -- Use correct conversion: hp = (Torque * RPM) / 7127  (Torque in Nm)
+                    -- Compute HP from motor torque (not wheel torque) to avoid overcounting drive ratio
+                    local hpPerMotor = (peakTorquePerMotor * redline) / 7127
+                    local hpTotal = (peakTorqueTotal * redline) / 7127
+
+                    config.AddonDisplay = config.AddonDisplay or {}
+                    config.AddonDisplay.engineType = "Electric Motor"
+                    config.AddonDisplay.cylinders = 0
+                    config.AddonDisplay.displacement = 0.0
+                    config.AddonDisplay.redline = redline
+                    config.AddonDisplay.flywheelMass = config.Engine_FlywheelMass or 0
+
+                    -- Provide both per-motor and total values for clarity
+                    config.AddonDisplay.peakTorquePerMotor = math.floor(peakTorquePerMotor)
+                    config.AddonDisplay.peakTorqueAtWheelsPerMotor = math.floor(peakTorqueAtWheelsPerMotor)
+                    config.AddonDisplay.peakTorqueTotal = math.floor(peakTorqueTotal)
+                    config.AddonDisplay.peakTorque = math.floor(peakTorqueTotal) -- backward-compatible (total motor torque)
+
+                    config.AddonDisplay.hpPerMotor = math.floor(hpPerMotor)
+                    config.AddonDisplay.hpTotal = math.floor(hpTotal)
+                    config.AddonDisplay.hp = math.floor(hpTotal) -- backward-compatible (total hp)
+
+                    -- Initial power distribution estimate (front %)
+                    local frontCount = (addon.FrontMotorCount or 0)
+                    local pd = 0
+                    if motorCount > 0 then
+                        pd = (frontCount / motorCount) * 100
+                    end
+                    config.AddonDisplay.powerDistribution = math.floor(pd)
+                end
+            end
+
+            -- Electric motor: if ignition is on, motor is active (ready for torque)
+            if ctx.ignition >= 1 then
+                -- Force active whenever ignition is on, prevent cranking states
+                
+                -- Play custom electric motor sound (server side trigger)
+                if not state.MotorSoundPlaying and Core.playCustomSound then
+                    Core.playCustomSound(
+                        "ElectricMotor", 
+                        addon.MotorSoundPath or "acf_engines/electric_small.wav",
+                        1, 0.05, 0.0
+                    )
+                    state.MotorSoundPlaying = true
+                end
+                
+                state.ShouldPlayBell = false -- Silence default bell
+                return { ignition = 1, active = true }
+            else
+                -- Ignition off: motor is off, no sound
+                if state.MotorSoundPlaying and Core.stopCustomSound then
+                    Core.stopCustomSound("ElectricMotor")
+                    state.MotorSoundPlaying = false
+                end
+                
+                state.ShouldPlayBell = false
+                return { active = false, rpm = 0 }
+            end
+        end,
+
+        -- Custom electric motor sound update (Client Side Hook)
+        OnSoundUpdate = function(state, config, sounds)
+             -- Modulate the custom sound pitch/volume based on RPM
+             local snd = sounds["Custom_ElectricMotor"]
+             -- Check if sound exists and is marked Active by the server
+             if snd and sounds["Custom_ElectricMotor_Active"] then
+                 local addon = config.Addons.ElectricPowertrain
+                 
+                 local throttle = state.Throttle or 0
+                 local rpm = state.RPM or 0
+                 local rpmRatio = math.clamp(rpm / (addon.MaxMotorRPM or 16000), 0, 1)
+                 
+                 -- Volume calculation: small idle hum + throttle-based volume
+                 local idleVolume = 0.05
+                 local throttleVolume = throttle * (addon.MotorSoundVolume or 0.6)
+                 local rpmVolume = rpmRatio * 0.2
+                 local finalVolume = math.clamp(idleVolume + throttleVolume + rpmVolume, 0, 1)
+                 
+                 -- Pitch scales with RPM
+                 local dynamicPitch = 0.8 + (rpmRatio * 0.6)
+                 
+                 snd:setPitch(dynamicPitch * (addon.MotorSoundPitch or 1.0) * 100)
+                 snd:setVolume(finalVolume)
+                 
+                 -- Force play if it stopped but should be active
+                 if not snd:isPlaying() then
+                     snd:play()
+                 end
+             end
+        end,
+
+        -- Silence default sounds
+        OnEngineSound = function(state, config, soundData)
+            -- We handle our own sounds via Custom Sound System
+            if soundData.soundType == "bell" or soundData.soundType == "starter" then
+                return nil -- Return nil to silence
+            end
+            return soundData
+        end,
+
+        -- Reverse toggle using R key (independent of brake)
+        HandleCustomTransmission = function(state, config, inputs)
+            local addon = config.Addons.ElectricPowertrain
+
+            state.InReverse = state.InReverse or false
+            state.LastR = state.LastR or false
+
+            -- R key: manual reverse toggle
+            if inputs.Key_R and not state.LastR then
+                state.InReverse = not state.InReverse
+            end
+            state.LastR = inputs.Key_R
+            
+            -- Auto-reverse behavior: pressing opposite direction when stopped
+            local speed = math.abs(state.Speed or 0)
+            local Key_W = inputs.Key_W
+            local Key_S = inputs.Key_S
+            
+            -- Track last direction key for auto-reverse
+            state.LastAutoReverseW = state.LastAutoReverseW or false
+            state.LastAutoReverseS = state.LastAutoReverseS or false
+            
+            -- If stopped and press opposite direction, switch
+            if speed < 2 then  -- Basically stopped (2 km/h threshold)
+                -- Forward mode: S can trigger reverse ONLY if we're not already moving forward
+                if not state.InReverse and Key_S and not state.LastAutoReverseS then
+                    state.InReverse = true
+                -- Reverse mode: W can trigger forward ONLY if we're not moving in reverse  
+                elseif state.InReverse and Key_W and not state.LastAutoReverseW then
+                    state.InReverse = false
+                end
+            end
+            
+            state.LastAutoReverseW = Key_W
+            state.LastAutoReverseS = Key_S
+
+            -- Electric powertrain: always gear 1 (no gearing, direction handled by motor polarity)
+            state.Gear = 1
+            state.GearRatio = 1  -- Force 1:1 ratio so forward and reverse have same torque
+        end,
+
+        -- Override brake input detection to handle W/S correctly in reverse
+        OnBrakeOverride = function(state, config, ctx)
+            local addon = config.Addons.ElectricPowertrain
+            
+            -- Electric vehicle: W/S inversion disabled in core when addon enabled
+            -- So brake logic is straightforward:
+            -- - Forward: S = brake
+            -- - Reverse: W = brake
+            -- - Space = handbrake (always)
+            
+            if ctx.inReverse then
+                -- In reverse: W brakes, S accelerates
+                return { brakeInput = ctx.key_w or ctx.key_space }
+            else
+                -- In forward: S brakes, W accelerates
+                return { brakeInput = ctx.key_s or ctx.key_space }
+            end
+        end,
+
+        -- Full engine override (electric motor)
+        HandleCustomEngine = function(state, config, inputs)
+            local addon = config.Addons.ElectricPowertrain
+
+            -- Electric vehicle pedal logic:
+            -- Forward mode: W = accelerate, S = brake (handled by default braking)
+            -- Reverse mode: S = accelerate, W = brake (handled by default braking)
+            local inReverse = state.InReverse or false
+            
+            -- Throttle control: Shift = full power, no shift = half power
+            local throttleMultiplier = inputs.Key_Shift and 1 or 0.5
+            
+            local throttle
+            if inReverse then
+                -- In reverse: S accelerates backward
+                throttle = (inputs.Key_S and 1 or 0) * throttleMultiplier
+            else
+                -- In forward: W accelerates forward
+                throttle = (inputs.Key_W and 1 or 0) * throttleMultiplier
+            end
+            
+            local direction = inReverse and -1 or 1
+
+            local wheelRPM = state.Flywheel_RPM or 0
+            local motorRPM = math.abs(wheelRPM * addon.DriveRatio)
+            motorRPM = math.min(motorRPM, addon.MaxMotorRPM)
+
+            -- EV-style torque curve: constant torque up to BaseSpeedRPM, then constant power
+            local baseRPM = math.max(1, addon.BaseSpeedRPM or 4000)
+            local torquePerMotor = addon.MaxMotorTorque
+            if motorRPM > baseRPM then
+                -- Constant power region: torque drops proportionally to maintain constant power
+                torquePerMotor = addon.MaxMotorTorque * (baseRPM / motorRPM)
+            end
+            local motorCount = (addon.FrontMotorCount or 0) + (addon.RearMotorCount or 0)
+            if motorCount < 1 then motorCount = 1 end
+            local totalTorque = torquePerMotor * motorCount
+            
+            -- Efficiency model: reduce torque at high RPM/load
+            local efficiency = 1.0
+            if (addon.EfficiencyLossAtMaxRPM or 0) > 0 then
+                local rpmRatio = math.clamp(motorRPM / math.max(addon.MaxMotorRPM, 1), 0, 1)
+                local effDrop = (addon.EfficiencyLossAtMaxRPM or 0.12) * rpmRatio
+                efficiency = math.clamp(1 - effDrop, addon.EfficiencyMin or 0.85, 1)
+            end
+
+            -- Motor torque (always positive, direction handled by direction multiplier)
+            local motorTorque = throttle * totalTorque * efficiency
+
+            state.RPM = motorRPM
+            state.Torque = motorTorque
+            state.Throttle = throttle
+            state.Clutch = 0
+            -- Split power based on motor counts (front/rear)
+            local frontShare = (addon.FrontMotorCount or 0) / motorCount
+            local rearShare = (addon.RearMotorCount or 0) / motorCount
+
+            -- Apply base drive bias and simple steering-based axle vectoring
+            local baseBias = math.clamp(addon.DriveBias or 0.5, 0, 1)
+            local steer = (inputs.Key_D and 1 or 0) - (inputs.Key_A and 1 or 0)
+            local biasShift = (addon.VectoringStrength or 0) * steer
+            local bias = math.clamp(baseBias + biasShift, 0, 1)
+
+            if frontShare > 0 and rearShare > 0 then
+                frontShare = bias
+                rearShare = 1 - bias
+            end
+            
+            -- Apply direction and drive ratio to get final power
+            local drivePower = motorTorque * addon.DriveRatio * direction
+
+            state.Flywheel_Power = drivePower
+            -- Compute numeric power distribution (front % of total)
+            -- Base on motor counts (front motors / total motors) so 1 front, 2 rear => 33% front
+            local frontCount = (addon.FrontMotorCount or 0)
+            local motorCount = math.max(1, (addon.FrontMotorCount or 0) + (addon.RearMotorCount or 0))
+            local pd = math.floor((frontCount / motorCount) * 100)
+            -- expose for core HUD via AddonDisplay and for auto-sync via addon state
+            addon.PowerDistribution = pd
+            config.AddonDisplay = config.AddonDisplay or {}
+            config.AddonDisplay.powerDistribution = pd
+            config.PowerDistribution = pd
+
+            -- Per-wheel torque vectoring (simple left/right split)
+            if addon.PerWheelVectoring then
+                local leftScale = math.clamp(1 + biasShift, 0.5, 1.5)
+                local rightScale = math.clamp(1 - biasShift, 0.5, 1.5)
+
+                local function buildScales(wheels, chassis)
+                    if not wheels or not chassis or not isValid(chassis) then return nil end
+                    local scales = {}
+                    local cpos = chassis:getPos()
+                    local right = chassis:getRight()
+                    for i, w in ipairs(wheels) do
+                        if isValid(w) then
+                            local side = (w:getPos() - cpos):dot(right)
+                            scales[i] = (side < 0) and leftScale or rightScale
+                        else
+                            scales[i] = 1
+                        end
+                    end
+                    return scales
+                end
+
+                if (addon.FrontMotorCount or 0) > 0 then
+                    state.FrontWheelPowerScale = buildScales(inputs.FrontWheels, inputs.Chassis)
+                end
+                if (addon.RearMotorCount or 0) > 0 then
+                    state.RearWheelPowerScale = buildScales(inputs.RearWheels, inputs.Chassis)
+                end
+            else
+                state.FrontWheelPowerScale = nil
+                state.RearWheelPowerScale = nil
+            end
+
+            state.Flywheel_PowerInertia = state.Flywheel_PowerInertia or 0
+
+            addon.MotorRPM = motorRPM
+            addon.MotorTorque = motorTorque
+            addon.InReverse = state.InReverse
+
+            return true
+        end
+    }
+}

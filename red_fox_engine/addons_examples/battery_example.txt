@@ -1,0 +1,134 @@
+-- Battery & Electrical System Addon Example
+-- Realistic car battery with alternator charging and electrical loads
+--
+-- How it works:
+-- - Alternator charges battery proportionally to RPM (peaks at 6000 RPM)
+-- - Electrical loads (fuel pump, ignition, lights, radio) draw current
+-- - Battery voltage drops as charge depletes (12.6V full, 10.5V empty)
+-- - Low voltage prevents engine starting
+--
+-- Usage: Enable in red_fox_engine_config.txt:
+--   Addons.Battery.Enabled = true
+
+return {
+    Battery = {
+        Enabled = false,  -- Set to true to use
+        
+        -- Configuration
+        BatteryCapacity = 80,          -- Battery capacity in amp-hours (typical car: 60-100 Ah)
+        CurrentCharge = 80,            -- Current charge in Ah (starts fully charged)
+        
+        -- Alternator Configuration
+        AlternatorMaxOutput = 120,     -- Max amperes @ high RPM (typical: 100-150A)
+        AlternatorMinRPM = 800,        -- RPM needed to start charging
+        AlternatorRPMEfficiency = 0.8, -- Output = MaxOutput * (RPM/6000) * RPMEfficiency
+        
+        -- Electrical Loads (in amperes when active)
+        -- These get summed to calculate total system draw
+        Loads = {
+            Starter = 200,             -- Cranking current (only active during start)
+            FuelPump = 5,              -- Always running when engine on
+            Ignition = 10,             -- Engine ignition system
+            Lights_Headlights = 10,    -- Optional: can be controlled by wire input
+            Lights_DRL = 3,            -- Daytime running lights
+            Radio = 3,                 -- Optional: can be controlled by wire input
+            Accessories = 2,           -- Dashboard, fans, etc (parasitic load)
+        },
+        
+        -- Active loads tracking (which loads are currently drawing)
+        ActiveLoads = {
+            FuelPump = false,
+            Ignition = false,
+            Lights_Headlights = false,
+            Radio = false,
+            Accessories = true,  -- Always on
+        },
+        
+        -- Battery behavior
+        MinimumVoltage = 10.5,         -- Minimum voltage before can't crank
+        MinimumStartVoltage = 11.5,    -- Voltage needed to reliably start engine
+        MaxVoltage = 14.5,             -- Max regulated voltage from alternator
+        
+        -- Auto-sync to clients
+        SyncedState = { "CurrentCharge", "BatteryVoltage", "AlternatorOutput", "TotalLoad" },
+        
+        -- Auto-create wire outputs
+        WireOutputs = {
+            { name = "BatteryVoltage", source = "BatteryVoltage", type = "normal" },
+            { name = "BatteryCharge_Ah", source = "CurrentCharge", type = "normal" },
+            { name = "BatteryCharge_Percent", source = "ChargePercent", type = "normal" },
+            { name = "AlternatorOutput", source = "AlternatorOutput", type = "normal" },
+            { name = "SystemLoad", source = "TotalLoad", type = "normal" },
+            { name = "IsCharging", source = "IsCharging", type = "normal" },
+        },
+        
+        -- Auto-create wire inputs to control loads
+        WireInputs = {
+            { name = "Headlights", target = "LoadControl_Headlights", type = "normal" },
+            { name = "Radio", target = "LoadControl_Radio", type = "normal" },
+        },
+        
+        -- Runtime values
+        BatteryVoltage = 12.6,
+        ChargePercent = 100,
+        AlternatorOutput = 0,
+        TotalLoad = 0,
+        IsCharging = 0,
+        
+        -- Hook: Update battery state based on alternator and loads
+        ModifyPower = function(power, state, config)
+            local addon = config.Addons.Battery
+            local tickInterval = config.UpdateRate and (1 / config.UpdateRate) or (1 / 66)
+            
+            -- Wire input: control loads
+            if addon.LoadControl_Headlights then
+                addon.ActiveLoads.Lights_Headlights = addon.LoadControl_Headlights > 0
+            end
+            if addon.LoadControl_Radio then
+                addon.ActiveLoads.Radio = addon.LoadControl_Radio > 0
+            end
+            
+            -- Automatically enable ignition and fuel pump when engine running
+            addon.ActiveLoads.Ignition = state.Active or false
+            addon.ActiveLoads.FuelPump = state.Active or false
+            
+            -- Calculate total electrical load (sum of active loads)
+            addon.TotalLoad = 0
+            for loadName, isActive in pairs(addon.ActiveLoads) do
+                if isActive and addon.Loads[loadName] then
+                    addon.TotalLoad = addon.TotalLoad + addon.Loads[loadName]
+                end
+            end
+            
+            -- Calculate alternator output based on RPM
+            local rpm = state.RPM or 0
+            addon.AlternatorOutput = 0
+            if state.Active and rpm > addon.AlternatorMinRPM then
+                local rpmFactor = math.min(rpm / 6000, 1)  -- Peaks at 6000 RPM
+                addon.AlternatorOutput = addon.AlternatorMaxOutput * rpmFactor * addon.AlternatorRPMEfficiency
+            end
+            
+            -- Net charge rate: positive = charging, negative = discharging (Ah per second)
+            local netCurrent = addon.AlternatorOutput - addon.TotalLoad
+            addon.CurrentCharge = addon.CurrentCharge + (netCurrent * tickInterval / 3600)  -- Convert A to Ah
+            addon.CurrentCharge = math.clamp(addon.CurrentCharge, 0, addon.BatteryCapacity)
+            
+            -- Calculate battery voltage (simple model: linear from charge state)
+            local chargePercent = (addon.CurrentCharge / addon.BatteryCapacity) * 100
+            addon.ChargePercent = chargePercent
+            
+            -- Voltage = 12.6V at full, 10.5V at empty (nominal lead-acid: 12V)
+            addon.BatteryVoltage = 10.5 + (chargePercent / 100) * 2.1
+            
+            -- Is alternator currently charging?
+            addon.IsCharging = (netCurrent > 0) and 1 or 0
+            
+            -- Prevent starting if battery too low
+            if addon.BatteryVoltage < addon.MinimumStartVoltage then
+                return power * 0.1  -- Severely reduced power when battery dead
+            end
+            
+            return power
+        end,
+    }
+}

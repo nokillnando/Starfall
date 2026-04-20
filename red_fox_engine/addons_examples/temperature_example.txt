@@ -1,0 +1,136 @@
+-- Temperature Management System Addon Example
+-- Tracks engine heat and applies thermal limitations
+--
+-- Usage: Enable in red_fox_engine_config.txt:
+--   Addons.Temperature.Enabled = true
+
+return {
+    Temperature = {
+        Enabled = false,  -- Set to true to use
+        
+        -- Configuration
+        AmbientTemp = 20,               -- Ambient temperature (°C)
+        CurrentTemp = 20,               -- Starting engine temperature
+        IdleTemp = 80,                  -- Temperature at idle
+        MaxSafeTemp = 110,              -- Max safe operating temp
+        OverheatTemp = 120,             -- Critical overheat temp
+        BlowTemp = 135,                 -- Engine blows at this temp
+        BlowEnabled = true,             -- Enable engine blow behavior
+        HeatUpRate = 0.8,               -- °C per second at full throttle
+        CoolDownRate = 0.15,            -- °C per second cooling
+        RadiatorCoolRate = 0.5,         -- Extra cooling when fan active
+        
+        -- RPM limiting when hot
+        MinRPMWhenHot = 6000,           -- Limit RPM to this when overheating
+        MinRPMWhenCritical = 4000,      -- Limit to this when critical
+        
+        -- Auto-sync CurrentTemp to clients for temperature gauge
+        SyncedState = { "CurrentTemp", "EngineBlown" },
+        
+        -- Auto-create wire outputs for temperature monitoring
+        WireOutputs = {
+            { name = "EngineTemp", source = "CurrentTemp", type = "normal" },
+            { name = "Overheating", source = "IsOverheating", type = "normal" },
+            { name = "TempWarning", source = "TempWarning", type = "normal" },
+            { name = "EngineBlown", source = "EngineBlown", type = "normal" },
+        },
+        
+        -- Auto-create wire inputs for external cooling control
+        WireInputs = {
+            { name = "FanActive", target = "ExternalFanActive", type = "normal" },
+        },
+        
+        -- Status flags
+        IsOverheating = false,
+        TempWarning = false,
+        EngineBlown = false,
+        BlowSound = "physics/metal/metal_box_break1.wav",
+        BlowSoundPitch = 1,
+        BlowSoundVolume = 1,
+        
+        -- Hook: Modify RPM based on temperature
+        ModifyRPM = function(rpm, state, config)
+            local addon = config.Addons.Temperature
+            local throttle = state.Throttle or 0
+            
+            -- Heat up based on throttle and RPM
+            local heatGeneration = addon.HeatUpRate * (throttle + (rpm / (config.Engine_Redline or 8000)))
+            addon.CurrentTemp = (addon.CurrentTemp or addon.AmbientTemp) + (heatGeneration / 66)
+            
+            -- Cool down (check for external fan from wire input)
+            local cooling = addon.CoolDownRate
+            local fanActive = addon.ExternalFanActive and addon.ExternalFanActive > 0
+            if fanActive or addon.CurrentTemp > addon.MaxSafeTemp then
+                cooling = cooling + addon.RadiatorCoolRate
+            end
+            addon.CurrentTemp = addon.CurrentTemp - (cooling / 66)
+            addon.CurrentTemp = math.clamp(addon.CurrentTemp, addon.AmbientTemp, addon.OverheatTemp + 20)
+            
+            -- Update status flags for wire outputs
+            addon.IsOverheating = addon.CurrentTemp > addon.OverheatTemp
+            addon.TempWarning = addon.CurrentTemp > addon.MaxSafeTemp
+            
+            -- Engine blow check
+            if addon.BlowEnabled and not addon.EngineBlown and addon.CurrentTemp >= addon.BlowTemp then
+                addon.EngineBlown = true
+                state.Active = false
+                state.Ignition = 0
+                state.PowerCut = 1
+                net.start("EngineBlowSound")
+                net.writeString(addon.BlowSound or "")
+                net.writeFloat(addon.BlowSoundPitch or 1)
+                net.writeFloat(addon.BlowSoundVolume or 1)
+                net.send()
+            end
+
+            if addon.EngineBlown then
+                state.Active = false
+                state.Ignition = 0
+                state.PowerCut = 1
+                return 0
+            end
+
+            -- RPM limiting when overheating
+            if addon.CurrentTemp > addon.OverheatTemp then
+                return math.min(rpm, addon.MinRPMWhenCritical)
+            elseif addon.CurrentTemp > addon.MaxSafeTemp then
+                return math.min(rpm, addon.MinRPMWhenHot)
+            end
+            
+            return rpm
+        end,
+        
+        -- Hook: Modify power when overheating (causes power loss)
+        ModifyPower = function(power, state, config)
+            local addon = config.Addons.Temperature
+            local currentTemp = addon.CurrentTemp or addon.AmbientTemp
+
+            if addon.EngineBlown then
+                return 0
+            end
+            
+            -- Linear power reduction from MaxSafeTemp to OverheatTemp
+            if currentTemp > addon.MaxSafeTemp then
+                local overheatRatio = (currentTemp - addon.MaxSafeTemp) / (addon.OverheatTemp - addon.MaxSafeTemp)
+                overheatRatio = math.clamp(overheatRatio, 0, 1)
+                return power * (1 - overheatRatio * 0.5)  -- Up to 50% power loss
+            end
+            
+            return power
+        end,
+        
+        -- Hook: Send temperature data to clients
+        NetworkWrite = function(state, config, net)
+            net.writeFloat(state.CurrentTemp or config.Addons.Temperature.AmbientTemp)
+        end,
+        
+        -- Hook: Receive temperature data on client
+        NetworkRead = function(state, config, net)
+            local temp = net.readFloat()
+            config.Addons.Temperature.CurrentTemp = temp
+            if state then
+                state.CurrentTemp = temp
+            end
+        end
+    }
+}

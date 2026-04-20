@@ -1,0 +1,200 @@
+-- ABS (Anti-Lock Braking System) Addon Example
+-- Prevents wheel locking during hard braking
+--
+-- Usage: Enable in red_fox_engine_config_modular.txt:
+--   Addons.ABS.Enabled = true
+
+return {
+    ABS = {
+        Enabled = true,  -- Set to true to use
+        
+        -- Configuration
+        ChannelMode = "4-Channel",     -- "4-Channel", "3-Channel", "2-Channel", "1-Channel"
+        EnableFront = true,            -- Enable ABS on Front Axle
+        EnableRear = true,             -- Enable ABS on Rear Axle
+        
+        LockThreshold = 5,             -- Wheel slip threshold (KPH difference)
+        PulseRate = 10,                -- Pulses per second (Hz)
+        PulseDuty = 0.35,              -- Fraction of time brakes are released (0-1)
+        ReleasePressure = 0.6,         -- Brake force ratio during pulse (0-1)
+        FrontBiasAdjust = 1.0,         -- Adjust front brake independently
+        RearBiasAdjust = 1.0,          -- Adjust rear brake independently
+        WheelRPMToSpeed = 0.15,        -- Approx KPH per wheel RPM (tune per wheel size)
+        SpeedThreshold = 5,            -- Minimum speed (KPH) for ABS to engage
+
+        -- Debug (optional)
+        DebugEnabled = true,          -- Set true to sync ABS debug state
+
+        -- Auto-sync for UI + realtime monitoring
+        SyncedState = {
+            "DebugFrontSlip", "DebugRearSlip", "DebugInPulse", "DebugABSActive",
+            "DebugBrakeForceF", "DebugBrakeForceR"
+        },
+
+        -- Wire outputs (for realtime monitoring)
+        WireOutputs = {
+            { name = "ABS_FrontSlip", source = "DebugFrontSlip", type = "normal" },
+            { name = "ABS_RearSlip", source = "DebugRearSlip", type = "normal" },
+            { name = "ABS_InPulse", source = "DebugInPulse", type = "normal" },
+            { name = "ABS_Active", source = "DebugABSActive", type = "normal" },
+            { name = "ABS_BrakeF", source = "DebugBrakeForceF", type = "normal" },
+            { name = "ABS_BrakeR", source = "DebugBrakeForceR", type = "normal" }
+        },
+        
+        -- State tracking
+        PulsePhase = 0,                -- Internal: pulse timing
+        
+        -- Hook: Modify brake forces to prevent wheel lock
+        OnBrakeApply = function(state, config, brakeData)
+            local addon = config.Addons.ABS
+            local modifiedBrakes = {
+                brakeForceF = brakeData.brakeForceF or 0,
+                brakeForceR = brakeData.brakeForceR or 0,
+                brakeForcesFront = {},
+                brakeForcesRear = {}
+            }
+            
+            -- Skip ABS when handbrake is active (handbrake = front brake ~0, rear brake high)
+            local frontBrake = brakeData.brakeForceF or 0
+            local rearBrake = brakeData.brakeForceR or 0
+            if frontBrake < 0.01 and rearBrake > 1 then
+                -- Handbrake detected - don't interfere
+                return modifiedBrakes
+            end
+
+            -- Skip ABS at very low speeds
+            local speedKPH = math.abs(brakeData.speed or 0)
+            if speedKPH < (addon.SpeedThreshold or 5) then
+                return modifiedBrakes
+            end
+
+            -- Calculate pulse (on/off cycle)
+            local pulseTime = timer.curtime()
+            local pulseFreq = 1 / (addon.PulseRate or 10)
+            local duty = math.clamp(addon.PulseDuty or 0.35, 0.05, 0.95)
+            local inPulse = (pulseTime % pulseFreq) < (pulseFreq * duty)
+            
+            local frontSlipMax = 0
+            local rearSlipMax = 0
+            
+            -- Helper to check slip
+            local function checkSlip(wheelRPM)
+                local wheelSpeed = math.abs(wheelRPM) * (addon.WheelRPMToSpeed or 0.15)
+                return math.abs(speedKPH - wheelSpeed)
+            end
+
+            local channelMode = addon.ChannelMode or "4-Channel"
+            local enableFront = addon.EnableFront ~= false -- Default true
+            local enableRear = addon.EnableRear ~= false -- Default true
+            
+            -- ==========================================
+            -- FRONT AXLE LOGIC
+            -- ==========================================
+            if enableFront and channelMode ~= "1-Channel" then
+                if channelMode == "4-Channel" or channelMode == "3-Channel" then
+                    -- Individual Wheel Monitoring
+                    if brakeData.frontRPMs then
+                        for i, rpm in ipairs(brakeData.frontRPMs) do
+                            local slip = checkSlip(rpm)
+                            frontSlipMax = math.max(frontSlipMax, slip)
+                            
+                            if slip > (addon.LockThreshold or 0.2) then
+                                -- Wheel Locking
+                                if inPulse then
+                                    modifiedBrakes.brakeForcesFront[i] = (brakeData.brakeForceF or 0) * (addon.ReleasePressure or 0.6) * (addon.FrontBiasAdjust or 1)
+                                else
+                                    modifiedBrakes.brakeForcesFront[i] = (brakeData.brakeForceF or 0) * (addon.FrontBiasAdjust or 1)
+                                end
+                            else
+                                -- Normal Braking
+                                modifiedBrakes.brakeForcesFront[i] = (brakeData.brakeForceF or 0) * (addon.FrontBiasAdjust or 1)
+                            end
+                        end
+                    end
+                else 
+                    -- "2-Channel" (Average)
+                    local avgFrontRPM = 0
+                    local count = 0
+                    if brakeData.frontRPMs then
+                        for i, rpm in ipairs(brakeData.frontRPMs) do
+                            avgFrontRPM = avgFrontRPM + (rpm or 0)
+                            count = count + 1
+                        end
+                        if count > 0 then avgFrontRPM = avgFrontRPM / count end
+                    end
+                    
+                    local slip = checkSlip(avgFrontRPM)
+                    frontSlipMax = slip
+                    if slip > (addon.LockThreshold or 0.2) then
+                        if inPulse then
+                            modifiedBrakes.brakeForceF = (brakeData.brakeForceF or 0) * (addon.ReleasePressure or 0.6) * (addon.FrontBiasAdjust or 1)
+                        else
+                            modifiedBrakes.brakeForceF = (brakeData.brakeForceF or 0) * (addon.FrontBiasAdjust or 1)
+                        end
+                    end
+                end
+            end
+            
+            -- ==========================================
+            -- REAR AXLE LOGIC
+            -- ==========================================
+            if enableRear then
+                if channelMode == "4-Channel" then
+                    -- Individual Wheel Monitoring
+                    if brakeData.rearRPMs then
+                        for i, rpm in ipairs(brakeData.rearRPMs) do
+                            local slip = checkSlip(rpm)
+                            rearSlipMax = math.max(rearSlipMax, slip)
+                            
+                            if slip > (addon.LockThreshold or 0.2) then
+                                -- Wheel Locking
+                                if inPulse then
+                                    modifiedBrakes.brakeForcesRear[i] = (brakeData.brakeForceR or 0) * (addon.ReleasePressure or 0.6) * (addon.RearBiasAdjust or 1)
+                                else
+                                    modifiedBrakes.brakeForcesRear[i] = (brakeData.brakeForceR or 0) * (addon.RearBiasAdjust or 1)
+                                end
+                            else
+                                -- Normal Braking
+                                modifiedBrakes.brakeForcesRear[i] = (brakeData.brakeForceR or 0) * (addon.RearBiasAdjust or 1)
+                            end
+                        end
+                    end
+                else 
+                    -- "3-Channel", "2-Channel", "1-Channel" (Average Rear)
+                    local avgRearRPM = 0
+                    local count = 0
+                    if brakeData.rearRPMs then
+                        for i, rpm in ipairs(brakeData.rearRPMs) do
+                            avgRearRPM = avgRearRPM + (rpm or 0)
+                            count = count + 1
+                        end
+                        if count > 0 then avgRearRPM = avgRearRPM / count end
+                    end
+                    
+                    local slip = checkSlip(avgRearRPM)
+                    rearSlipMax = slip
+                    if slip > (addon.LockThreshold or 0.2) then
+                        if inPulse then
+                            modifiedBrakes.brakeForceR = (brakeData.brakeForceR or 0) * (addon.ReleasePressure or 0.6) * (addon.RearBiasAdjust or 1)
+                        else
+                            modifiedBrakes.brakeForceR = (brakeData.brakeForceR or 0) * (addon.RearBiasAdjust or 1)
+                        end
+                    end
+                end
+            end
+
+            -- Debug sync (realtime monitoring)
+            if addon.DebugEnabled then
+                addon.DebugFrontSlip = frontSlipMax
+                addon.DebugRearSlip = rearSlipMax
+                addon.DebugInPulse = inPulse
+                addon.DebugABSActive = (frontSlipMax > (addon.LockThreshold or 0.2)) or (rearSlipMax > (addon.LockThreshold or 0.2))
+            end
+
+            addon.DebugBrakeForceF = modifiedBrakes.brakeForceF
+            addon.DebugBrakeForceR = modifiedBrakes.brakeForceR
+            
+            return modifiedBrakes
+        end
+    }
+}

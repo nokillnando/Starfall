@@ -1,0 +1,674 @@
+--@name Red Fox Engine v3 (SF Port) Modular
+--@shared
+--@author Red Fox
+--@include red_fox_engine/simulated_engine_core_modular.txt
+
+-- Import Core Library
+dofile("red_fox_engine/simulated_engine_core_modular.txt")
+local Core = _G.RedFoxEngineCore
+
+-- Configuration Table
+local config = {
+    -- Engine Specifications
+    Engine_Bore = 87,
+    Engine_Stroke = 84,
+    Engine_Cylinders = 4,
+    Engine_Airflow = 135,
+    Engine_Idle = 1200,
+    Engine_IdleRev = 0.1,
+    Engine_RevLimiter = 1,
+    Engine_RevLimitRPM = 9000,      -- Exact RPM to trigger bouncing
+    Engine_RevLimitDrop = 250,      -- RPM to drop when hit (e.g., 250 for fast bounce)
+    Engine_RevLimitDelay = 0.0,     -- Delay before throttle returns (ignition cut)
+    Engine_Redline = 9000,
+    Engine_TorqueTable = {1.45, 2.56, 2.04, 1.52, 1.30}, 
+    TorqueMultiplier = 1, -- Multiplier for torque output (affects physics + torque display, but NOT HP calculation)
+    Engine_FlywheelMass = 8,
+    Engine_Configuration = 0, -- 0 = Inline, 1 = V
+    Engine_Redline = 9000,
+    
+    -- Transmission
+    Gearbox_Ratios = {
+        3.133,
+        2.045,
+        1.481,
+        1.161,
+        0.943,
+        0.763
+    },
+    GearSpeeds = {29, 55, 78, 103, 126}, -- Shift up speeds (km/h) for Speed-Based mode
+    Gearbox_FinalDrive = 4.10,
+    Gearbox_Delay = 250,
+    Gearbox_ClutchSpeed = 1,
+    
+    ReverseGearRatios = { -3.583, -2 },
+    ReverseGearSpeeds = { 15, 30 }, -- Used for Speed-Based Reverse Logic
+    
+    WheelRPMToSpeed = 0.15, -- [IMPORTANT] Approx KPH per wheel RPM. TUNING REQUIRED: Increase for big wheels.
+    
+    PowerDistribution = 0, -- 0 = RWD, 100 = FWD, 50 = AWD
+    
+    -- Transmission Tuning
+    AutoGear = true,
+    ClassicAuto = false,
+    UseRPMBasedGear = true,
+    ImmediateReverseEngage = true,
+    
+    DriftSlipTolerance = 0.50,
+    Min_Gear_Time = 250, -- ms
+    Min_Reverse_Gear_Time = 150,
+    SpeedToReverse = 5, -- km/h threshold to allow reverse engagement
+    ReverseWSonReverse = true, -- Swap W/S in ClassicAuto reverse (E2 parity)
+    
+    ManualModeEnabled = true,
+    ManualModeKey = "n",
+    UseComfortSportMode = true,
+    ComfortSportModeKey = "m",
+    ComfortUpshiftRPM = 45, -- % Redline (Min Upshift point at 0% throttle)
+    ComfortDownshiftRPM = 25, -- % Redline (Min Downshift point at 0% throttle)
+    SportUpshiftRPM = 90,
+    SportDownshiftRPM = 55,
+    DownshiftCooldown = 0.35, -- seconds between downshifts (anti-hunt)
+    
+    UseClutchLerpInManual = true,
+    ClutchLerp = 0.4,
+    ClutchLerpReverse = 0.5,
+    
+    
+    -- Controls
+    AlwaysSportMode = false,
+    
+    -- Braking Tuning
+    BrakeMult = 2.25,
+    HandbrakePowerMult = 3,
+    
+    FirstPhaseBrakeSpeed = 10,
+    SecondPhaseBrakeSpeed = 40,
+    ThirdPhaseBrakeSpeed = 100,
+    StoppedPhaseBrakeSpeed = 5,
+    
+    StoppedBrakeMult = 3,
+    
+    FirstPhaseBrakeR = 0.7,
+    FirstPhaseBrakeF = 0.9,
+    
+    SecondPhaseBrakeR = 0.15,
+    SecondPhaseBrakeF = 0.4,
+    
+    ThirdPhaseBrakeR = 0.05,
+    ThirdPhaseBrakeF = 0.3,
+    
+    -- Physics Tuning
+    UpdateRate = 66,                  -- Update rate for engine calculations in Hz (forces apply every frame regardless)
+    ChassisAccFeedMult = -39.37/6,
+    BrakeFeedBMult = 2,
+    TorqueInvert = true,
+    ForceMult = 0.015,
+    
+    
+    -- Manual Mode Controls
+    ReverseWSonReverse = true,        -- In manual mode: true = use W for reverse throttle, false = use S for reverse throttle
+    
+    -- Orientation Configuration
+    -- Use Vector(x,y,z) for precise axis control (updates with entity rotation via localToWorldVector)
+    -- x=forward/back, y=right/left, z=up/down in entity's local space
+    EngineAxis = Vector(0, 0, 1),  -- Engine's up axis controls wheel torque direction
+    ChassisFeedDirectionAxis = Vector(1, 0, 0),     -- Force direction for acceleration feedback
+    ChassisFeedForwardAxis = Vector(0, 0, 1),       -- Offset axis for force application points (Left/Right = roll, Up/Down = pitch)
+
+    -- Debug axis visualizer (global) - uses ChassisFeedDirectionAxis and ChassisFeedForwardAxis
+    DebugAxes = false,
+    DebugAxisLength = 50,
+    DebugAxisShowWheels = false,
+    
+    -- Turbo Tuning
+    Turbo = false,
+    Turbo_PSIMax = 6,
+    Turbo_AirPressure = 18.4,
+    Turbo_MaxRPM = 9000,
+    Turbo_MaxFlow = 9000,
+    Turbo_FlowScale = 100,
+    Turbo_DragScale = 0.01,
+    Turbo_Inertia = 0.035,
+    Turbo_Exp = 1,
+
+    -- Sound Settings
+    Sounds = {
+        Engine_SoundOn = "acf_extra/vehiclefx/engines/l4/mini_onhigh.WAV",
+        Engine_SoundOff = "acf_extra/vehiclefx/engines/l4/mini_onlow.WAV",
+        TurboSound = "acf_engines/turbine_small.wav",
+        TurboBOV = "acf_extra/vehiclefx/boost/turbo_hiss1.wav",
+        GearChange = "physics/plaster/ceiling_tile_impact_hard3.wav",
+        Starter = "acf_extra/vehiclefx/starters/starter2.wav",
+        Bell = "buttons/bell1.wav"
+    },
+    
+    
+    -- General Core Settings
+    AllowCheckVersion = true,   -- Check for Engine updates on spawn
+    
+    -- [[ Engine Info Hologram ]]
+    InfoGUI = {
+        Scale = 6,          -- Size scale of the hologram (Default 6)
+        Distance = 200,    -- Max visibility distance
+        ViewAngleDot = 0.99, -- Visibility cone (1.0 = strict, 0.5 = loose, -1.0 = always visible)
+        Offset = Vector(0, 0, 30), -- Position offset relative to chip
+        AngleOffset = Angle(0, 0, 0) -- Manual rotation offset (Pitch/Yaw/Roll)
+    },
+    
+    -- Engine Sound Parameters (E2-Based, Starfall Normalized to 0-1 Scale)
+    -- Pitch formula: (RPM / Divisor) * 155 + (50 * Active) then normalized to Starfall 0.5-2.0 range
+    -- Volume formula: Engine_Volume (throttle state 0-1) * VolumeMultiplier, clamped to 0-1+
+    Engine_SoundOnDiv = 4000,           -- Divisor controls pitch sweep rate for load sound (higher = slower pitch rise with RPM)
+    Engine_SoundOnPitchMult = 1,      -- Pitch multiplier for load sound (1 = normal, 2 = double pitch frequency)
+    Engine_SoundOnVolume = 1,         -- Volume multiplier for load sound (0.5 = half volume, 2 = double volume)
+    
+    Engine_SoundOffDiv = 3500,          -- Divisor controls pitch sweep rate for coast sound (inverse volume when throttle off)
+    Engine_SoundOffPitchMult = 1,     -- Pitch multiplier for coast sound
+    Engine_SoundOffVolume = 0.5,        -- Volume multiplier for coast sound (high volume when coasting, fades with throttle)
+    
+    Engine_SoundOverallDiv = 1,       -- Global sound volume control (0.5 = half all volumes, 2 = double all volumes)
+    Engine_SoundBlendRate = 8,        -- Throttle blend speed (higher = faster crossfade between On/Off)
+    Engine_SoundThrottleExponent = 1.2, -- Curve for throttle blend (1 = linear, >1 = smoother)
+    
+    Engine_SoundOnRPMStart = 300,     -- RPM where On sound begins to rise (lower = audible sooner)
+    Engine_SoundOnVolumeMin = 0.1,    -- Minimum RPM envelope for On sound (0 = none, 0.1 = slight idle presence)
+    Engine_SoundOnVolumeCurve = 0.2,  -- RPM envelope curve for On volume (<1 = louder earlier, >1 = louder later)
+    Engine_SoundOnGateCurve = 0.5,    -- Gate curve for On sound onset (<1 = earlier, >1 = later)
+    
+    Engine_SoundOffRPMInfluence = 0,  -- 0 = Off sound ignores RPM, 1 = Off sound scales by RPM
+    Engine_SoundOffPitchCurve = 1,    -- Pitch curve exponent for Off sound (1 = linear, <1 = lower pitch at high RPM)
+    
+    Engine_SoundBlendAttack = 12,     -- Throttle attack speed (higher = faster on-sound rise)
+    Engine_SoundBlendRelease = 1,     -- Throttle release speed (lower = slower on-sound fade)
+    Engine_SoundBlendOverlap = 0.1,   -- Crossfade overlap (0 = hard crossfade, 0.1 = small overlap)
+    Engine_SoundBlendCurve = 1.1,     -- Crossfade curve (1 = linear, >1 = smoother, <1 = more aggressive)
+    
+    -- Turbo Sound Parameters (E2-Based, Starfall Normalized to 0-1 Scale)
+    -- Turbo pitch: 75 + 50 * (Turbo_RPM / Turbo_MaxRPM) then normalized
+    -- Turbo volume: Turbo_RPM / Turbo_MaxRPM * 0.75 * VolumeMultiplier, tied to boost spool level
+    TurboPitch = 1,                   -- Multiplier for turbo whine pitch (higher = higher frequency whine)
+    TurboVolume = 1,                  -- Multiplier for turbo whine volume (scales with turbo boost pressure)
+    TurboBOVPitch = 1,                -- Multiplier for BOV (blow-off valve) pitch (triggered on throttle release from boost)
+    TurboBOVVolume = 1,               -- Multiplier for BOV hiss volume (one-shot sound when boost vents)
+    
+    -- Gear Change Sound Parameters
+    GearChangePitch = 1,
+    GearChangeVolume = 0.75,
+    GearChangeSoundTimer = 0.1,       -- Time between gear change sound repeats (ms)
+    
+    -- Ignition/Crank Sound Settings
+    BellPitch = 1,
+    BellVolume = 0.5,
+    BellLoopTime = 1300,  -- ms between bell sound loops
+    StarterPitch = 1,
+    StarterVolume = 0.75,
+    StarterLoopTime = 200,  -- ms between starter sound loops
+
+}
+
+-- ============================================================================
+-- ADDON SYSTEM (Modular Architecture)
+-- ============================================================================
+-- Define custom addons here to extend engine functionality
+-- See ADDON_HOOKS.md for complete documentation
+
+config.Addons = {
+    ExtraFeatures = {
+        Enabled = true, -- Set to true to use (overridden by config)
+        
+        -- Configuration Defaults
+        HeadlightKey = "h",          -- Key to toggle headlights (F)
+        EnableCamera = false,         -- Enable/Disable Camera feature
+        CameraKey = "p",             -- Key to toggle camera (P)
+        CamDistance = 100,           -- Default Camera Distance
+        CamOffset = Vector(0,0,0),   -- Default Camera Offset (Local to Chassis)
+        
+        -- Register keys for client-to-server syncing
+        -- The core will automatically track these keys on client and send events to server
+        InputKeyFields = { "HeadlightKey", "CameraKey" },
+
+        -- Beam Settings
+        LowBeamFov = 65,
+        LowBeamBrightness = 1,
+        HighBeamFov = 80,
+        HighBeamBrightness = 2,
+
+        -- Wire Light Colors (Vector RGB 0-255)
+        UseWireLight = true,
+        WireLColor = Vector(255, 255, 255),
+        UseWireBrakeLight = true,
+        BrakeWireLightColor = Vector(255, 0, 0),
+        UseWireReverseLight = true,
+        ReverseWireLightColor = Vector(255, 255, 255),
+        
+        ReverseGearNumber = -1,  -- Gear number to consider "Reverse"
+
+        -- Driver Hints
+        UseHints = true,
+        
+        -- Internal State
+        HeadlightState = 0, -- 0=Off, 1=Low, 2=High
+        CamOn = 0,
+        
+        -- Wire Inputs
+        WireInputs = {
+            { name = "Cam", type = "wirelink", condition = "EnableCamera" }
+        },
+
+        -- Wire Outputs (Mapped to fields in this table)
+        WireOutputs = {
+            { name = "CamOn", source = "CamOn", type = "normal" },
+            { name = "Light", source = "Light", type = "normal" },
+            { name = "LightL", source = "LightL", type = "normal" },
+            { name = "LightA", source = "LightA", type = "normal" },
+            { name = "BrakeL", source = "BrakeL", type = "normal" },
+            { name = "ReverseL", source = "ReverseL", type = "normal" },
+            { name = "Ind", source = "Ind", type = "normal" },
+            { name = "FOV", source = "FOV", type = "normal" },
+            { name = "Brightness", source = "Brightness", type = "normal" },
+            { name = "WLight", source = "WLight", type = "vector" },
+            { name = "BrakeWLight", source = "BrakeWLight", type = "vector" },
+            { name = "ReverseWLight", source = "ReverseWLight", type = "vector" },
+        },
+        
+        -- Synced State (Networked to client)
+        SyncedState = { "HeadlightState", "CamOn" },
+
+        -- Helper: Print hint
+        PrintHint = function(ply, text)
+            if isValid(ply) and ply:isPlayer() then
+                if SERVER then
+                    pcall(printHud, ply, text)
+                elseif ply == player() then
+                    pcall(printHud, text)
+                end
+            end
+        end,
+        
+        -- Hook: Initialization
+        OnInit = function(state, config)
+            local addon = config.Addons.ExtraFeatures
+            -- Initialize output fields
+            addon.HeadlightState = 0
+            addon.CamOn = 0
+            addon.Light = 0
+            addon.LightL = 0
+            addon.LightA = 0
+            addon.BrakeL = 0
+            addon.ReverseL = 0
+            addon.FOV = 0
+            addon.Brightness = 0
+            addon.WLight = Vector(0,0,0)
+            addon.BrakeWLight = Vector(0,0,0)
+            addon.ReverseWLight = Vector(0,0,0)
+        end,
+
+        -- Hook: Main Update Loop
+        OnEngineUpdate = function(state, config)
+            local addon = config.Addons.ExtraFeatures
+            local driver = state.Driver
+            if not isValid(driver) then 
+                addon.LastDriver = nil
+                addon.HintsShown = false
+                return 
+            end
+            
+            -- Get Driver Key State (populated by core from client net messages)
+            local keyState = state.DriverKeyState and state.DriverKeyState[driver]
+            
+            -- Check for Hints on Entry
+            if driver ~= addon.LastDriver then
+                addon.HintsShown = false
+                addon.LastDriver = driver
+            end
+
+            if addon.UseHints and not addon.HintsShown then
+                timer.simple(1, function()
+                    if isValid(driver) and driver == addon.LastDriver then
+                        addon.PrintHint(driver, "- Controls -")
+                        addon.PrintHint(driver, "F to start | Alt for Clutch | R to reset gears")
+                        addon.PrintHint(driver, "W/A/S/D to drive | Space for Handbrake")
+                        addon.PrintHint(driver, string.upper(addon.HeadlightKey) .. " for headlights (Tap: Low/High | Hold: Off)")
+                        if addon.EnableCamera then
+                            addon.PrintHint(driver, string.upper(addon.CameraKey) .. " for camera")
+                        end
+                    end
+                end)
+                addon.HintsShown = true
+            end
+            
+            -- ========================================================================
+            -- HEADLIGHT INPUT (Tap: Toggle On/Switch | Hold: Turn Off)
+            -- ========================================================================
+            if keyState then
+                local isDown = keyState.downKeys and keyState.downKeys[addon.HeadlightKey]
+                
+                -- Detect new press
+                if isDown and not addon.HeadlightKey_IsDown then
+                    addon.HeadlightKey_IsDown = true
+                    addon.HeadlightKey_PressTime = timer.curtime()
+                    addon.HeadlightKey_HoldHandled = false
+                    -- Do nothing on press (waits for release to avoid flash)
+                
+                -- Detect hold (while down)
+                elseif isDown and addon.HeadlightKey_IsDown then
+                    if not addon.HeadlightKey_HoldHandled and (timer.curtime() - (addon.HeadlightKey_PressTime or 0)) > 0.5 then
+                        -- Hold Action: Turn Off
+                        addon.HeadlightState = 0
+                        addon.PrintHint(driver, "Headlights: OFF (Hold)")
+                        addon.HeadlightKey_HoldHandled = true
+                    end
+                
+                -- Detect release
+                elseif not isDown and addon.HeadlightKey_IsDown then
+                    addon.HeadlightKey_IsDown = false
+                    
+                    -- Release Action: Toggle (if not handled by hold)
+                    if not addon.HeadlightKey_HoldHandled then
+                        if addon.HeadlightState == 0 then
+                            addon.HeadlightState = 1 -- Turn On (Low)
+                            addon.PrintHint(driver, "Headlights: Low Beam")
+                        else
+                            -- Switch High/Low (Off is excluded from toggle cycle)
+                            addon.HeadlightState = (addon.HeadlightState == 1) and 2 or 1
+                            if addon.HeadlightState == 1 then
+                                addon.PrintHint(driver, "Headlights: Low Beam")
+                            else
+                                addon.PrintHint(driver, "Headlights: High Beam")
+                            end
+                        end
+                        addon.HeadlightKey_HoldHandled = true
+                    end
+                end
+                
+                -- Clear legacy press state just in case
+                keyState.pressedKeys[addon.HeadlightKey] = nil
+            end
+            
+            -- Update Headlight Outputs based on State
+            if addon.HeadlightState == 0 then
+                addon.Light = 0; addon.LightL = 0; addon.LightA = 0
+                addon.FOV = 0; addon.Brightness = 0
+                addon.WLight = Vector(0,0,0)
+            elseif addon.HeadlightState == 1 then
+                addon.Light = 1; addon.LightL = 1; addon.LightA = 0
+                addon.FOV = addon.LowBeamFov
+                addon.Brightness = addon.LowBeamBrightness
+                if addon.UseWireLight then addon.WLight = addon.WireLColor end
+            elseif addon.HeadlightState == 2 then
+                addon.Light = 1; addon.LightL = 1; addon.LightA = 1
+                addon.FOV = addon.HighBeamFov
+                addon.Brightness = addon.HighBeamBrightness
+                if addon.UseWireLight then addon.WLight = addon.WireLColor end
+            end
+            
+            -- ========================================================================
+            -- CAMERA INPUT
+            -- ========================================================================
+            if addon.EnableCamera and keyState and keyState.pressedKeys[addon.CameraKey] then
+                -- Consume key press
+                keyState.pressedKeys[addon.CameraKey] = nil
+                
+                addon.CamOn = 1 - addon.CamOn
+                
+                if addon.CamOn == 1 then
+                    addon.PrintHint(driver, "Camera: Active")
+                else
+                    addon.PrintHint(driver, "Camera: Disabled")
+                end
+            end
+            
+            -- Write to Cam wirelink if available (mimics E2 behavior)
+            if addon.Cam and type(addon.Cam) == "Wirelink" and isValid(addon.Cam) then
+                addon.Cam["Activated"] = addon.CamOn
+                -- Set Camera Transform (Parented to Chassis)
+                local base = state.Chassis
+                if isValid(base) then
+                    addon.Cam["Parent"] = base
+                    addon.Cam["Distance"] = addon.CamDistance
+                    -- Calculate Position: Base Pos + Local Offset converted to World
+                    -- E2: Position = Base:pos() + CamOffset.
+                    -- Note: In E2 "CamOffset" is often a world vector if added directly to pos().
+                    -- But user wants it relative to chassis?
+                    -- If CamOffset is (0,0,0), it's at Chassis origin.
+                    -- If user edits CamOffset in config, they likely expect Local Coordinates (Forward/Right/Up).
+                    -- Current implementation: base:pos() + addon.CamOffset.
+                    -- This means CamOffset is a WORLD offset (e.g. Vector(0,0,100) adds 100 units UP global).
+                    -- If the car rotates, this offset STAYS global.
+                    -- Use LocalToWorld for rotation support:
+                    local worldPos = base:localToWorld(addon.CamOffset)
+                    addon.Cam["Position"] = worldPos
+                end
+            end
+            
+            -- ========================================================================
+            -- BRAKE & REVERSE LIGHTS
+            -- ========================================================================
+            local isReverse = state.InReverse or (state.Gear <= (addon.ReverseGearNumber or -1))
+            
+            if isReverse then
+                addon.ReverseL = 1
+                if addon.UseWireReverseLight then addon.ReverseWLight = addon.ReverseWireLightColor end
+            else
+                addon.ReverseL = 0
+                addon.ReverseWLight = Vector(0,0,0)
+            end
+            
+            -- Brake Lights
+            if state.Brake and state.Brake > 0 then
+                addon.BrakeL = 1
+                if addon.UseWireBrakeLight then addon.BrakeWLight = addon.BrakeWireLightColor end
+            else
+                addon.BrakeL = 0
+                addon.BrakeWLight = Vector(0,0,0)
+            end
+        end
+    },
+    
+    ABS = {
+        Enabled = true,  -- Set to true to use
+        
+        -- Configuration
+        ChannelMode = "4-Channel",     -- "4-Channel", "3-Channel", "2-Channel", "1-Channel"
+        EnableFront = true,            -- Enable ABS on Front Axle
+        EnableRear = true,             -- Enable ABS on Rear Axle
+        
+        LockThreshold = 5,             -- Wheel slip threshold (KPH difference)
+        PulseRate = 10,                -- Pulses per second (Hz)
+        PulseDuty = 0.55,              -- Fraction of time brakes are released (0-1)
+        ReleasePressure = 0.1,         -- Brake force ratio during pulse (0-1)
+        FrontBiasAdjust = 1.0,         -- Adjust front brake independently
+        RearBiasAdjust = 1.0,          -- Adjust rear brake independently
+        WheelRPMToSpeed = 0.15,        -- Approx KPH per wheel RPM (tune per wheel size)
+        SpeedThreshold = 5,            -- Minimum speed (KPH) for ABS to engage
+
+        -- Debug (optional)
+        DebugEnabled = true,          -- Set true to sync ABS debug state
+
+        -- Auto-sync for UI + realtime monitoring
+        SyncedState = {
+            "DebugFrontSlip", "DebugRearSlip", "DebugInPulse", "DebugABSActive",
+            "DebugBrakeForceF", "DebugBrakeForceR"
+        },
+
+        -- Wire outputs (for realtime monitoring)
+        WireOutputs = {
+            { name = "ABS_FrontSlip", source = "DebugFrontSlip", type = "normal" },
+            { name = "ABS_RearSlip", source = "DebugRearSlip", type = "normal" },
+            { name = "ABS_InPulse", source = "DebugInPulse", type = "normal" },
+            { name = "ABS_Active", source = "DebugABSActive", type = "normal" },
+            { name = "ABS_BrakeF", source = "DebugBrakeForceF", type = "normal" },
+            { name = "ABS_BrakeR", source = "DebugBrakeForceR", type = "normal" }
+        },
+        
+        -- State tracking
+        PulsePhase = 0,                -- Internal: pulse timing
+        
+        -- Hook: Modify brake forces to prevent wheel lock
+        OnBrakeApply = function(state, config, brakeData)
+            local addon = config.Addons.ABS
+            local modifiedBrakes = {
+                brakeForceF = brakeData.brakeForceF or 0,
+                brakeForceR = brakeData.brakeForceR or 0,
+                brakeForcesFront = {},
+                brakeForcesRear = {}
+            }
+            
+            -- Skip ABS when handbrake is active (handbrake = front brake ~0, rear brake high)
+            local frontBrake = brakeData.brakeForceF or 0
+            local rearBrake = brakeData.brakeForceR or 0
+            if frontBrake < 0.01 and rearBrake > 1 then
+                -- Handbrake detected - don't interfere
+                return modifiedBrakes
+            end
+
+            -- Skip ABS at very low speeds
+            local speedKPH = math.abs(brakeData.speed or 0)
+            if speedKPH < (addon.SpeedThreshold or 5) then
+                return modifiedBrakes
+            end
+
+            -- Calculate pulse (on/off cycle)
+            local pulseTime = timer.curtime()
+            local pulseFreq = 1 / (addon.PulseRate or 10)
+            local duty = math.clamp(addon.PulseDuty or 0.35, 0.05, 0.95)
+            local inPulse = (pulseTime % pulseFreq) < (pulseFreq * duty)
+            
+            local frontSlipMax = 0
+            local rearSlipMax = 0
+            
+            -- Helper to check slip
+            local function checkSlip(wheelRPM)
+                local wheelSpeed = math.abs(wheelRPM) * (addon.WheelRPMToSpeed or 0.15)
+                return math.abs(speedKPH - wheelSpeed)
+            end
+
+            local channelMode = addon.ChannelMode or "4-Channel"
+            local enableFront = addon.EnableFront ~= false -- Default true
+            local enableRear = addon.EnableRear ~= false -- Default true
+            
+            -- ==========================================
+            -- FRONT AXLE LOGIC
+            -- ==========================================
+            if enableFront and channelMode ~= "1-Channel" then
+                if channelMode == "4-Channel" or channelMode == "3-Channel" then
+                    -- Individual Wheel Monitoring
+                    if brakeData.frontRPMs then
+                        for i, rpm in ipairs(brakeData.frontRPMs) do
+                            local slip = checkSlip(rpm)
+                            frontSlipMax = math.max(frontSlipMax, slip)
+                            
+                            if slip > (addon.LockThreshold or 0.2) then
+                                -- Wheel Locking
+                                if inPulse then
+                                    modifiedBrakes.brakeForcesFront[i] = (brakeData.brakeForceF or 0) * (addon.ReleasePressure or 0.6) * (addon.FrontBiasAdjust or 1)
+                                else
+                                    modifiedBrakes.brakeForcesFront[i] = (brakeData.brakeForceF or 0) * (addon.FrontBiasAdjust or 1)
+                                end
+                            else
+                                -- Normal Braking
+                                modifiedBrakes.brakeForcesFront[i] = (brakeData.brakeForceF or 0) * (addon.FrontBiasAdjust or 1)
+                            end
+                        end
+                    end
+                else 
+                    -- "2-Channel" (Average)
+                    local avgFrontRPM = 0
+                    local count = 0
+                    if brakeData.frontRPMs then
+                        for i, rpm in ipairs(brakeData.frontRPMs) do
+                            avgFrontRPM = avgFrontRPM + (rpm or 0)
+                            count = count + 1
+                        end
+                        if count > 0 then avgFrontRPM = avgFrontRPM / count end
+                    end
+                    
+                    local slip = checkSlip(avgFrontRPM)
+                    frontSlipMax = slip
+                    if slip > (addon.LockThreshold or 0.2) then
+                        if inPulse then
+                            modifiedBrakes.brakeForceF = (brakeData.brakeForceF or 0) * (addon.ReleasePressure or 0.6) * (addon.FrontBiasAdjust or 1)
+                        else
+                            modifiedBrakes.brakeForceF = (brakeData.brakeForceF or 0) * (addon.FrontBiasAdjust or 1)
+                        end
+                    end
+                end
+            end
+            
+            -- ==========================================
+            -- REAR AXLE LOGIC
+            -- ==========================================
+            if enableRear then
+                if channelMode == "4-Channel" then
+                    -- Individual Wheel Monitoring
+                    if brakeData.rearRPMs then
+                        for i, rpm in ipairs(brakeData.rearRPMs) do
+                            local slip = checkSlip(rpm)
+                            rearSlipMax = math.max(rearSlipMax, slip)
+                            
+                            if slip > (addon.LockThreshold or 0.2) then
+                                -- Wheel Locking
+                                if inPulse then
+                                    modifiedBrakes.brakeForcesRear[i] = (brakeData.brakeForceR or 0) * (addon.ReleasePressure or 0.6) * (addon.RearBiasAdjust or 1)
+                                else
+                                    modifiedBrakes.brakeForcesRear[i] = (brakeData.brakeForceR or 0) * (addon.RearBiasAdjust or 1)
+                                end
+                            else
+                                -- Normal Braking
+                                modifiedBrakes.brakeForcesRear[i] = (brakeData.brakeForceR or 0) * (addon.RearBiasAdjust or 1)
+                            end
+                        end
+                    end
+                else 
+                    -- "3-Channel", "2-Channel", "1-Channel" (Average Rear)
+                    local avgRearRPM = 0
+                    local count = 0
+                    if brakeData.rearRPMs then
+                        for i, rpm in ipairs(brakeData.rearRPMs) do
+                            avgRearRPM = avgRearRPM + (rpm or 0)
+                            count = count + 1
+                        end
+                        if count > 0 then avgRearRPM = avgRearRPM / count end
+                    end
+                    
+                    local slip = checkSlip(avgRearRPM)
+                    rearSlipMax = slip
+                    if slip > (addon.LockThreshold or 0.2) then
+                        if inPulse then
+                            modifiedBrakes.brakeForceR = (brakeData.brakeForceR or 0) * (addon.ReleasePressure or 0.6) * (addon.RearBiasAdjust or 1)
+                        else
+                            modifiedBrakes.brakeForceR = (brakeData.brakeForceR or 0) * (addon.RearBiasAdjust or 1)
+                        end
+                    end
+                end
+            end
+
+            -- Debug sync (realtime monitoring)
+            if addon.DebugEnabled then
+                addon.DebugFrontSlip = frontSlipMax
+                addon.DebugRearSlip = rearSlipMax
+                addon.DebugInPulse = inPulse
+                addon.DebugABSActive = (frontSlipMax > (addon.LockThreshold or 0.2)) or (rearSlipMax > (addon.LockThreshold or 0.2))
+            end
+
+            addon.DebugBrakeForceF = modifiedBrakes.brakeForceF
+            addon.DebugBrakeForceR = modifiedBrakes.brakeForceR
+            
+            return modifiedBrakes
+        end
+    }
+
+}
+
+
+-- Initialize Engine Instance
+if _G.RedFoxEngineCore then
+    if CLIENT then
+        _G.RedFoxEngineCore.initClient(config)
+    else
+        _G.RedFoxEngineCore.initServer(config)
+    end
+else
+    print(Color(255, 0, 0), "CRITICAL ERROR: RedFoxEngineCore not loaded!")
+end

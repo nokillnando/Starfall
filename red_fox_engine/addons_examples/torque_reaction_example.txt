@@ -1,0 +1,89 @@
+-- Torque Reaction Addon Example
+-- Simulates chassis reaction to engine torque (tilting/rolling)
+-- Realistic effect: Powerful engines cause chassis to tilt opposite to wheel rotation
+--
+-- Usage: Enable in red_fox_engine_config.txt:
+--   Addons.TorqueReaction.Enabled = true
+
+return {
+    TorqueReaction = {
+        Enabled = false,  -- Set to true to use
+        
+        -- Configuration
+        ReactionStrength = 1.0,         -- Multiplier for torque reaction (0 = none, 2 = double)
+        RPMInfluence = 0.5,             -- How much RPM affects reaction (0-1)
+        ThrottleInfluence = 0.8,        -- How much throttle affects reaction (0-1)
+        MinRPMForReaction = 2000,       -- RPM threshold before reaction kicks in
+        
+        -- Advanced tuning
+        TorqueAxis = "Right",           -- Axis to apply reaction torque (Right/Left/Up/Down/Forward/Back)
+        InvertReaction = false,         -- Flip reaction direction
+        MaxTorqueMagnitude = 10000,     -- Clamp max torque applied
+        
+        -- Wire outputs for monitoring
+        WireOutputs = {
+            { name = "TorqueReactionForce", source = "CurrentReactionForce", type = "normal" },
+            { name = "TorqueReactionActive", source = "IsReacting", type = "normal" },
+        },
+        
+        -- Status tracking
+        CurrentReactionForce = 0,
+        IsReacting = false,
+        
+        -- Hook: Apply torque reaction to chassis
+        OnPhysicsUpdate = function(state, config, physicsData)
+            local addon = config.Addons.TorqueReaction
+            local ChassisPhys = physicsData.ChassisPhys
+            local Chassis = physicsData.Chassis
+            
+            -- Only apply if engine is active and above min RPM
+            if not state.Active or state.RPM < addon.MinRPMForReaction then
+                addon.CurrentReactionForce = 0
+                addon.IsReacting = false
+                return
+            end
+            
+            -- Calculate reaction magnitude based on RPM and throttle
+            local rpmFactor = (state.RPM / (config.Engine_Redline or 8000)) * addon.RPMInfluence
+            local throttleFactor = (state.Throttle or 0) * addon.ThrottleInfluence
+            local powerFactor = (state.Flywheel_Power or 0) / (config.Engine_MaxPower or 1000)
+            
+            -- Combined reaction strength
+            local reactionMagnitude = powerFactor * rpmFactor * throttleFactor * addon.ReactionStrength
+            reactionMagnitude = reactionMagnitude * physicsData.tickMult
+            
+            -- Get torque axis from chassis
+            local torqueAxis
+            if addon.TorqueAxis == "Right" then
+                torqueAxis = Chassis:getRight()
+            elseif addon.TorqueAxis == "Up" then
+                torqueAxis = Chassis:getUp()
+            elseif addon.TorqueAxis == "Forward" then
+                torqueAxis = Chassis:getForward()
+            else
+                torqueAxis = Chassis:getRight()  -- Default
+            end
+            
+            -- Invert if needed
+            if addon.InvertReaction then
+                torqueAxis = -torqueAxis
+            end
+            
+            -- Calculate final torque (opposite to wheel rotation direction)
+            local reactionTorque = torqueAxis * reactionMagnitude * 1000
+            
+            -- Clamp to max magnitude
+            local magnitude = reactionTorque:getLength()
+            if magnitude > addon.MaxTorqueMagnitude then
+                reactionTorque = reactionTorque:getNormalized() * addon.MaxTorqueMagnitude
+            end
+            
+            -- Apply torque to chassis
+            ChassisPhys:applyTorque(reactionTorque)
+            
+            -- Update status
+            addon.CurrentReactionForce = magnitude
+            addon.IsReacting = magnitude > 100
+        end,
+    }
+}

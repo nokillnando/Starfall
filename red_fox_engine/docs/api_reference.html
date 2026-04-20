@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>API Reference - Red Fox Engine</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+
+<body>
+    <nav class="sidebar">
+        <a href="index.html" class="logo">Red Fox Engine</a>
+
+        <div class="nav-group">
+            <div class="nav-header">Structure</div>
+            <a href="#addon-structure" class="nav-link">Addon Structure</a>
+            <a href="#shared-state" class="nav-link">Shared State (s)</a>
+        </div>
+
+        <div class="nav-group">
+            <div class="nav-header">Server Hooks</div>
+            <a href="#OnInit" class="nav-link">OnInit</a>
+            <a href="#OnIgnition" class="nav-link">OnIgnition</a>
+            <a href="#OnEngineUpdate" class="nav-link">OnEngineUpdate</a>
+            <a href="#OnEngineSound" class="nav-link">OnEngineSound</a>
+            <a href="#OnBrakeApply" class="nav-link">OnBrakeApply</a>
+            <a href="#OnBrakeOverride" class="nav-link">OnBrakeOverride</a>
+            <a href="#HandleCustomTransmission" class="nav-link">HandleCustomTransmission</a>
+            <a href="#HandleCustomEngine" class="nav-link">HandleCustomEngine</a>
+            <a href="#OnTurboCalculation" class="nav-link">OnTurboCalculation</a>
+            <a href="#OnRevLimit" class="nav-link">OnRevLimit</a>
+            <a href="#ModifyPower" class="nav-link">ModifyPower</a>
+            <a href="#OnPhysicsUpdate" class="nav-link">OnPhysicsUpdate</a>
+            <a href="#NetworkWrite" class="nav-link">NetworkWrite</a>
+        </div>
+
+        <div class="nav-group">
+            <div class="nav-header">Client Hooks</div>
+            <a href="#NetworkRead" class="nav-link">NetworkRead</a>
+            <a href="#OnSoundUpdate" class="nav-link">OnSoundUpdate</a>
+        </div>
+    </nav>
+
+    <main class="main-content">
+        <h1>API Reference</h1>
+        <p class="lead">Complete documentation for the Red Fox Engine v3 Addon API.</p>
+
+        <section id="addon-structure">
+            <h2>Addon Structure</h2>
+            <pre><code>config.Addons.MyAddon = {
+    Enabled = true,
+    SyncedState = { "MyVar" }, -- Auto-networked to client
+    WireInputs = { {name="MyInput", type="normal"} },
+    WireOutputs = { {name="MyOutput", source="MyVar", type="normal"} },
+    
+    -- HOOKS
+    OnInit = function(s, c) ... end
+}</code></pre>
+        </section>
+
+        <section id="shared-state">
+            <h2>Shared State (s)</h2>
+            <p>The <code>s</code> table contains the <strong>Real-Time State</strong> of the engine.</p>
+            <table class="param-table">
+                <tr>
+                    <th>Variable</th>
+                    <th>Type</th>
+                    <th>Description</th>
+                </tr>
+                <tr>
+                    <td><code>s.RPM</code></td>
+                    <td>number</td>
+                    <td>Current Engine RPM.</td>
+                </tr>
+                <tr>
+                    <td><code>s.Gear</code></td>
+                    <td>number</td>
+                    <td>Current Gear (-1=R, 0=N, 1+=F).</td>
+                </tr>
+                <tr>
+                    <td><code>s.Throttle</code></td>
+                    <td>number</td>
+                    <td>Current Throttle (0-1).</td>
+                </tr>
+                <tr>
+                    <td><code>s.Clutch</code></td>
+                    <td>number</td>
+                    <td>Clutch engagement (0=Disengaged, 1=Engaged).</td>
+                </tr>
+                <tr>
+                    <td><code>s.Torque</code></td>
+                    <td>number</td>
+                    <td>Torque multiplier (0-1).</td>
+                </tr>
+                <tr>
+                    <td><code>s.Speed</code></td>
+                    <td>number</td>
+                    <td>Speed in KPH (Absolute).</td>
+                </tr>
+                <tr>
+                    <td><code>s.SpeedN</code></td>
+                    <td>number</td>
+                    <td>Speed in KPH (Signed).</td>
+                </tr>
+                <tr>
+                    <td><code>s.Turbo_Boost</code></td>
+                    <td>number</td>
+                    <td>Boost multiplier (1.0 = N/A).</td>
+                </tr>
+                <tr>
+                    <td><code>s.Active</code></td>
+                    <td>boolean</td>
+                    <td>Is engine running?</td>
+                </tr>
+                <tr>
+                    <td><code>s.Ignition</code></td>
+                    <td>number</td>
+                    <td>0=Off, 1=On, 2=Cranking, 3=Running.</td>
+                </tr>
+                <tr>
+                    <td><code>s.InReverse</code></td>
+                    <td>boolean</td>
+                    <td>True if in reverse logic.</td>
+                </tr>
+                <tr>
+                    <td><code>s.Driver</code></td>
+                    <td>Entity</td>
+                    <td>Current driver.</td>
+                </tr>
+            </table>
+        </section>
+
+        <section id="server-hooks">
+            <h2>Server-Side Hooks</h2>
+
+            <div class="card" id="OnInit">
+                <h3>OnInit(state, config)</h3>
+                <p>Called once when the engine initializes. Use this to set initial values.</p>
+                <div class="code-header">Example from <code>extra_features_addon.txt</code></div>
+                <pre><code>OnInit = function(state, config)
+    local addon = config.Addons.ExtraFeatures
+    -- Initialize output fields
+    addon.HeadlightState = 0
+    addon.CamOn = 0
+    addon.Light = 0
+    addon.LightL = 0
+    addon.LightA = 0
+    addon.BrakeL = 0
+    addon.ReverseL = 0
+    addon.FOV = 0
+    addon.Brightness = 0
+    addon.WLight = Vector(0,0,0)
+    addon.BrakeWLight = Vector(0,0,0)
+    addon.ReverseWLight = Vector(0,0,0)
+end</code></pre>
+            </div>
+
+            <div class="card" id="OnIgnition">
+                <h3>OnIgnition(state, config, ctx)</h3>
+                <p>Called when the ignition key is pressed. Return state overrides.</p>
+                <div class="code-header">Example from <code>electric_powertrain_example.txt</code></div>
+                <pre><code>OnIgnition = function(state, config, ctx)
+    local addon = config.Addons and config.Addons.ElectricPowertrain
+    
+    -- Electric powertrain handles its own W/S inversion and sounds
+    state.SkipWSInversion = true
+    config.SkipWSInversion = true
+
+    -- (Code omitted for brevity: HUD override logic)
+
+    -- Electric motor: if ignition is on, motor is active (ready for torque)
+    if ctx.ignition >= 1 then
+        -- Force active whenever ignition is on, prevent cranking states
+        
+        -- Play custom electric motor sound (server side trigger)
+        if not state.MotorSoundPlaying and Core.playCustomSound then
+            Core.playCustomSound(
+                "ElectricMotor", 
+                addon.MotorSoundPath or "acf_engines/electric_small.wav",
+                1, 0.05, 0.0
+            )
+            state.MotorSoundPlaying = true
+        end
+        
+        state.ShouldPlayBell = false -- Silence default bell
+        return { ignition = 1, active = true }
+    else
+        -- Ignition off: motor is off, no sound
+        if state.MotorSoundPlaying and Core.stopCustomSound then
+            Core.stopCustomSound("ElectricMotor")
+            state.MotorSoundPlaying = false
+        end
+        
+        state.ShouldPlayBell = false
+        return { active = false, rpm = 0 }
+    end
+end</code></pre>
+            </div>
+
+            <div class="card" id="OnEngineUpdate">
+                <h3>OnEngineUpdate(state, config)</h3>
+                <p>Called every tick. Use for timers, logic, or hints.</p>
+                <div class="code-header">Example from <code>extra_features_addon.txt</code></div>
+                <pre><code>OnEngineUpdate = function(state, config)
+    local addon = config.Addons.ExtraFeatures
+    local driver = state.Driver
+    if not isValid(driver) then 
+        addon.LastDriver = nil
+        addon.HintsShown = false
+        return 
+    end
+    
+    -- Check for Hints on Entry
+    if driver ~= addon.LastDriver then
+        addon.HintsShown = false
+        addon.LastDriver = driver
+    end
+
+    if addon.UseHints and not addon.HintsShown then
+        timer.simple(1, function()
+            if isValid(driver) and driver == addon.LastDriver then
+                addon.PrintHint(driver, "- Controls -")
+                addon.PrintHint(driver, "F to start | Alt for Clutch | R to reset gears")
+                addon.PrintHint(driver, "W/A/S/D to drive | Space for Handbrake")
+                addon.PrintHint(driver, string.upper(addon.HeadlightKey) .. " for headlights")
+            end
+        end)
+        addon.HintsShown = true
+    end
+end</code></pre>
+            </div>
+
+            <div class="card" id="OnEngineSound">
+                <h3>OnEngineSound(state, config, soundData)</h3>
+                <p>Called before playing default sounds. Return <code>nil</code> to silence default sounds.</p>
+                <div class="code-header">Example from <code>electric_powertrain_example.txt</code></div>
+                <pre><code>OnEngineSound = function(state, config, soundData)
+    -- We handle our own sounds via Custom Sound System
+    if soundData.soundType == "bell" or soundData.soundType == "starter" then
+        return nil -- Return nil to silence
+    end
+    return soundData
+end</code></pre>
+            </div>
+
+            <div class="card" id="HandleCustomTransmission">
+                <h3>HandleCustomTransmission(state, config, inputs)</h3>
+                <p>Completely overrides transmission logic. Return <code>true</code> to prevent default logic.</p>
+                <div class="code-header">Example from <code>electric_powertrain_example.txt</code></div>
+                <pre><code>HandleCustomTransmission = function(state, config, inputs)
+    local addon = config.Addons.ElectricPowertrain
+
+    state.InReverse = state.InReverse or false
+    state.LastR = state.LastR or false
+
+    -- R key: manual reverse toggle
+    if inputs.Key_R and not state.LastR then
+        state.InReverse = not state.InReverse
+    end
+    state.LastR = inputs.Key_R
+    
+    -- Auto-reverse behavior: pressing opposite direction when stopped
+    local speed = math.abs(state.Speed or 0)
+    local Key_W = inputs.Key_W
+    local Key_S = inputs.Key_S
+    
+    -- If stopped and press opposite direction, switch
+    if speed < 2 then
+        if not state.InReverse and Key_S and not state.LastAutoReverseS then
+            state.InReverse = true
+        elseif state.InReverse and Key_W and not state.LastAutoReverseW then
+            state.InReverse = false
+        end
+    end
+    
+    state.LastAutoReverseW = Key_W
+    state.LastAutoReverseS = Key_S
+
+    -- Electric powertrain: always gear 1
+    state.Gear = 1
+    state.GearRatio = 1
+end</code></pre>
+            </div>
+
+            <div class="card" id="HandleCustomEngine">
+                <h3>HandleCustomEngine(state, config, inputs)</h3>
+                <p>Overrides engine physics (RPM, Torque). Useful for completely custom powertrains.</p>
+                <div class="code-header">Example from <code>electric_powertrain_example.txt</code></div>
+                <pre><code>HandleCustomEngine = function(state, config, inputs)
+    local addon = config.Addons.ElectricPowertrain
+
+    -- Electric vehicle pedal logic
+    local inReverse = state.InReverse or false
+    local throttleMultiplier = inputs.Key_Shift and 1 or 0.5
+    
+    local throttle
+    if inReverse then
+        throttle = (inputs.Key_S and 1 or 0) * throttleMultiplier
+    else
+        throttle = (inputs.Key_W and 1 or 0) * throttleMultiplier
+    end
+    
+    local direction = inReverse and -1 or 1
+    local wheelRPM = state.Flywheel_RPM or 0
+    local motorRPM = math.abs(wheelRPM * addon.DriveRatio)
+    motorRPM = math.min(motorRPM, addon.MaxMotorRPM)
+
+    -- EV-style torque curve: constant torque up to BaseSpeedRPM, then constant power
+    local baseRPM = math.max(1, addon.BaseSpeedRPM or 4000)
+    local torquePerMotor = addon.MaxMotorTorque
+    if motorRPM > baseRPM then
+        torquePerMotor = addon.MaxMotorTorque * (baseRPM / motorRPM)
+    end
+    
+    -- ... (Efficiency logic omitted) ...
+
+    local motorTorque = throttle * torquePerMotor * (addon.FrontMotorCount + addon.RearMotorCount)
+    local drivePower = motorTorque * addon.DriveRatio * direction
+
+    state.RPM = motorRPM
+    state.Torque = motorTorque
+    state.Throttle = throttle
+    state.Flywheel_Power = drivePower
+
+    return true
+end</code></pre>
+            </div>
+
+            <div class="card" id="OnTurboCalculation">
+                <h3>OnTurboCalculation(state, config, turboData)</h3>
+                <p>Overrides forced induction.</p>
+                <div class="code-header">Example from <code>supercharger_example.txt</code></div>
+                <pre><code>OnTurboCalculation = function(state, config, turboData)
+    local addon = config.Addons.Supercharger
+    
+    -- Supercharger boost is directly tied to engine RPM (no lag)
+    local rpm = turboData.engineRPM or 0
+    local throttle = turboData.throttle or 0
+    
+    -- Calculate boost based on RPM range
+    local boostRange = math.max(addon.BoostRPMMax - addon.BoostRPMStart, 1)
+    local rpmRatio = math.clamp((rpm - addon.BoostRPMStart) / boostRange, 0, 1)
+
+    -- Apply boost curve (strong low-end, dropoff at high RPM)
+    local dropoffCurve = addon.HighRPMDropoffCurve or 1.6
+    local dropoff = rpmRatio ^ dropoffCurve
+    
+    -- ... (Calculation logic omitted) ...
+    
+    local psi = (maxBoost - (maxBoost - minBoost) * dropoff) * throttleFactor
+    local boost = (psi + addon.AirPressure) / addon.AirPressure
+    
+    addon.SuperchargerRPM = rpm
+    addon.SuperchargerPSI = psi
+    
+    return {
+        turboPSI = psi,           -- Override turbo PSI
+        turboBoost = boost,       -- Override turbo boost
+        turboRPM = rpm,           -- Supercharger RPM = engine RPM
+        torqueMultiplier = torqueMultiplier, 
+        disableBOV = true         -- Superchargers don't use a BOV
+    }
+end</code></pre>
+            </div>
+
+            <div class="card" id="OnRevLimit">
+                <h3>OnRevLimit(state, config, LimitRPM, DropRPM, DelayTime)</h3>
+                <p>Dynamically overrides Rev Limiter parameters per-tick. Useful for 2-step launch control or cold-engine protection.</p>
+                <div class="code-header">Example (2-Step Launch Control)</div>
+                <pre><code>OnRevLimit = function(s, c, LimitRPM, DropRPM, DelayTime)
+    -- If clutch is fully engaged and speed is near 0, limit RPM to 4500 for launch
+    if (s.Clutch or 0) > 0.8 and (s.Speed or 0) < 5 then
+        return {
+            limitRPM = 4500,
+            dropRPM = 150,    -- Small drop for fast bouncing
+            delayTime = 0.05  -- Short ignition cut delay
+        }
+    end
+    -- Return nil allows normal rev limit config to apply
+end</code></pre>
+            </div>
+
+            <div class="card" id="OnBrakeOverride">
+                <h3>OnBrakeOverride(state, config, ctx)</h3>
+                <p>Overrides which keys trigger braking.</p>
+                <div class="code-header">Example from <code>electric_powertrain_example.txt</code></div>
+                <pre><code>OnBrakeOverride = function(state, config, ctx)
+    local addon = config.Addons.ElectricPowertrain
+    
+    -- Electric vehicle: W/S inversion disabled in core when addon enabled
+    -- So brake logic is straightforward:
+    if ctx.inReverse then
+        -- In reverse: W brakes, S accelerates
+        return { brakeInput = ctx.key_w or ctx.key_space }
+    else
+        -- In forward: S brakes, W accelerates
+        return { brakeInput = ctx.key_s or ctx.key_space }
+    end
+end</code></pre>
+            </div>
+
+            <div class="card" id="ModifyPower">
+                <h3>ModifyPower(state, config, power)</h3>
+                <p>Final hook to scale output power before wheels (Traction Control).</p>
+                <div class="code-header">Example (Generic - No Addon uses this yet)</div>
+                <pre><code>ModifyPower = function(s, c, power)
+    -- Example: Simple 50% power cut
+    return power * 0.5 
+end</code></pre>
+            </div>
+
+            <div class="card" id="NetworkWrite">
+                <h3>NetworkWrite(state, config, net)</h3>
+                <p>Send custom data to client.</p>
+                <div class="code-header">Example from <code>supercharger_example.txt</code></div>
+                <pre><code>NetworkWrite = function(state, config, net)
+    local addon = config.Addons.Supercharger
+    net.writeString(addon.SuperchargerSoundPath or "")
+    net.writeFloat(addon.SuperchargerSoundVolume or 1.0)
+    net.writeFloat(addon.SuperchargerIdleVolume or 0.35)
+    net.writeFloat(addon.SuperchargerSoundPitchMin or 1.0)
+    net.writeFloat(addon.SuperchargerSoundPitchMax or 2.5)
+end</code></pre>
+            </div>
+        </section>
+
+        <section id="client-hooks">
+            <h2>Client-Side Hooks</h2>
+
+            <div class="card" id="NetworkRead">
+                <h3>NetworkRead(state, config, net)</h3>
+                <p>Receive custom data.</p>
+                <div class="code-header">Example from <code>supercharger_example.txt</code></div>
+                <pre><code>NetworkRead = function(state, config, net)
+    local addon = config.Addons.Supercharger
+    addon.SuperchargerSoundPath = net.readString()
+    addon.SuperchargerSoundVolume = net.readFloat()
+    addon.SuperchargerIdleVolume = net.readFloat()
+    addon.SuperchargerSoundPitchMin = net.readFloat()
+    addon.SuperchargerSoundPitchMax = net.readFloat()
+    
+    -- Create or replace sound object on client side
+    if addon.SuperchargerSoundPath and addon.SuperchargerSoundPath ~= "" then
+        -- ... (Sound creation logic) ...
+        addon._soundObject = sound.create(engineEnt, addon.SuperchargerSoundPath, true)
+    end
+    
+    -- Create a client think hook once to drive pitch/volume updates
+    if not addon._soundThinkHook then
+        addon._soundThinkHook = true
+        hook.add("think", "SuperchargerSound", function()
+             -- ...
+        end)
+    end
+end</code></pre>
+            </div>
+
+            <div class="card" id="OnSoundUpdate">
+                <h3>OnSoundUpdate(state, config, sounds)</h3>
+                <p>Update custom sounds per-frame.</p>
+                <div class="code-header">Example from <code>electric_powertrain_example.txt</code></div>
+                <pre><code>OnSoundUpdate = function(state, config, sounds)
+     -- Modulate the custom sound pitch/volume based on RPM
+     local snd = sounds["Custom_ElectricMotor"]
+     -- Check if sound exists and is marked Active by the server
+     if snd and sounds["Custom_ElectricMotor_Active"] then
+         local addon = config.Addons.ElectricPowertrain
+         
+         local throttle = state.Throttle or 0
+         local rpm = state.RPM or 0
+         local rpmRatio = math.clamp(rpm / (addon.MaxMotorRPM or 16000), 0, 1)
+         
+         -- Volume calculation: small idle hum + throttle-based volume
+         local idleVolume = 0.05
+         local throttleVolume = throttle * (addon.MotorSoundVolume or 0.6)
+         local rpmVolume = rpmRatio * 0.2
+         local finalVolume = math.clamp(idleVolume + throttleVolume + rpmVolume, 0, 1)
+         
+         -- Pitch scales with RPM
+         local dynamicPitch = 0.8 + (rpmRatio * 0.6)
+         
+         snd:setPitch(dynamicPitch * (addon.MotorSoundPitch or 1.0) * 100)
+         snd:setVolume(finalVolume)
+         
+         -- Force play if it stopped but should be active
+         if not snd:isPlaying() then
+             snd:play()
+         end
+     end
+end</code></pre>
+            </div>
+        </section>
+
+    </main>
+    <script src="js/main.js"></script>
+</body>
+
+</html>

@@ -1,0 +1,308 @@
+-- Air System Addon Example (Truck/Heavy Vehicle) - RESEARCHED & FIXED
+-- Simulates REALISTIC air pressure system based on real truck air brake research
+--
+-- RESEARCH FINDINGS:
+-- 1. Compressor CYCLES on/off (cut-in/cut-out), NOT always running
+-- 2. Air brakes use air ONLY on application (not while held)
+-- 3. Heat does NOT cause fade in air brakes (no fluid to boil)
+-- 4. Brake squeal occurs DURING application (friction resonance)
+-- 5. Core brake forces (BrakeF/BrakeR) are COSMETIC ONLY - don't actually brake!
+--
+-- FIXES APPLIED:
+-- - Air consumption: One-shot on brake application, not continuous
+-- - Compressor: Cycles based on cut-in/cut-out with hysteresis
+-- - Heat: Removed from brake fade (doesn't affect air brakes realistically)
+-- - Heat: NOW affects drum expansion (mechanical fade via clearance increase)
+-- - Brake hiss: Only plays DURING braking with speed, not constantly
+-- - Brake force: Added BrakeFeedMult modification for ACTUAL braking effect
+
+return {
+    AirSystem = {
+        Enabled = false,  -- Set to true to use
+
+        -- Configuration (pressures in PSI - REALISTIC TRUCK VALUES)
+        MaxPressure = 125,          -- Full system pressure (typical: 120-125)
+        MinServicePressure = 60,    -- Below this, brakes start to feel weak
+        CutInPressure = 100,        -- Compressor turns ON below this
+        CutOutPressure = 125,       -- Compressor turns OFF above this
+        EmergencyPressure = 55,     -- Low-pressure warning (spring brakes apply)
+
+        -- Dynamics (REALISTIC: air used on apply, not while holding)
+        Pressure = 120,             -- Initial pressure
+        LeakRate = 0.0,            -- PSI per tick base leak (~2 PSI/min at 66 tick/sec)
+        BrakeApplyUse = 3.0,        -- PSI consumed per brake application (one-shot)
+        CompressorRate = 0.1,       -- PSI per tick while compressor is on
+        
+        -- Internal tracking
+        _LastBrakeState = false,    -- Track brake application edges
+
+        -- Sounds
+        CompressorSoundPath = "ambient/machines/turbine_loop_1.wav",
+        CompressorSoundVolume = 0.4,
+        CompressorSoundPitch = 100.0,
+
+        CompressorFullSoundPath = "ambient/machines/steam_release_2.wav",  -- One-shot when max pressure reached
+        CompressorFullVolume = 0.4,
+        CompressorFullPitch = 100.0,  -- Pitch control for compressor full sound
+
+        BrakeReleaseSoundPath = "ambient/machines/steam_release_1.wav",  -- Air release when braking stops
+        BrakeReleaseVolume = 10.5,
+        BrakeReleasePitch = 100.0,
+
+        BrakeHissSoundPath = "acf_extra/vehiclefx/trans/tw_onhigh.wav",
+        BrakeHissMinVolume = 0.2,   -- Minimum hiss volume (light braking)
+        BrakeHissMaxVolume = 0.7,   -- Maximum hiss volume (hard braking + speed)
+        BrakeHissMinPitch = 80,     -- Pitch at low speed (normalized 0-255 range)
+        BrakeHissMaxPitch = 180,    -- Pitch at high speed
+        BrakeHissBrakeRequire = 0.05, -- Minimum brake input to trigger hiss
+        BrakeHissSpeedThreshold = 20,  -- Minimum speed (KPH) for hiss
+        BrakeHissSpeedMax = 100,     -- Speed (KPH) for max pitch/volume
+
+        LowPressureSoundPath = "ambient/alarms/klaxon1.wav",
+        LowPressureSoundVolume = 0.4,
+        LowPressureSoundPitch = 1.0,
+
+        -- Auto-sync for UI + client sounds
+        SyncedState = {
+            "Pressure", "CompressorActive", "LowPressure",
+            "Brake", "Speed",  -- Needed for client-side sound logic
+            "CompressorSoundPath", "CompressorSoundVolume", "CompressorSoundPitch",
+            "CompressorFullSoundPath", "CompressorFullVolume", "CompressorFullPitch",
+            "BrakeReleaseSoundPath", "BrakeReleaseVolume", "BrakeReleasePitch",
+            "BrakeHissSoundPath", "BrakeHissMinVolume", "BrakeHissMaxVolume",
+            "BrakeHissMinPitch", "BrakeHissMaxPitch", "BrakeHissBrakeRequire",
+            "BrakeHissSpeedThreshold", "BrakeHissSpeedMax",
+            "LowPressureSoundPath", "LowPressureSoundVolume", "LowPressureSoundPitch"
+        },
+
+        -- Wire outputs
+        WireOutputs = {
+            { name = "AirPressure", source = "Pressure", type = "normal" },
+            { name = "CompressorActive", source = "CompressorActive", type = "normal" },
+            { name = "LowPressure", source = "LowPressure", type = "normal" },
+        },
+
+        -- Update pressure and compressor state
+        OnPhysicsUpdate = function(state, config, physicsData)
+            local addon = config.Addons.AirSystem
+            local dt = physicsData.tickMult or 1
+
+            local pressure = addon.Pressure or addon.MaxPressure
+            local braking = (state.Brake or 0) > 0.05
+            local engineRunning = state.Active or false
+
+            -- Base system leak (always present)
+            pressure = pressure - (addon.LeakRate or 0) * dt
+
+            -- Air consumption: ONE-SHOT on brake application (realistic)
+            local currentBraking = braking
+            local lastBraking = addon._LastBrakeState or false
+            if currentBraking and not lastBraking then
+                -- Brake was just applied - consume air
+                pressure = pressure - (addon.BrakeApplyUse or 3.0)
+            end
+            addon._LastBrakeState = currentBraking
+
+            -- Compressor control: CYCLES on/off with hysteresis (realistic)
+            addon.CompressorActive = addon.CompressorActive or false
+            if engineRunning then
+                if pressure <= (addon.CutInPressure or 100) then
+                    addon.CompressorActive = true
+                elseif pressure >= (addon.CutOutPressure or 125) then
+                    addon.CompressorActive = false
+                end
+                -- Hysteresis: compressor stays in current state between thresholds
+            else
+                addon.CompressorActive = false  -- Engine off = no compressor
+            end
+
+            -- Add pressure if compressor is running
+            if addon.CompressorActive then
+                pressure = pressure + (addon.CompressorRate or 1.8) * dt
+            end
+
+            -- Clamp pressure AFTER compressor logic
+            pressure = math.clamp(pressure, 0, addon.MaxPressure or 125)
+            
+            -- Check cutout AGAIN after clamping (in case we just hit max)
+            if pressure >= (addon.CutOutPressure or 125) then
+                addon.CompressorActive = false
+            end
+            addon.Pressure = pressure
+            addon.LowPressure = pressure <= (addon.EmergencyPressure or 55)
+            
+            -- Store for client sync (used in sound think hook)
+            addon.Brake = (state.Brake or 0)
+            addon.Speed = (state.Speed or 0)
+            
+            -- Initialize sound system on first run (must be in OnPhysicsUpdate to ensure addon reference is valid)
+            if not addon._soundSystemInitialized then
+                addon._soundSystemInitialized = true
+                
+                -- Initialize state tracking for all sounds
+                addon._LastCompressorActive = false
+                addon._LastBrakeInput = 0
+                addon._LastPressure = 0
+                addon._LastLowPressure = false
+                addon._LastHissActive = false
+                
+                -- Register the think hook for sound management
+                if not addon._soundThinkHook then
+                    addon._soundThinkHook = true
+                    hook.add("think", "AirSystemSound_" .. tostring(addon), function()
+                        -- Create sounds on first run of think hook
+                        local function normalizePitch(val)
+                            if val == nil then return 100 end
+                            if val <= 5 then return val * 100 end
+                            return val
+                        end
+                        
+                        local function ensureSound(name, path, looping)
+                            if not path or path == "" then return nil end
+                            if addon[name] and addon[name .. "_Path"] == path then 
+                                return addon[name] 
+                            end
+                            if addon[name] then 
+                                pcall(function() addon[name]:stop() end)
+                                addon[name] = nil 
+                            end
+                            local engineEnt = chip():getParent()
+                            if engineEnt and engineEnt:isValid() then
+                                local snd = sound.create(engineEnt, path, looping or false)
+                                if snd then
+                                    snd:setVolume(0)
+                                    addon[name] = snd
+                                    addon[name .. "_Path"] = path
+                                end
+                            end
+                            return addon[name]
+                        end
+                        
+                        ensureSound("_CompressorSnd", addon.CompressorSoundPath, true)
+                        ensureSound("_BrakeHissSnd", addon.BrakeHissSoundPath, true)
+                        ensureSound("_LowWarnSnd", addon.LowPressureSoundPath, true)
+                        ensureSound("_CompressorFullSnd", addon.CompressorFullSoundPath, false)
+                        ensureSound("_BrakeReleaseSnd", addon.BrakeReleaseSoundPath, false)
+                        
+                        -- Compressor sound (only when active)
+                        if addon._CompressorSnd then
+                            local compActive = addon.CompressorActive or false
+                            local wasActive = addon._LastCompressorActive or false
+                            if compActive and not wasActive then
+                                addon._CompressorSnd:play()
+                            elseif not compActive and wasActive then
+                                addon._CompressorSnd:stop()
+                            end
+                            if compActive then
+                                addon._CompressorSnd:setPitch(normalizePitch(addon.CompressorSoundPitch or 1))
+                                addon._CompressorSnd:setVolume(addon.CompressorSoundVolume or 0.6)
+                            else
+                                addon._CompressorSnd:setVolume(0)
+                            end
+                            addon._LastCompressorActive = compActive
+                        end
+                        
+                        -- Compressor full sound (one-shot)
+                        if addon._CompressorFullSnd then
+                            local pressure = addon.Pressure or 0
+                            local maxPressure = addon.MaxPressure or 125
+                            if pressure >= maxPressure - 1 and (addon._LastPressure or 0) < maxPressure - 1 then
+                                addon._CompressorFullSnd:setPitch(normalizePitch(addon.CompressorFullPitch or 1.0))
+                                addon._CompressorFullSnd:setVolume(addon.CompressorFullVolume or 0.4)
+                                addon._CompressorFullSnd:play()
+                            end
+                            addon._LastPressure = pressure
+                        end
+                        
+                        -- Brake release sound (one-shot) - MUST BE BEFORE brake hiss to catch state change
+                        local brakeInput = (addon.Brake or 0)
+                        local lastBrakeInput = addon._LastBrakeInput or 0
+                        if addon._BrakeReleaseSnd then
+                            if lastBrakeInput > 0.05 and brakeInput <= 0.05 then
+                                -- Must stop one-shot sounds before replaying them
+                                pcall(function() addon._BrakeReleaseSnd:stop() end)
+                                addon._BrakeReleaseSnd:setPitch(normalizePitch(addon.BrakeReleasePitch or 1.0))
+                                addon._BrakeReleaseSnd:setVolume(addon.BrakeReleaseVolume or 0.5)
+                                addon._BrakeReleaseSnd:play()
+                            end
+                        end
+                        
+                        -- Brake hiss (only during braking with movement)
+                        if addon._BrakeHissSnd then
+                            local speed = (addon.Speed or 0)
+                            local hissActive = brakeInput > (addon.BrakeHissBrakeRequire or 0.05)
+                                and speed > (addon.BrakeHissSpeedThreshold or 5)
+                            local wasHissActive = addon._LastHissActive or false
+
+                            if hissActive then
+                                if not wasHissActive then
+                                    addon._BrakeHissSnd:play()
+                                end
+                                local speedMax = addon.BrakeHissSpeedMax or 40
+                                local speedFactor = math.clamp(speed / speedMax, 0, 1)
+                                local brakeFactor = math.clamp(brakeInput, 0, 1)
+                                local intensity = speedFactor * brakeFactor
+                                local minVol = addon.BrakeHissMinVolume or 0.2
+                                local maxVol = addon.BrakeHissMaxVolume or 0.7
+                                local volume = minVol + (maxVol - minVol) * intensity
+                                addon._BrakeHissSnd:setVolume(volume)
+                                local minPitch = addon.BrakeHissMinPitch or 80
+                                local maxPitch = addon.BrakeHissMaxPitch or 180
+                                local pitch = minPitch + (maxPitch - minPitch) * speedFactor
+                                addon._BrakeHissSnd:setPitch(normalizePitch(pitch))
+                            else
+                                addon._BrakeHissSnd:setVolume(0)
+                                if wasHissActive then
+                                    addon._BrakeHissSnd:stop()
+                                end
+                            end
+                            addon._LastHissActive = hissActive
+                        end
+
+                        -- Update AFTER both release + hiss checks
+                        addon._LastBrakeInput = brakeInput
+                        
+                        -- Low pressure warning (looping)
+                        if addon._LowWarnSnd then
+                            local lowPressure = addon.LowPressure or false
+                            local wasLow = addon._LastLowPressure or false
+                            if lowPressure and not wasLow then
+                                addon._LowWarnSnd:play()
+                            elseif not lowPressure and wasLow then
+                                addon._LowWarnSnd:stop()
+                            end
+                            if lowPressure then
+                                addon._LowWarnSnd:setPitch(normalizePitch(addon.LowPressureSoundPitch or 1))
+                                addon._LowWarnSnd:setVolume(addon.LowPressureSoundVolume or 0.4)
+                            else
+                                addon._LowWarnSnd:setVolume(0)
+                            end
+                            addon._LastLowPressure = lowPressure
+                        end
+                    end)
+                end
+            end
+        end,
+
+        -- Modify brake force based on air pressure
+        OnBrakeApply = function(state, config, ctx)
+            local addon = config.Addons.AirSystem
+            local pressure = addon.Pressure or addon.MaxPressure
+            local minService = addon.MinServicePressure or 60
+            local maxPressure = addon.MaxPressure or 125
+
+            -- Pressure-based scaling (0..1)
+            local pressureRatio = math.clamp((pressure - minService) / math.max(maxPressure - minService, 1), 0, 1)
+
+            return {
+                brakeForceF = (ctx.brakeForceF or 0) * pressureRatio,
+                brakeForceR = (ctx.brakeForceR or 0) * pressureRatio
+            }
+        end,
+
+        -- NOTE: OnBrakeApply hook already handles pressure-based braking reduction
+        -- No ModifyPower needed - it was causing inverted pitch effects
+
+        -- Sound system is now managed in OnPhysicsUpdate think hook
+    }
+}

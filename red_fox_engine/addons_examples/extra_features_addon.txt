@@ -1,0 +1,260 @@
+-- Red Fox Engine Addon: Extra Features
+-- Implements Headlights (Low/High/Off Cycle), Camera Toggle, and Light Outputs
+-- Follows standard Red Fox Engine Addon Framework
+
+return {
+    ExtraFeatures = {
+        Enabled = true, -- Set to true to use (overridden by config)
+        
+        -- Configuration Defaults
+        HeadlightKey = "h",          -- Key to toggle headlights (F)
+        EnableCamera = true,         -- Enable/Disable Camera feature
+        CameraKey = "g",             -- Key to toggle camera (P)
+        CamDistance = 100,           -- Default Camera Distance
+        CamOffset = Vector(0,0,0),   -- Default Camera Offset (Local to Chassis)
+        
+        -- Register keys for client-to-server syncing
+        -- The core will automatically track these keys on client and send events to server
+        InputKeyFields = { "HeadlightKey", "CameraKey" },
+
+        -- Beam Settings
+        LowBeamFov = 65,
+        LowBeamBrightness = 1,
+        HighBeamFov = 80,
+        HighBeamBrightness = 2,
+
+        -- Wire Light Colors (Vector RGB 0-255)
+        UseWireLight = true,
+        WireLColor = Vector(255, 255, 255),
+        UseWireBrakeLight = true,
+        BrakeWireLightColor = Vector(255, 0, 0),
+        UseWireReverseLight = true,
+        ReverseWireLightColor = Vector(255, 255, 255),
+        
+        ReverseGearNumber = -1,  -- Gear number to consider "Reverse"
+
+        -- Driver Hints
+        UseHints = true,
+        
+        -- Internal State
+        HeadlightState = 0, -- 0=Off, 1=Low, 2=High
+        CamOn = 0,
+        
+        -- Wire Inputs
+        WireInputs = {
+            { name = "Cam", type = "wirelink", condition = "EnableCamera" }
+        },
+
+        -- Wire Outputs (Mapped to fields in this table)
+        WireOutputs = {
+            { name = "CamOn", source = "CamOn", type = "normal" },
+            { name = "Light", source = "Light", type = "normal" },
+            { name = "LightL", source = "LightL", type = "normal" },
+            { name = "LightA", source = "LightA", type = "normal" },
+            { name = "BrakeL", source = "BrakeL", type = "normal" },
+            { name = "ReverseL", source = "ReverseL", type = "normal" },
+            { name = "Ind", source = "Ind", type = "normal" },
+            { name = "FOV", source = "FOV", type = "normal" },
+            { name = "Brightness", source = "Brightness", type = "normal" },
+            { name = "WLight", source = "WLight", type = "vector" },
+            { name = "BrakeWLight", source = "BrakeWLight", type = "vector" },
+            { name = "ReverseWLight", source = "ReverseWLight", type = "vector" },
+        },
+        
+        -- Synced State (Networked to client)
+        SyncedState = { "HeadlightState", "CamOn" },
+
+        -- Helper: Print hint
+        PrintHint = function(ply, text)
+            if isValid(ply) and ply:isPlayer() then
+                if SERVER then
+                    pcall(printHud, ply, text)
+                elseif ply == player() then
+                    pcall(printHud, text)
+                end
+            end
+        end,
+        
+        -- Hook: Initialization
+        OnInit = function(state, config)
+            local addon = config.Addons.ExtraFeatures
+            -- Initialize output fields
+            addon.HeadlightState = 0
+            addon.CamOn = 0
+            addon.Light = 0
+            addon.LightL = 0
+            addon.LightA = 0
+            addon.BrakeL = 0
+            addon.ReverseL = 0
+            addon.FOV = 0
+            addon.Brightness = 0
+            addon.WLight = Vector(0,0,0)
+            addon.BrakeWLight = Vector(0,0,0)
+            addon.ReverseWLight = Vector(0,0,0)
+        end,
+
+        -- Hook: Main Update Loop
+        OnEngineUpdate = function(state, config)
+            local addon = config.Addons.ExtraFeatures
+            local driver = state.Driver
+            if not isValid(driver) then 
+                addon.LastDriver = nil
+                addon.HintsShown = false
+                return 
+            end
+            
+            -- Get Driver Key State (populated by core from client net messages)
+            local keyState = state.DriverKeyState and state.DriverKeyState[driver]
+            
+            -- Check for Hints on Entry
+            if driver ~= addon.LastDriver then
+                addon.HintsShown = false
+                addon.LastDriver = driver
+            end
+
+            if addon.UseHints and not addon.HintsShown then
+                timer.simple(1, function()
+                    if isValid(driver) and driver == addon.LastDriver then
+                        addon.PrintHint(driver, "- Controls -")
+                        addon.PrintHint(driver, "F to start | Alt for Clutch | R to reset gears")
+                        addon.PrintHint(driver, "W/A/S/D to drive | Space for Handbrake")
+                        addon.PrintHint(driver, string.upper(addon.HeadlightKey) .. " for headlights (Tap: Low/High | Hold: Off)")
+                        if addon.EnableCamera then
+                            addon.PrintHint(driver, string.upper(addon.CameraKey) .. " for camera")
+                        end
+                    end
+                end)
+                addon.HintsShown = true
+            end
+            
+            -- ========================================================================
+            -- HEADLIGHT INPUT (Tap: Toggle On/Switch | Hold: Turn Off)
+            -- ========================================================================
+            if keyState then
+                local isDown = keyState.downKeys and keyState.downKeys[addon.HeadlightKey]
+                
+                -- Detect new press
+                if isDown and not addon.HeadlightKey_IsDown then
+                    addon.HeadlightKey_IsDown = true
+                    addon.HeadlightKey_PressTime = timer.curtime()
+                    addon.HeadlightKey_HoldHandled = false
+                    -- Do nothing on press (waits for release to avoid flash)
+                
+                -- Detect hold (while down)
+                elseif isDown and addon.HeadlightKey_IsDown then
+                    if not addon.HeadlightKey_HoldHandled and (timer.curtime() - (addon.HeadlightKey_PressTime or 0)) > 0.5 then
+                        -- Hold Action: Turn Off
+                        addon.HeadlightState = 0
+                        addon.PrintHint(driver, "Headlights: OFF (Hold)")
+                        addon.HeadlightKey_HoldHandled = true
+                        state.ForceNetNow = true  -- Force immediate net send for responsiveness
+                    end
+                
+                -- Detect release
+                elseif not isDown and addon.HeadlightKey_IsDown then
+                    addon.HeadlightKey_IsDown = false
+                    
+                    -- Release Action: Toggle (if not handled by hold)
+                    if not addon.HeadlightKey_HoldHandled then
+                        if addon.HeadlightState == 0 then
+                            addon.HeadlightState = 1 -- Turn On (Low)
+                            addon.PrintHint(driver, "Headlights: Low Beam")
+                        else
+                            -- Switch High/Low (Off is excluded from toggle cycle)
+                            addon.HeadlightState = (addon.HeadlightState == 1) and 2 or 1
+                            if addon.HeadlightState == 1 then
+                                addon.PrintHint(driver, "Headlights: Low Beam")
+                            else
+                                addon.PrintHint(driver, "Headlights: High Beam")
+                            end
+                        end
+                        addon.HeadlightKey_HoldHandled = true
+                        state.ForceNetNow = true  -- Force immediate net send for responsiveness
+                    end
+                end
+                
+                -- Clear legacy press state just in case
+                keyState.pressedKeys[addon.HeadlightKey] = nil
+            end
+            
+            -- Update Headlight Outputs based on State
+            if addon.HeadlightState == 0 then
+                addon.Light = 0; addon.LightL = 0; addon.LightA = 0
+                addon.FOV = 0; addon.Brightness = 0
+                addon.WLight = Vector(0,0,0)
+            elseif addon.HeadlightState == 1 then
+                addon.Light = 1; addon.LightL = 1; addon.LightA = 0
+                addon.FOV = addon.LowBeamFov
+                addon.Brightness = addon.LowBeamBrightness
+                if addon.UseWireLight then addon.WLight = addon.WireLColor end
+            elseif addon.HeadlightState == 2 then
+                addon.Light = 1; addon.LightL = 1; addon.LightA = 1
+                addon.FOV = addon.HighBeamFov
+                addon.Brightness = addon.HighBeamBrightness
+                if addon.UseWireLight then addon.WLight = addon.WireLColor end
+            end
+            
+            -- ========================================================================
+            -- CAMERA INPUT
+            -- ========================================================================
+            if addon.EnableCamera and keyState and keyState.pressedKeys[addon.CameraKey] then
+                -- Consume key press
+                keyState.pressedKeys[addon.CameraKey] = nil
+                
+                addon.CamOn = 1 - addon.CamOn
+                
+                if addon.CamOn == 1 then
+                    addon.PrintHint(driver, "Camera: Active")
+                else
+                    addon.PrintHint(driver, "Camera: Disabled")
+                end
+                state.ForceNetNow = true  -- Force immediate net send for responsiveness
+            end
+            
+            -- Write to Cam wirelink if available (mimics E2 behavior)
+            if addon.Cam and type(addon.Cam) == "Wirelink" and isValid(addon.Cam) then
+                addon.Cam["Activated"] = addon.CamOn
+                -- Set Camera Transform (Parented to Chassis)
+                local base = state.Chassis
+                if isValid(base) then
+                    addon.Cam["Parent"] = base
+                    addon.Cam["Distance"] = addon.CamDistance
+                    -- Calculate Position: Base Pos + Local Offset converted to World
+                    -- E2: Position = Base:pos() + CamOffset.
+                    -- Note: In E2 "CamOffset" is often a world vector if added directly to pos().
+                    -- But user wants it relative to chassis?
+                    -- If CamOffset is (0,0,0), it's at Chassis origin.
+                    -- If user edits CamOffset in config, they likely expect Local Coordinates (Forward/Right/Up).
+                    -- Current implementation: base:pos() + addon.CamOffset.
+                    -- This means CamOffset is a WORLD offset (e.g. Vector(0,0,100) adds 100 units UP global).
+                    -- If the car rotates, this offset STAYS global.
+                    -- Use LocalToWorld for rotation support:
+                    local worldPos = base:localToWorld(addon.CamOffset)
+                    addon.Cam["Position"] = worldPos
+                end
+            end
+            
+            -- ========================================================================
+            -- BRAKE & REVERSE LIGHTS
+            -- ========================================================================
+            local isReverse = state.InReverse or (state.Gear <= (addon.ReverseGearNumber or -1))
+            
+            if isReverse then
+                addon.ReverseL = 1
+                if addon.UseWireReverseLight then addon.ReverseWLight = addon.ReverseWireLightColor end
+            else
+                addon.ReverseL = 0
+                addon.ReverseWLight = Vector(0,0,0)
+            end
+            
+            -- Brake Lights
+            if state.Brake and state.Brake > 0 then
+                addon.BrakeL = 1
+                if addon.UseWireBrakeLight then addon.BrakeWLight = addon.BrakeWireLightColor end
+            else
+                addon.BrakeL = 0
+                addon.BrakeWLight = Vector(0,0,0)
+            end
+        end
+    }
+}

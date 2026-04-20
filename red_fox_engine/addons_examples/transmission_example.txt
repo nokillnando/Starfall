@@ -1,0 +1,218 @@
+-- Transmission Addon Examples
+-- Two different transmission types for different vehicle styles
+--
+-- Usage: Enable ONE in red_fox_engine_config.txt:
+--   Addons.SequentialTransmission.Enabled = true   (race car)
+--   OR
+--   Addons.TruckTransmission.Enabled = true         (truck/offroad)
+
+return {
+    -- ====== SEQUENTIAL TRANSMISSION (Race-like) ======
+    -- Manual sequential gearbox for sporty vehicles
+    -- M1 = Upshift, M2 = Downshift, S = Reverse
+    SequentialTransmission = {
+        Enabled = false,  -- Set to true to use
+        
+        -- Configuration
+        AutoBlipThrottle = true,    -- Auto-blip on downshift
+        BlipAmount = 0.3,           -- How much throttle for blip
+        ShiftDelay = 200,           -- Milliseconds between shifts
+        LastShiftTime = 0,          -- Internal: don't modify
+        
+        -- Hook: Override transmission logic entirely
+        HandleCustomTransmission = function(state, config, inputs)
+            local addon = config.Addons.SequentialTransmission
+            local now = timer.curtime() * 1000  -- Convert to milliseconds
+            local timeSinceShift = now - (addon.LastShiftTime or 0)
+            local canShift = timeSinceShift > addon.ShiftDelay
+            
+            -- Reset throttle/clutch delays after shift completes
+            if timeSinceShift > addon.ShiftDelay then
+                state.Throttle_Delay = 0
+                state.Clutch_Delay = 0
+            end
+            
+            -- Upshift on M1
+            if inputs.Key_M1 and not state.LastM1 and canShift then
+                state.Gear = math.min(state.Gear + 1, #config.Gearbox_Ratios)
+                addon.LastShiftTime = now
+                
+                state.Throttle_Delay = 1
+                state.Clutch_Delay = 1
+            end
+            
+            -- Downshift on M2
+            if inputs.Key_M2 and not state.LastM2 and canShift then
+                state.Gear = math.max(state.Gear - 1, -1)
+                addon.LastShiftTime = now
+                
+                -- Auto-blip on downshift
+                if addon.AutoBlipThrottle and state.Gear > 0 then
+                    state.ThrottleBlip = addon.BlipAmount
+                end
+                
+                state.Throttle_Delay = 1
+                state.Clutch_Delay = 1
+            end
+            
+            -- Reverse engagement (S key)
+            if inputs.Key_S and not state.LastS and state.Gear >= 0 and state.SpeedN <= 5 then
+                state.Gear = -1
+                state.InReverse = true
+            end
+            
+            -- Forward engagement (when leaving reverse)
+            if inputs.Key_W and not state.LastW and state.InReverse and state.SpeedN >= -5 then
+                state.Gear = 1
+                state.InReverse = false
+            end
+            
+            -- Track key presses
+            state.LastM1 = inputs.Key_M1
+            state.LastM2 = inputs.Key_M2
+            state.LastS = inputs.Key_S
+            state.LastW = inputs.Key_W
+
+            -- Sync addon gear for outputs/sync
+            addon.Gear = state.Gear
+        end
+    },
+    
+    -- ====== TRUCK TRANSMISSION (Dual-Range) ======
+    -- Manual transmission with low/high range multipliers
+    -- X = Low Range (2.5x torque), Z = High Range (1.0x)
+    -- M1 = Upshift, M2 = Downshift, S = Reverse
+    TruckTransmission = {
+        Enabled = false,  -- Set to true to use
+        
+        -- Configuration
+        LowRangeKey = "X",            -- Key to toggle low range
+        HighRangeKey = "Z",           -- Key to toggle high range
+        LowRangeMultiplier = 2.5,     -- 2.5x torque in low range
+        HighRangeMultiplier = 1.0,    -- 1.0x (normal) in high range
+        CurrentRange = "High",        -- Start in high range
+        AutoBlipThrottle = true,
+        BlipAmount = 0.3,
+        ShiftDelay = 200,             -- Milliseconds between gear shifts
+        RangeChangeDelay = 500,       -- Milliseconds between range changes
+        LastShiftTime = 0,
+        LastRangeChangeTime = 0,
+        BaseRatios = nil,             -- Internal: stores base ratios
+        InputKeyFields = { "LowRangeKey", "HighRangeKey" },
+        
+        -- Auto-sync range to clients
+        SyncedState = { "CurrentRange", "Gear" },
+        
+        -- Wire outputs
+        WireOutputs = {
+            { name = "CurrentGear", source = "Gear", type = "normal" },
+            { name = "TransmissionRange", source = "RangeValue", type = "normal" },  -- 0=High, 1=Low
+        },
+        
+        -- Runtime
+        RangeValue = 0,  -- 0 = High range, 1 = Low range (for wire output)
+        Gear = 1,
+        
+        HandleCustomTransmission = function(state, config, inputs)
+            local addon = config.Addons.TruckTransmission
+            local now = timer.curtime() * 1000
+            
+            -- Initialize addon gear if not set
+            if not addon.Gear or addon.Gear == nil then
+                addon.Gear = 1
+            end
+            
+            -- Initialize state tracking on first run
+            if not state.LastM1 then state.LastM1 = false end
+            if not state.LastM2 then state.LastM2 = false end
+            if not state.LastS then state.LastS = false end
+            if not state.LastW then state.LastW = false end
+            if not state.InReverse then state.InReverse = false end
+            -- Use addon gear as the persistent gear value
+            if not state.Gear then state.Gear = addon.Gear end
+            
+            -- Store base ratios on first run
+            if not addon.BaseRatios then
+                addon.BaseRatios = {}
+                for i, ratio in ipairs(config.Gearbox_Ratios) do
+                    addon.BaseRatios[i] = ratio
+                end
+            end
+            
+            -- Range switching using core's key press tracking
+            local timeSinceRangeChange = now - (addon.LastRangeChangeTime or 0)
+            local canChangeRange = timeSinceRangeChange > addon.RangeChangeDelay
+
+            local keyLowPressed = inputs.KeyPressed and inputs.KeyPressed(addon.LowRangeKey) or false
+            local keyHighPressed = inputs.KeyPressed and inputs.KeyPressed(addon.HighRangeKey) or false
+
+            if keyLowPressed and canChangeRange then
+                addon.CurrentRange = "Low"
+                addon.RangeValue = 1
+                addon.LastRangeChangeTime = now
+            end
+
+            if keyHighPressed and canChangeRange then
+                addon.CurrentRange = "High"
+                addon.RangeValue = 0
+                addon.LastRangeChangeTime = now
+            end
+            
+            -- Apply range multiplier to all ratios
+            local rangeMultiplier = (addon.CurrentRange == "Low") and addon.LowRangeMultiplier or addon.HighRangeMultiplier
+            for i = 1, #addon.BaseRatios do
+                config.Gearbox_Ratios[i] = addon.BaseRatios[i] * rangeMultiplier
+            end
+            
+            -- Sequential shifting: M1 = Upshift, M2 = Downshift
+            local timeSinceShift = now - (addon.LastShiftTime or 0)
+            if timeSinceShift > addon.ShiftDelay then
+                state.Throttle_Delay = 0
+                state.Clutch_Delay = 0
+            end
+            local canShift = timeSinceShift > addon.ShiftDelay
+            
+            if inputs.Key_M1 and not state.LastM1 and canShift then
+                state.Gear = math.min(state.Gear + 1, #addon.BaseRatios)
+                addon.LastShiftTime = now
+                state.Throttle_Delay = 1
+                state.Clutch_Delay = 1
+            end
+            
+            if inputs.Key_M2 and not state.LastM2 and canShift then
+                state.Gear = math.max(state.Gear - 1, -1)
+                addon.LastShiftTime = now
+                
+                -- Auto-blip throttle on downshift
+                if addon.AutoBlipThrottle and state.Gear > 0 then
+                    state.ThrottleBlip = addon.BlipAmount
+                end
+                
+                state.Throttle_Delay = 1
+                state.Clutch_Delay = 1
+            end
+            
+            -- Reverse selection should NOT be bound to brake (S).
+            -- Use clutch (Alt) + M2 from 1st to enter reverse, and clutch (Alt) + M1 to exit.
+            local clutchHeld = inputs.Key_Alt
+            if inputs.Key_M2 and not state.LastM2 and clutchHeld and state.Gear == 1 and state.SpeedN <= 5 then
+                state.Gear = -1
+            elseif inputs.Key_M1 and not state.LastM1 and clutchHeld and state.Gear < 0 and state.SpeedN >= -5 then
+                state.Gear = 1
+            end
+            
+            -- Keep InReverse active based on gear, but make sure reverse throttle uses W (not S)
+            state.InReverse = (state.Gear < 0)
+            config.ReverseWSonReverse = true
+            
+            -- Track key presses
+            state.LastM1 = inputs.Key_M1
+            state.LastM2 = inputs.Key_M2
+            state.LastS = inputs.Key_S
+            state.LastW = inputs.Key_W
+
+            -- Sync addon gear for outputs/sync
+            addon.Gear = state.Gear
+        end
+    }
+}

@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Red Fox Engine v3 - Documentation</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+
+<body>
+    <nav class="sidebar">
+        <a href="index.html" class="logo">Red Fox Engine</a>
+
+        <div class="nav-group">
+            <div class="nav-header">Guide</div>
+            <a href="index.html" class="nav-link active">Overview</a>
+            <a href="index.html#getting-started" class="nav-link">Getting Started</a>
+        </div>
+
+        <div class="nav-group">
+            <div class="nav-header">Configuration</div>
+            <a href="#conf-engine" class="nav-link">1. Engine Specs</a>
+            <a href="#conf-trans" class="nav-link">2. Transmission</a>
+            <a href="#conf-tuning" class="nav-link">3. Trans. Tuning</a>
+            <a href="#conf-manual" class="nav-link">4. Manual Mode</a>
+            <a href="#conf-braking" class="nav-link">5. Braking</a>
+            <a href="#conf-physics" class="nav-link">6. Physics</a>
+            <a href="#conf-turbo" class="nav-link">7. Turbo</a>
+            <a href="#conf-sounds" class="nav-link">8. Sound Files</a>
+            <a href="#conf-soundparams" class="nav-link">9. Sound Tuning</a>
+            <a href="#conf-hologram" class="nav-link">10. Hologram</a>
+        </div>
+
+        <div class="nav-group">
+            <div class="nav-header">Reference</div>
+            <a href="api_reference.html" class="nav-link">API Reference</a>
+            <a href="examples.html" class="nav-link">Examples</a>
+        </div>
+    </nav>
+
+    <main class="main-content">
+        <h1>Red Fox Engine v3</h1>
+        <p class="lead">Complete Configuration Reference.</p>
+
+        <section id="getting-started">
+            <h2>Getting Started</h2>
+            <p>Use the following template for your main Starfall file:</p>
+            <pre><code>--@name Red Fox Engine v3 Car
+--@shared
+--@include red_fox_engine/simulated_engine_core_modular.txt
+
+dofile("red_fox_engine/simulated_engine_core_modular.txt")
+local Core = _G.RedFoxEngineCore
+
+local config = {
+    -- Paste variables from below here
+    Engine_Redline = 9000,
+    -- ...
+    Addons = {}
+}
+
+if CLIENT then Core.initClient(config) else Core.initServer(config) end</code></pre>
+        </section>
+
+        <section id="conf-engine">
+            <h2>1. Engine Specifications</h2>
+            <table class="param-table">
+                <tr>
+                    <th>Variable</th>
+                    <th>Default</th>
+                    <th>Description</th>
+                </tr>
+                <tr>
+                    <td><code>Engine_Bore</code></td>
+                    <td>87</td>
+                    <td>Cylinder bore (mm).</td>
+                </tr>
+                <tr>
+                    <td><code>Engine_Stroke</code></td>
+                    <td>84</td>
+                    <td>Piston stroke (mm).</td>
+                </tr>
+                <tr>
+                    <td><code>Engine_Cylinders</code></td>
+                    <td>4</td>
+                    <td>Number of cylinders.</td>
+                </tr>
+                <tr>
+                    <td><code>Engine_Airflow</code></td>
+                    <td>135</td>
+                    <td>Airflow (CFM). Used for torque calc if PeakTorque unset.</td>
+                </tr>
+                <tr>
+                    <td><code>Engine_Idle</code></td>
+                    <td>1200</td>
+                    <td>Target Idle RPM.</td>
+                </tr>
+                <tr>
+                    <td><code>Engine_IdleRev</code></td>
+                    <td>0.1</td>
+                    <td>Throttle nudge to maintain idle.</td>
+                </tr>
+                <tr>
+                    <td><code>Engine_RevLimiter</code></td>
+                    <td>1</td>
+                    <td>1 = Hard Cut, 0 = Soft/None.</td>
+                </tr>
+                <tr>
+                    <td><code>Engine_RevLimitRPM</code></td>
+                    <td>9000</td>
+                    <td>Exact RPM to trigger bouncing.</td>
+                </tr>
+                <tr>
+                    <td><code>Engine_RevLimitDrop</code></td>
+                    <td>250</td>
+                    <td>RPM to drop when hitting limiter.</td>
+                </tr>
+                <tr>
+                    <td><code>Engine_RevLimitDelay</code></td>
+                    <td>0.0</td>
+                    <td>Delay before throttle returns (ignition cut).</td>
+                </tr>
+                <tr>
+                    <td><code>Engine_Redline</code></td>
+                    <td>9000</td>
+                    <td>Max RPM.</td>
+                </tr>
+                <tr>
+                    <td><code>Engine_FlywheelMass</code></td>
+                    <td>8</td>
+                    <td>Inertia (kg). Higher = slower revs.</td>
+                </tr>
+                <tr>
+                    <td><code>Engine_Configuration</code></td>
+                    <td>0</td>
+                    <td>0 = Inline, 1 = VPhape (Affects sound/physics hint).</td>
+                </tr>
+                <tr>
+                    <td><code>Engine_TorqueTable</code></td>
+                    <td>{1.45, 2.56...}</td>
+                    <td>N-Point Bezier Control Table (0% to 100% Redline).</td>
+                </tr>
+                <tr>
+                    <td><code>TorqueMultiplier</code></td>
+                    <td>1</td>
+                    <td>Global final torque scalar.</td>
+                </tr>
+            </table>
+        </section>
+
+        <section id="conf-trans">
+            <h2>2. Transmission & Gearing</h2>
+            <table class="param-table">
+                <tr>
+                    <th>Variable</th>
+                    <th>Default</th>
+                    <th>Description</th>
+                </tr>
+                <tr>
+                    <td><code>Gearbox_Ratios</code></td>
+                    <td>{3.13...}</td>
+                    <td>Forward gear ratios.</td>
+                </tr>
+                <tr>
+                    <td><code>Gearbox_FinalDrive</code></td>
+                    <td>4.10</td>
+                    <td>Final drive ratio.</td>
+                </tr>
+                <tr>
+                    <td><code>ReverseGearRatios</code></td>
+                    <td>{-3.58, -2}</td>
+                    <td>Reverse gear ratios.</td>
+                </tr>
+                <tr>
+                    <td><code>Gearbox_Delay</code></td>
+                    <td>250</td>
+                    <td>Shift time (ms).</td>
+                </tr>
+                <tr>
+                    <td><code>Gearbox_ClutchSpeed</code></td>
+                    <td>1</td>
+                    <td>Clutch engagement speed scalar.</td>
+                </tr>
+                <tr>
+                    <td><code>WheelRPMToSpeed</code></td>
+                    <td>0.15</td>
+                    <td><b>CRITICAL:</b> Wheel RPM to KPH factor.</td>
+                </tr>
+                <tr>
+                    <td><code>PowerDistribution</code></td>
+                    <td>0</td>
+                    <td>0=RWD, 50=AWD, 100=FWD.</td>
+                </tr>
+                <tr>
+                    <td><code>GearSpeeds</code></td>
+                    <td>{29, 55...}</td>
+                    <td>Shift-points (KPH) if <code>UseRPMBasedGear=false</code>.</td>
+                </tr>
+                <tr>
+                    <td><code>ReverseGearSpeeds</code></td>
+                    <td>{15, 30}</td>
+                    <td>Reverse shift-points (KPH).</td>
+                </tr>
+            </table>
+        </section>
+
+        <section id="conf-tuning">
+            <h2>3. Transmission Tuning</h2>
+            <table class="param-table">
+                <tr>
+                    <th>Variable</th>
+                    <th>Default</th>
+                    <th>Description</th>
+                </tr>
+                <tr>
+                    <td><code>AutoGear</code></td>
+                    <td>true</td>
+                    <td>Enable automatic transmission.</td>
+                </tr>
+                <tr>
+                    <td><code>ClassicAuto</code></td>
+                    <td>false</td>
+                    <td>True = P/R/N/D Logic. False = Sequential R/N/1.</td>
+                </tr>
+                <tr>
+                    <td><code>UseRPMBasedGear</code></td>
+                    <td>true</td>
+                    <td><b>Recommended:</b> Use RPM thresholds for shifts.</td>
+                </tr>
+                <tr>
+                    <td><code>ImmediateReverseEngage</code></td>
+                    <td>true</td>
+                    <td>If true, allows R engagement without full stop.</td>
+                </tr>
+                <tr>
+                    <td><code>DriftSlipTolerance</code></td>
+                    <td>0.50</td>
+                    <td>Allowed slip % before holding gear.</td>
+                </tr>
+                <tr>
+                    <td><code>Min_Gear_Time</code></td>
+                    <td>250</td>
+                    <td>Min time (ms) in gear before shifting again.</td>
+                </tr>
+                <tr>
+                    <td><code>Min_Reverse_Gear_Time</code></td>
+                    <td>150</td>
+                    <td>Min time (ms) in reverse gear.</td>
+                </tr>
+                <tr>
+                    <td><code>SpeedToReverse</code></td>
+                    <td>5</td>
+                    <td>Max KPH to allow engaging reverse.</td>
+                </tr>
+                <tr>
+                    <td><code>ReverseWSonReverse</code></td>
+                    <td>true</td>
+                    <td>True: W=Back, S=Brake in R. False: S=Throttle.</td>
+                </tr>
+            </table>
+        </section>
+
+        <section id="conf-manual">
+            <h2>4. Manual & Shifting Mode</h2>
+            <table class="param-table">
+                <tr>
+                    <th>Variable</th>
+                    <th>Default</th>
+                    <th>Description</th>
+                </tr>
+                <tr>
+                    <td><code>ManualModeEnabled</code></td>
+                    <td>true</td>
+                    <td>Allow key toggle for manual.</td>
+                </tr>
+                <tr>
+                    <td><code>ManualModeKey</code></td>
+                    <td>"n"</td>
+                    <td>Toggle key.</td>
+                </tr>
+                <tr>
+                    <td><code>AlwaysSportMode</code></td>
+                    <td>false</td>
+                    <td>Force aggressive shifts always.</td>
+                </tr>
+                <tr>
+                    <td><code>UseComfortSportMode</code></td>
+                    <td>true</td>
+                    <td>Toggle shift points based on Mode.</td>
+                </tr>
+                <tr>
+                    <td><code>ComfortSportModeKey</code></td>
+                    <td>"m"</td>
+                    <td>Key to toggle Sport Mode.</td>
+                </tr>
+                <tr>
+                    <td><code>ComfortUpshiftRPM</code></td>
+                    <td>45</td>
+                    <td>% Redline upsift (Comfort).</td>
+                </tr>
+                <tr>
+                    <td><code>ComfortDownshiftRPM</code></td>
+                    <td>25</td>
+                    <td>% Redline downshift (Comfort).</td>
+                </tr>
+                <tr>
+                    <td><code>SportUpshiftRPM</code></td>
+                    <td>90</td>
+                    <td>% Redline upsift (Sport).</td>
+                </tr>
+                <tr>
+                    <td><code>SportDownshiftRPM</code></td>
+                    <td>55</td>
+                    <td>% Redline downshift (Sport).</td>
+                </tr>
+                <tr>
+                    <td><code>DownshiftCooldown</code></td>
+                    <td>0.35</td>
+                    <td>Seconds between downshifts.</td>
+                </tr>
+                <tr>
+                    <td><code>UseClutchLerpInManual</code></td>
+                    <td>true</td>
+                    <td>Smooth clutch in manual?</td>
+                </tr>
+                <tr>
+                    <td><code>ClutchLerp</code></td>
+                    <td>0.4</td>
+                    <td>Clutch smoothing factor.</td>
+                </tr>
+                <tr>
+                    <td><code>ClutchLerpReverse</code></td>
+                    <td>0.5</td>
+                    <td>Clutch smoothing factor (Reverse).</td>
+                </tr>
+            </table>
+        </section>
+
+        <section id="conf-braking">
+            <h2>5. Braking Physics (Phased)</h2>
+            <table class="param-table">
+                <tr>
+                    <th>Variable</th>
+                    <th>Default</th>
+                    <th>Description</th>
+                </tr>
+                <tr>
+                    <td><code>BrakeMult</code></td>
+                    <td>2.25</td>
+                    <td>Global brake force multiplier.</td>
+                </tr>
+                <tr>
+                    <td><code>HandbrakePowerMult</code></td>
+                    <td>3</td>
+                    <td>Handbrake force multiplier.</td>
+                </tr>
+                <tr>
+                    <td><code>StoppedBrakeMult</code></td>
+                    <td>3</td>
+                    <td>Parking brake force.</td>
+                </tr>
+                <tr>
+                    <td><code>StoppedPhaseBrakeSpeed</code></td>
+                    <td>5</td>
+                    <td>Speed (KPH) considered "Stopped".</td>
+                </tr>
+                <tr>
+                    <td><code>FirstPhaseBrakeSpeed</code></td>
+                    <td>10</td>
+                    <td>Start of Phase 1 (Low Speed).</td>
+                </tr>
+                <tr>
+                    <td><code>FirstPhaseBrakeF/R</code></td>
+                    <td>0.9 / 0.7</td>
+                    <td>Phase 1 Brake Force (Front/Rear).</td>
+                </tr>
+                <tr>
+                    <td><code>SecondPhaseBrakeSpeed</code></td>
+                    <td>40</td>
+                    <td>Start of Phase 2 (Medium Speed).</td>
+                </tr>
+                <tr>
+                    <td><code>SecondPhaseBrakeF/R</code></td>
+                    <td>0.4 / 0.15</td>
+                    <td>Phase 2 Brake Force (Front/Rear).</td>
+                </tr>
+                <tr>
+                    <td><code>ThirdPhaseBrakeSpeed</code></td>
+                    <td>100</td>
+                    <td>Start of Phase 3 (High Speed).</td>
+                </tr>
+                <tr>
+                    <td><code>ThirdPhaseBrakeF/R</code></td>
+                    <td>0.3 / 0.05</td>
+                    <td>Phase 3 Brake Force (Front/Rear).</td>
+                </tr>
+            </table>
+        </section>
+
+        <section id="conf-physics">
+            <h2>6. Physics & Orientation</h2>
+            <table class="param-table">
+                <tr>
+                    <th>Variable</th>
+                    <th>Default</th>
+                    <th>Description</th>
+                </tr>
+                <tr>
+                    <td><code>UpdateRate</code></td>
+                    <td>66</td>
+                    <td>Calculation Rate (Hz).</td>
+                </tr>
+                <tr>
+                    <td><code>ForceMult</code></td>
+                    <td>0.015</td>
+                    <td><b>Master Physics Scalar.</b></td>
+                </tr>
+                <tr>
+                    <td><code>TorqueInvert</code></td>
+                    <td>true</td>
+                    <td>Invert torque application?</td>
+                </tr>
+                <tr>
+                    <td><code>EngineAxis</code></td>
+                    <td>Vector(0,0,1)</td>
+                    <td>Engine "Up" Axis.</td>
+                </tr>
+                <tr>
+                    <td><code>ChassisFeedDirectionAxis</code></td>
+                    <td>Vector(1,0,0)</td>
+                    <td>Movement "Forward" Axis.</td>
+                </tr>
+                <tr>
+                    <td><code>ChassisFeedForwardAxis</code></td>
+                    <td>Vector(0,0,1)</td>
+                    <td>Movement "Up" Axis.</td>
+                </tr>
+                <tr>
+                    <td><code>ChassisAccFeedMult</code></td>
+                    <td>-6.5</td>
+                    <td>Frame pitch reaction force.</td>
+                </tr>
+                <tr>
+                    <td><code>BrakeFeedBMult</code></td>
+                    <td>2</td>
+                    <td>Brake pitch reaction force.</td>
+                </tr>
+                <tr>
+                    <td><code>DebugAxes</code></td>
+                    <td>false</td>
+                    <td>Show alignment axes.</td>
+                </tr>
+                <tr>
+                    <td><code>DebugAxisLength</code></td>
+                    <td>50</td>
+                    <td>Visual length of axes.</td>
+                </tr>
+                <tr>
+                    <td><code>DebugAxisShowWheels</code></td>
+                    <td>false</td>
+                    <td>Show wheel vectors.</td>
+                </tr>
+            </table>
+        </section>
+
+        <section id="conf-turbo">
+            <h2>7. Turbo Tuning</h2>
+            <table class="param-table">
+                <tr>
+                    <th>Variable</th>
+                    <th>Default</th>
+                    <th>Description</th>
+                </tr>
+                <tr>
+                    <td><code>Turbo</code></td>
+                    <td>false</td>
+                    <td>Enable Turbo?</td>
+                </tr>
+                <tr>
+                    <td><code>Turbo_PSIMax</code></td>
+                    <td>6</td>
+                    <td>Max Boost (PSI).</td>
+                </tr>
+                <tr>
+                    <td><code>Turbo_AirPressure</code></td>
+                    <td>18.4</td>
+                    <td>Atmospheric Pressure Base.</td>
+                </tr>
+                <tr>
+                    <td><code>Turbo_MaxRPM</code></td>
+                    <td>9000</td>
+                    <td>Turbo Spool Max RPM.</td>
+                </tr>
+                <tr>
+                    <td><code>Turbo_MaxFlow</code></td>
+                    <td>9000</td>
+                    <td>Max Flow (CFM).</td>
+                </tr>
+                <tr>
+                    <td><code>Turbo_FlowScale</code></td>
+                    <td>100</td>
+                    <td>Spool Rate.</td>
+                </tr>
+                <tr>
+                    <td><code>Turbo_DragScale</code></td>
+                    <td>0.01</td>
+                    <td>Spool Resistance.</td>
+                </tr>
+                <tr>
+                    <td><code>Turbo_Inertia</code></td>
+                    <td>0.035</td>
+                    <td>Spool Inertia.</td>
+                </tr>
+                <tr>
+                    <td><code>Turbo_Exp</code></td>
+                    <td>1</td>
+                    <td>Boost Curve Exponent.</td>
+                </tr>
+            </table>
+        </section>
+
+        <section id="conf-sounds">
+            <h2>8. Sound Files</h2>
+            <p>Paths to sound files (WAV/MP3).</p>
+            <pre><code>Sounds = {
+    Engine_SoundOn = "path/to/on_loop.wav",
+    Engine_SoundOff = "path/to/off_loop.wav",
+    TurboSound = "...",
+    TurboBOV = "...",
+    GearChange = "...",
+    Starter = "...",
+    Bell = "..."
+}</code></pre>
+        </section>
+
+        <section id="conf-soundparams">
+            <h2>9. Sound Tuning (Advanced)</h2>
+            <p>Fine-tune how engine pitch/volume reacts to RPM.</p>
+            <h3>Engine Loop</h3>
+            <table class="param-table">
+                <tr>
+                    <th>Variable</th>
+                    <th>Default</th>
+                    <th>Description</th>
+                </tr>
+                <tr>
+                    <td><code>Engine_SoundOnDiv</code></td>
+                    <td>4000</td>
+                    <td>Pitch = RPM / Div.</td>
+                </tr>
+                <tr>
+                    <td><code>Engine_SoundOnPitchMult</code></td>
+                    <td>1</td>
+                    <td>Pitch Scalar.</td>
+                </tr>
+                <tr>
+                    <td><code>Engine_SoundOnVolume</code></td>
+                    <td>1</td>
+                    <td>Max Volume.</td>
+                </tr>
+                <tr>
+                    <td><code>Engine_SoundOffDiv</code></td>
+                    <td>3500</td>
+                    <td>Coast Pitch Divisor.</td>
+                </tr>
+                <tr>
+                    <td><code>Engine_SoundOffVolume</code></td>
+                    <td>0.5</td>
+                    <td>Coast Volume.</td>
+                </tr>
+                <tr>
+                    <td><code>Engine_SoundBlendRate</code></td>
+                    <td>8</td>
+                    <td>Crossfade Speed.</td>
+                </tr>
+                <tr>
+                    <td><code>Engine_SoundThrottleExponent</code></td>
+                    <td>1.2</td>
+                    <td>Response Curve.</td>
+                </tr>
+                <tr>
+                    <td><code>Engine_SoundOnRPMStart</code></td>
+                    <td>300</td>
+                    <td>RPM where On Sound starts.</td>
+                </tr>
+            </table>
+
+            <h3>Turbo & Effects</h3>
+            <table class="param-table">
+                <tr>
+                    <th>Variable</th>
+                    <th>Default</th>
+                    <th>Description</th>
+                </tr>
+                <tr>
+                    <td><code>TurboPitch/Volume</code></td>
+                    <td>1</td>
+                    <td>Turbo Whine scalars.</td>
+                </tr>
+                <tr>
+                    <td><code>TurboBOVPitch/Volume</code></td>
+                    <td>1</td>
+                    <td>Blow-off valve scalars.</td>
+                </tr>
+                <tr>
+                    <td><code>BellPitch/Volume</code></td>
+                    <td>1/0.5</td>
+                    <td>Ignition Chime scalars.</td>
+                </tr>
+                <tr>
+                    <td><code>StarterPitch/Volume</code></td>
+                    <td>1/0.75</td>
+                    <td>Starter Motor scalars.</td>
+                </tr>
+            </table>
+        </section>
+
+        <section id="conf-hologram">
+            <h2>10. Info Hologram</h2>
+            <pre><code>InfoGUI = {
+    Scale = 6,          -- Scale
+    Distance = 200,     -- Max View Dist
+    ViewAngleDot = 0.99,-- View Cone
+    Offset = Vector(0,0,30), -- Pos
+    AngleOffset = Angle(0,0,0)
+}</code></pre>
+        </section>
+    </main>
+    <script src="js/main.js"></script>
+</body>
+
+</html>
