@@ -5,6 +5,14 @@ local Core = {}
 _G.RedFoxEngineCore = Core
 local Version = "3.01" -- v3 Alpha
 
+--[[
+Changelog:
+
+V3.01
+Initial public version
+
+]]--
+
 -- Math Helpers
 local function clamp(val, min, max) return math.clamp(val, min, max) end
 local function round(val, decimals) return math.round(val, decimals) end
@@ -2203,11 +2211,18 @@ if CLIENT then
         -- Version Check Logic
         local function checkVersionOnSpawn(cfg)
             if not cfg.AllowCheckVersion then return end
-            -- GitHub raw URL for the main simulated_engine_core_modular.txt
-            local githubURL = "https://raw.github.com/nokillnando/Starfall/main/red_fox_engine/simulated_engine_core_modular.txt"
-            local localVersion = Version
+
+            local function parseVersions(localVer, remoteVer)
+                local rP = string.explode(".", remoteVer)
+                local lP = string.explode(".", localVer)
+                local rM = tonumber(rP[1]) or 0
+                local rm = tonumber(rP[2]) or 0
+                local lM = tonumber(lP[1]) or 0
+                local lm = tonumber(lP[2]) or 0
+                return (rM > lM) or (rM == lM and rm > lm)
+            end
+
             local maxRetries = 10
-    
             local function doVersionCheck()
                 if not http.canRequest() then
                     maxRetries = maxRetries - 1
@@ -2216,54 +2231,84 @@ if CLIENT then
                     return
                 end
     
-                http.get(githubURL,
-                    function(data)
-                        if not (data and data ~= "") then
-                            if cfg.AllowCheckVersion then
-                                print(Color(255,255,255), "Red Fox Engine version check failed - no data received")
+                local coreDone = false
+                local configDone = not cfg.ConfigVersion
+                local coreUpToDate = true
+                local configUpToDate = true
+                local remoteCoreVer = ""
+                local remoteConfigVer = ""
+                
+                local function evalResults()
+                    if coreDone and configDone then
+                         if coreUpToDate and configUpToDate then
+                             if cfg.ConfigVersion then
+                                 print(Color(255,255,255), "Red Fox Engine is up to date! (Core: ", Color(0,255,0), Version, Color(255,255,255), ", Config: ", Color(0,255,0), cfg.ConfigVersion, Color(255,255,255), ")")
+                             else
+                                 print(Color(255,255,255), "Red Fox Core is up to date! Version: ", Color(0,255,0), Version)
+                             end
+                         else
+                             if not coreUpToDate then
+                                 print(Color(255,255,255), "Red Fox Core Update available! Local: ", Color(255,0,0), Version, Color(255,255,255), " | Remote: ", Color(0,255,0), remoteCoreVer)
+                             elseif cfg.ConfigVersion then
+                                 print(Color(255,255,255), "Red Fox Core is up to date! Version: ", Color(0,255,0), Version)
+                             end
+                             
+                             if cfg.ConfigVersion then
+                                 if not configUpToDate then
+                                     print(Color(255,255,255), "Red Fox Config Update available! Local: ", Color(255,0,0), cfg.ConfigVersion, Color(255,255,255), " | Remote: ", Color(0,255,0), remoteConfigVer)
+                                 else
+                                     print(Color(255,255,255), "Red Fox Config is up to date! Version: ", Color(0,255,0), cfg.ConfigVersion)
+                                 end
+                             end
+                         end
+                    end
+                end
+
+                -- Check Core module
+                local coreURL = "https://raw.github.com/nokillnando/Starfall/main/red_fox_engine/simulated_engine_core_modular.txt"
+                http.get(coreURL, function(data)
+                    if data and data ~= "" then
+                        local startIdx = data:find('local Version = "')
+                        if startIdx then
+                            local endIdx = data:find('"', startIdx + 17)
+                            if endIdx then
+                                remoteCoreVer = data:sub(startIdx + 17, endIdx - 1)
+                                if parseVersions(Version, remoteCoreVer) then
+                                    coreUpToDate = false
+                                end
                             end
-                            return
-                        end
-    
-                        local versionStart = data:find('local Version = "')
-                        if not versionStart then
-                            if cfg.AllowCheckVersion then
-                                print(Color(255,255,255), "Red Fox Engine version check failed - version string not found")
-                            end
-                            return
-                        end
-    
-                        versionStart = versionStart + 17
-                        local versionEnd = data:find('"', versionStart)
-                        if not versionEnd or versionEnd <= versionStart then
-                            if cfg.AllowCheckVersion then
-                                print(Color(255,255,255), "Red Fox Engine version check failed - could not parse remote version")
-                            end
-                            return
-                        end
-    
-                        local remoteVersion = data:sub(versionStart, versionEnd - 1)
-                        local remoteParts = string.explode(".", remoteVersion)
-                        local localParts = string.explode(".", localVersion)
-    
-                        local remoteMajor = tonumber(remoteParts[1]) or 0
-                        local remoteMinor = tonumber(remoteParts[2]) or 0
-                        local localMajor = tonumber(localParts[1]) or 0
-                        local localMinor = tonumber(localParts[2]) or 0
-    
-                        if remoteMajor > localMajor or (remoteMajor == localMajor and remoteMinor > localMinor) then
-                            print(Color(255,255,255), "Check config file for updated default variables")
-                            print(Color(255,255,255), "Red Fox Engine Update available! Local: ", Color(0,255,0), localVersion, Color(255,255,255), " | Remote: ", Color(0,255,0), remoteVersion)
-                        else
-                            print(Color(255,255,255), "Local Red Fox Engine is up to date! Version: ", Color(0,255,0), localVersion)
-                        end
-                    end,
-                    function(err)
-                        if cfg.AllowCheckVersion then
-                            print(Color(255,255,255), "Red Fox Engine version check failed - could not connect to remote: ", Color(255,0,0), err)
                         end
                     end
-                )
+                    coreDone = true
+                    evalResults()
+                end, function() 
+                    coreDone = true
+                    evalResults()
+                end)
+
+                -- Check Config template
+                if cfg.ConfigVersion then
+                    local configURL = "https://raw.github.com/nokillnando/Starfall/main/red_fox_engine/red_fox_engine_config_modular.txt"
+                    http.get(configURL, function(data)
+                        if data and data ~= "" then
+                            local startIdx = data:find('ConfigVersion = "')
+                            if startIdx then
+                                local endIdx = data:find('"', startIdx + 17)
+                                if endIdx then
+                                    remoteConfigVer = data:sub(startIdx + 17, endIdx - 1)
+                                    if parseVersions(cfg.ConfigVersion, remoteConfigVer) then
+                                        configUpToDate = false
+                                    end
+                                end
+                            end
+                        end
+                        configDone = true
+                        evalResults()
+                    end, function() 
+                        configDone = true
+                        evalResults()
+                    end)
+                end
             end
             timer.simple(1, doVersionCheck)
         end
