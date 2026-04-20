@@ -27,7 +27,6 @@ local config = {
     TorqueMultiplier = 1, -- Multiplier for torque output (affects physics + torque display, but NOT HP calculation)
     Engine_FlywheelMass = 8,
     Engine_Configuration = 0, -- 0 = Inline, 1 = V
-    Engine_Redline = 9000,
     
     -- Transmission
     Gearbox_Ratios = {
