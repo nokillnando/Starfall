@@ -1,0 +1,1334 @@
+--@name Skidmark Core
+--@author [C17] Red Fox
+--@shared
+
+local Version = "1.00"
+
+-- Skidmark Core - Pure logic and rendering, no configuration
+local SkidmarkCore = {}
+_G.SkidmarkCore = SkidmarkCore
+
+-- ============================================================================
+-- SHARED REFERENCE DATA
+-- ============================================================================
+SkidmarkCore.WheelData = {}
+SkidmarkCore.Config = {}
+
+-- ============================================================================
+-- CLIENT: Rendering & Detection
+-- ============================================================================
+if CLIENT then
+    -- Version Check Logic
+    local function checkVersionOnSpawn()
+        if not SkidmarkCore.Config.AllowCheckVersion then return end
+        local githubURL = "https://raw.github.com/nokillnando/Starfall/main/skidmark_system/skidmark_core.txt"
+        local localVersion = Version
+        local maxRetries = 10
+
+        local function doVersionCheck()
+            if not http.canRequest() then
+                maxRetries = maxRetries - 1
+                if maxRetries <= 0 then return end
+                timer.simple(0.5, doVersionCheck)
+                return
+            end
+
+            http.get(githubURL,
+                function(data)
+                    if not (data and data ~= "") then
+                        if SkidmarkCore.Config.AllowCheckVersion then
+                            print(Color(255, 255, 255), "Skidmark Core version check failed - no data received")
+                        end
+                        return
+                    end
+
+                    local versionStart = data:find('Version = "')
+                    if not versionStart then
+                        if SkidmarkCore.Config.AllowCheckVersion then
+                            print(Color(255, 255, 255), "Skidmark Core version check failed - version string not found")
+                        end
+                        return
+                    end
+
+                    versionStart = versionStart + 11
+                    local versionEnd = data:find('"', versionStart)
+                    if not versionEnd or versionEnd <= versionStart then
+                        if SkidmarkCore.Config.AllowCheckVersion then
+                            print(Color(255, 255, 255), "Skidmark Core version check failed - could not parse remote version")
+                        end
+                        return
+                    end
+
+                    local remoteVersion = data:sub(versionStart, versionEnd - 1)
+                    local remoteParts = string.explode(".", remoteVersion)
+                    local localParts = string.explode(".", localVersion)
+
+                    local remoteMajor = tonumber(remoteParts[1]) or 0
+                    local remoteMinor = tonumber(remoteParts[2]) or 0
+                    local localMajor = tonumber(localParts[1]) or 0
+                    local localMinor = tonumber(localParts[2]) or 0
+
+                    if remoteMajor > localMajor or (remoteMajor == localMajor and remoteMinor > localMinor) then
+                        print(Color(255, 255, 255), "Skidmark Core Update available! Local: ", Color(0, 255, 0), localVersion, Color(255, 255, 255), " | Remote: ", Color(0, 255, 0), remoteVersion)
+                    else
+                        print(Color(255, 255, 255), "Local Skidmark Core is up to date! Version: ", Color(0, 255, 0), localVersion)
+                    end
+                end,
+                function(err)
+                    if SkidmarkCore.Config.AllowCheckVersion then
+                        print(Color(255, 255, 255), "Skidmark Core version check failed - could not connect to remote: ", Color(255, 0, 0), err)
+                    end
+                end
+            )
+        end
+        timer.simple(1, doVersionCheck)
+    end
+
+    timer.simple(1, checkVersionOnSpawn)
+
+    -- Network storage for wheel/chassis data
+    local NetworkedWheels = {}
+    local NetworkedBase = nil
+    local NetworkedWheelState = {}
+    local NetworkedFilterEntities = {} -- Entities to exclude from traces (vehicle body, constraints, extras)
+    
+    local Materials = {}
+    local HologramPool = {}
+    local ActiveQuads = {}
+    local MaterialUsesCustomTexture = {}
+    local ForwardSlipHistory = {}
+    
+    local function getQuadLimit()
+        return math.min(
+            SkidmarkCore.Config.MaxQuads or 128,
+            SkidmarkCore.Config.HologramLimit or 180
+        )
+    end
+    
+    -- ========================================
+    -- NETWORKING: Receive wheel/base from server
+    -- ========================================
+    net.receive("skidmark_sendWheels", function()
+        local hasBase = net.readBool()
+        if hasBase then
+            NetworkedBase = net.readEntity()
+        end
+        
+        local wheelCount = net.readUInt(32)
+        NetworkedWheels = {}
+        for i = 1, wheelCount do
+            local wheel = net.readEntity()
+            local axle = net.readUInt(2)
+            if isValid(wheel) then
+                table.insert(NetworkedWheels, {
+                    ent = wheel,
+                    axle = axle == 1 and "front" or "rear"
+                })
+            end
+        end
+        -- Read filter entities (vehicle body, constraints, extras)
+        local filterCount = net.readUInt(16)
+        NetworkedFilterEntities = {}
+        for i = 1, filterCount do
+            local ent = net.readEntity()
+            if isValid(ent) then
+                table.insert(NetworkedFilterEntities, ent)
+            end
+        end
+    end)
+    
+    net.receive("skidmark_sendWheelState", function()
+        local count = net.readUInt(32)
+        NetworkedWheelState = {}
+        for i = 1, count do
+            local idx = net.readUInt(16)
+            NetworkedWheelState[idx] = {
+                vel = net.readVector(),
+                angVel = net.readFloat()
+            }
+        end
+    end)
+    
+    local function buildMaterialCacheKey(sCfg, axle)
+        local matCfg = SkidmarkCore.Config.MaterialConfig or {}
+        local useModTexture = sCfg and sCfg.UseModTexture
+        if useModTexture == nil then
+            useModTexture = matCfg.UseModTexture
+        end
+        local shader = (sCfg and sCfg.Shader) or matCfg.Shader or "VertexLitGeneric"
+        local materialPath = (sCfg and sCfg.Material) or matCfg.Material or ""
+        local baseTexture
+        if axle == "front" then
+            baseTexture = (sCfg and sCfg.FrontTexture) or matCfg.FrontTexture or (sCfg and sCfg.Texture) or matCfg.Texture or "vgui/white"
+        elseif axle == "rear" then
+            baseTexture = (sCfg and sCfg.RearTexture) or matCfg.RearTexture or (sCfg and sCfg.Texture) or matCfg.Texture or "vgui/white"
+        else
+            baseTexture = (sCfg and sCfg.Texture) or matCfg.Texture or "vgui/white"
+        end
+        local alphaTest = tostring((sCfg and sCfg.AlphaTest) or matCfg.AlphaTest or false)
+        local alphaRef = tostring((sCfg and sCfg.AlphaTestReference) or matCfg.AlphaTestReference or "")
+        local scaleU = tostring((sCfg and sCfg.TextureScaleU) or matCfg.TextureScaleU or 1)
+        local scaleV = tostring((sCfg and sCfg.TextureScaleV) or matCfg.TextureScaleV or 1)
+        local tint = tostring((sCfg and sCfg.TintTexture) or matCfg.TintTexture or false)
+
+        return table.concat({
+            tostring(useModTexture),
+            axle or "generic",
+            shader,
+            materialPath,
+            baseTexture,
+            alphaTest,
+            alphaRef,
+            scaleU,
+            scaleV,
+            tint
+        }, "|"), baseTexture, materialPath, shader, useModTexture
+    end
+
+    local function loadMaterial(surfaceId, sCfg, axle)
+        local cacheKey, baseTexture, materialPath, shader, useModTexture = buildMaterialCacheKey(sCfg, axle)
+        if Materials[cacheKey] then
+            MaterialUsesCustomTexture[surfaceId] = MaterialUsesCustomTexture[cacheKey]
+            return Materials[cacheKey]
+        end
+
+        local matCfg = SkidmarkCore.Config.MaterialConfig or {}
+        local sourceMaterial = nil
+        
+        if useModTexture == false and materialPath ~= "" then
+            Materials[cacheKey] = material.load(materialPath)
+            MaterialUsesCustomTexture[cacheKey] = false
+            MaterialUsesCustomTexture[surfaceId] = false
+            return Materials[cacheKey]
+        end
+        
+        local mat = material.create(shader)
+        mat:setInt("$model", 1)
+        mat:setInt("$ignorez", 0)
+        mat:setInt("$vertexcolor", 1)
+        mat:setInt("$vertexalpha", 1)
+        mat:setInt("$translucent", 1)
+        mat:setInt("$alphatest", (sCfg and sCfg.AlphaTest) or matCfg.AlphaTest and 1 or 0)
+        if (sCfg and sCfg.AlphaTestReference) or matCfg.AlphaTestReference then
+            mat:setFloat("$alphatestreference", (sCfg and sCfg.AlphaTestReference) or matCfg.AlphaTestReference)
+        end
+        
+        if string.find(baseTexture, "https://", 1, true) or string.find(baseTexture, "http://", 1, true) then
+            mat:setTexture("$basetexture", "vgui/white")
+            mat:setTextureURL("$basetexture", baseTexture, function(_, _, w, h, layout)
+                if not w or not h then
+                    print("[SKD-MAT] Failed to load texture URL: " .. baseTexture)
+                    return
+                end
+                local sx, sy = 1024 / w, 1024 / h
+                layout(0, 0, w * sx, h * sy)
+                print("[SKD-MAT] Loaded texture URL: " .. baseTexture .. " (" .. w .. "x" .. h .. ")")
+            end)
+            MaterialUsesCustomTexture[cacheKey] = true
+            MaterialUsesCustomTexture[surfaceId] = true
+        else
+            sourceMaterial = material.load(baseTexture)
+            if sourceMaterial and sourceMaterial.getTexture and sourceMaterial:getTexture("$basetexture") then
+                mat:setTexture("$basetexture", sourceMaterial:getTexture("$basetexture"))
+                MaterialUsesCustomTexture[cacheKey] = false
+                MaterialUsesCustomTexture[surfaceId] = false
+            else
+                mat:setTexture("$basetexture", baseTexture)
+                MaterialUsesCustomTexture[cacheKey] = true
+                MaterialUsesCustomTexture[surfaceId] = true
+            end
+        end
+        
+        local texMatrix = Matrix()
+        texMatrix:setScale(Vector(
+            (sCfg and sCfg.TextureScaleU) or matCfg.TextureScaleU or 1,
+            (sCfg and sCfg.TextureScaleV) or matCfg.TextureScaleV or 1,
+            1
+        ))
+        mat:setMatrix("$basetexturetransform", texMatrix)
+        
+        Materials[cacheKey] = mat
+        return mat
+    end
+    
+    local function shouldTintTexture(sCfg)
+        local matCfg = SkidmarkCore.Config.MaterialConfig or {}
+        if sCfg and sCfg.TintTexture ~= nil then return sCfg.TintTexture end
+        if matCfg.TintTexture ~= nil then return matCfg.TintTexture end
+        return false
+    end
+
+    local function isDebugEnabled()
+        return SkidmarkCore.Config.EnableDebug == true
+    end
+    
+    local function mapSegmentUV(u, v, sCfg)
+        local matCfg = SkidmarkCore.Config.MaterialConfig or {}
+        local rot = ((sCfg and sCfg.TextureRotationDeg) or matCfg.TextureRotationDeg or 0) % 360
+        if rot < 0 then rot = rot + 360 end
+        
+        local outU, outV = u, v
+        
+        if rot == 90 then
+            outU, outV = v, 1 - u
+        elseif rot == 180 then
+            outU, outV = 1 - u, 1 - v
+        elseif rot == 270 then
+            outU, outV = 1 - v, u
+        end
+        
+        if (sCfg and sCfg.FlipTextureU) or matCfg.FlipTextureU then
+            outU = 1 - outU
+        end
+        if (sCfg and sCfg.FlipTextureV) or matCfg.FlipTextureV then
+            outV = 1 - outV
+        end
+        
+        return outU, outV
+    end
+    
+    local function getSpinAxisSpeed(wheelState, wheel, axle, radius)
+        if not wheelState then return 0 end
+        local spinDeg = wheelState.angVel or 0
+        if math.abs(spinDeg) < (SkidmarkCore.Config.SpinSpeedDeadzone or 8) then
+            return 0
+        end
+        return radius * 2 * math.pi / 360 * spinDeg
+    end
+
+    local function resolveWheelAxle(wheelInfo, chassis)
+        local axle = wheelInfo.axle or "generic"
+        if axle ~= "generic" then return axle end
+        if SkidmarkCore.Config.AutoClassifyAxles == false or not isValid(chassis) then
+            return axle
+        end
+
+        local wheel = wheelInfo.ent or wheelInfo
+        if not isValid(wheel) then return axle end
+
+        local rel = wheel:getPos() - chassis:getPos()
+        local forwardDot = rel:dot(chassis:getForward())
+        return forwardDot >= 0 and "front" or "rear"
+    end
+
+    local function buildAxleSpinState(wheels, chassis)
+        local axleState = {
+            front = { spinSum = 0, count = 0 },
+            rear = { spinSum = 0, count = 0 },
+            generic = { spinSum = 0, count = 0 }
+        }
+
+        for _, wheelInfo in ipairs(wheels or {}) do
+            local wheel = wheelInfo.ent or wheelInfo
+            local axle = wheelInfo.axle or "front"
+            if not isValid(wheel) then continue end
+
+            local wheelState = NetworkedWheelState[wheel:entIndex()]
+            if not wheelState then continue end
+
+            local radius = (wheel:obbSize().z * 0.5) or 10
+            local spinSpeed = getSpinAxisSpeed(wheelState, wheel, axle, radius)
+            axleState[axle] = axleState[axle] or { spinSum = 0, count = 0 }
+            axleState[axle].spinSum = axleState[axle].spinSum + math.abs(spinSpeed)
+            axleState[axle].count = axleState[axle].count + 1
+        end
+
+        return axleState
+    end
+
+    -- Calculation: detect if wheel is skidding based on slip
+    local function calcSkidData(wheel, chassis, radius, sCfg, trNormal, axle, axleSpinState)
+        if not isValid(wheel) or not isValid(chassis) then
+            return {
+                total = 0,
+                side = 0,
+                forward = 0,
+                roll = 0
+            }
+        end
+        
+        local wheelState = NetworkedWheelState[wheel:entIndex()]
+        local wheelVel = wheelState and wheelState.vel or wheel:getVelocity()
+        local sampleVel = wheelVel
+        local wheelSpeed = sampleVel:getLength()
+        
+        if wheelSpeed < -100 then
+            return {
+                total = 0,
+                side = 0,
+                forward = 0,
+                roll = 0
+            }
+        end
+        local wheelFwd = chassis:getForward()
+        local normal = trNormal or Vector(0, 0, 1)
+        local groundFwd = (wheelFwd - normal * wheelFwd:dot(normal)):getNormalized()
+        local groundRight = normal:cross(groundFwd):getNormalized()
+        
+        if groundFwd:getLength() < 0.001 or groundRight:getLength() < 0.001 then
+            return {
+                total = 0,
+                side = 0,
+                forward = 0,
+                roll = 0,
+                forwardDir = nil
+            }
+        end
+        
+        -- Remove motion into the ground so contact patch velocity is measured on the surface plane.
+        sampleVel = sampleVel - normal * sampleVel:dot(normal)
+        
+        local localVel = Vector(
+            sampleVel:dot(groundFwd),
+            sampleVel:dot(groundRight),
+            0
+        )
+        
+        -- Forward speed is still derived from the wheel physically so burnouts and lockers track independent wheel contacts
+        local forwardSpeed = math.abs(localVel.x)
+        
+        -- For lateral slip, we explicitly track the CHASSIS drift angle instead of the individual wheel.
+        -- Using the chassis completely solves "lane change false positives", "steering constraint flopping", 
+        -- and "inner arc geometric tracking" which falsely make front wheels screech during clean 20mph turns.
+        local chassisVel = chassis:getVelocity()
+        chassisVel = chassisVel - normal * chassisVel:dot(normal)
+        local chLocal = Vector( chassisVel:dot(groundFwd), chassisVel:dot(groundRight), 0 )
+        local lateralSlipVelocity = math.abs(chLocal.y)
+        
+        local brakeFactor = 0
+
+        do
+            local wheelId = wheel:entIndex()
+            local now = timer.curtime()
+            local prev = ForwardSlipHistory[wheelId]
+            if prev then
+                local dt = math.max(now - (prev.time or now), 0.001)
+                local decel = math.max((prev.forwardSpeed or forwardSpeed) - forwardSpeed, 0) / dt
+                brakeFactor = math.clamp(
+                    (decel - (SkidmarkCore.Config.BrakeDecelDeadzone or 80)) /
+                    (SkidmarkCore.Config.BrakeDecelRange or 320),
+                    0,
+                    1
+                )
+            end
+            ForwardSlipHistory[wheelId] = {
+                time = now,
+                forwardSpeed = forwardSpeed
+            }
+        end
+
+        local rotSpeed = 0
+        local wheelRotSpeed = 0
+        local hasSpinData = wheelState ~= nil
+        if wheelState then
+            wheelRotSpeed = getSpinAxisSpeed(wheelState, wheel, axle, radius)
+            rotSpeed = wheelRotSpeed
+            if axle ~= "generic" and axleSpinState and axleSpinState[axle] and axleSpinState[axle].count > 0 then
+                rotSpeed = axleSpinState[axle].spinSum / axleSpinState[axle].count
+            end
+        end
+        
+        local longitudinalSlip = 0
+        local forwardRatioFactor = 0
+        local forwardActive = false
+        local forwardType = nil
+        local explicitLockupFactor = 0
+        if hasSpinData then
+            local absRotSpeed = math.abs(rotSpeed)
+            local absWheelRotSpeed = math.abs(wheelRotSpeed)
+            local lockupSlip = math.max(forwardSpeed - absWheelRotSpeed, 0)
+            local burnoutSlip = math.max(absRotSpeed - forwardSpeed, 0)
+            local lockupSpeedRef = math.max(forwardSpeed, absWheelRotSpeed, 1)
+            local burnoutSpeedRef = math.max(forwardSpeed, absRotSpeed, 1)
+            local lockupRatio = lockupSlip / lockupSpeedRef
+            local burnoutRatio = burnoutSlip / burnoutSpeedRef
+            local lockupRatioDeadzone = SkidmarkCore.Config.ForwardSlipRatioDeadzone or 0.35
+            local burnoutRatioDeadzone = SkidmarkCore.Config.BurnoutSlipRatioDeadzone or 0.35
+            local forwardAbsDeadzone = SkidmarkCore.Config.ForwardSlipMinAbsolute or (SkidmarkCore.Config.ForwardSlipDeadzone or 120)
+            local minLockupSpeed = SkidmarkCore.Config.MinLockupSpeed or 120
+            local lockupSpinSpeed = SkidmarkCore.Config.LockupSpinSpeed or 20
+            local hardLockupRatio = SkidmarkCore.Config.LockupRatioHardThreshold or 0.8
+            local hardBurnoutRatio = SkidmarkCore.Config.BurnoutRatioHardThreshold or 0.5
+            local brakeEnough = brakeFactor >= (SkidmarkCore.Config.LockupBrakeThreshold or 0.12)
+            local explicitLockupSpinLimit = math.max(
+                lockupSpinSpeed,
+                forwardSpeed * math.max(1 - hardLockupRatio, 0.05)
+            )
+            local explicitWheelLockup =
+                forwardSpeed > minLockupSpeed and
+                absWheelRotSpeed <= explicitLockupSpinLimit
+
+            local lockupActive =
+                explicitWheelLockup or
+                (
+                    lockupRatio >= hardLockupRatio and
+                    lockupSlip >= forwardAbsDeadzone and
+                    brakeEnough
+                )
+
+            -- Simple wheels_fx style burnout detection
+            local burnoutSlipRaw = math.max(absWheelRotSpeed - forwardSpeed, 0)
+            local burnoutTrigger = SkidmarkCore.Config.BurnoutSkidTrigger or 80
+            local burnoutActive = burnoutSlipRaw > burnoutTrigger
+            
+
+            if lockupActive then
+                local lockupRatioScale = math.clamp((lockupRatio - lockupRatioDeadzone) / math.max(1 - lockupRatioDeadzone, 0.001), 0, 1)
+                if explicitWheelLockup then
+                    lockupSlip = math.max(lockupSlip, forwardSpeed)
+                    lockupRatioScale = math.max(lockupRatioScale, 1)
+                    explicitLockupFactor = math.max(
+                        explicitLockupFactor,
+                        0.65 + 0.35 * math.clamp(
+                            (forwardSpeed - minLockupSpeed) /
+                            math.max((SkidmarkCore.Config.SkidSpeedRange or 320) * 0.25, 1),
+                            0,
+                            1
+                        )
+                    )
+                end
+                longitudinalSlip = math.max(longitudinalSlip, lockupSlip)
+                forwardRatioFactor = math.max(forwardRatioFactor, lockupRatioScale)
+                forwardActive = true
+                forwardType = "lockup"
+            end
+
+            if burnoutActive then
+                local explicitBurnoutFactor = math.clamp((burnoutSlipRaw - burnoutTrigger) / (SkidmarkCore.Config.BurnoutSkidRange or 100), 0, 1)
+                explicitLockupFactor = math.max(explicitLockupFactor, explicitBurnoutFactor)
+                forwardActive = true
+                if forwardType == nil then
+                    forwardType = "burnout"
+                end
+            end
+        end
+        -- Using raw lateral velocity inherently scales with speed, so low-speed normal turning 
+        -- physically cannot generate enough sideways sliding to trigger marks, eliminating hacks.
+        local baseDeadzone = SkidmarkCore.Config.SideSlipVelocityDeadzone or 70
+        
+        -- Apply optional multiplier for front or rear wheels if people want to tune drift balances
+        if axle == "front" then
+            lateralSlipVelocity = lateralSlipVelocity * (SkidmarkCore.Config.FrontAxleDriftMultiplier or 1.0)
+            baseDeadzone = baseDeadzone * (SkidmarkCore.Config.FrontAxleDeadzoneMul or 1.0)
+        elseif axle == "rear" then
+            lateralSlipVelocity = lateralSlipVelocity * (SkidmarkCore.Config.RearAxleDriftMultiplier or 1.0)
+            baseDeadzone = baseDeadzone * (SkidmarkCore.Config.RearAxleDeadzoneMul or 1.0)
+        end
+        
+        local sideFactor = math.clamp(
+            (lateralSlipVelocity - baseDeadzone) /
+            (SkidmarkCore.Config.SideSlipVelocityRange or 200),
+            0,
+            1
+        )
+        sideFactor = sideFactor ^ (SkidmarkCore.Config.SideSlipExponent or 1.3)
+        local forwardFactor = math.clamp(
+            (longitudinalSlip - (SkidmarkCore.Config.ForwardSlipDeadzone or 120)) /
+            (SkidmarkCore.Config.ForwardSlipRange or 700),
+            0,
+            1
+        )
+        forwardFactor = forwardFactor ^ (SkidmarkCore.Config.ForwardSlipExponent or 1.2)
+        forwardFactor = forwardFactor * forwardRatioFactor
+        forwardFactor = math.max(forwardFactor, explicitLockupFactor)
+        local totalSlip =
+            sideFactor * (SkidmarkCore.Config.LateralSlipWeight or 1.0) +
+            forwardFactor * (SkidmarkCore.Config.ForwardSlipWeight or 0.85)
+        
+        totalSlip = totalSlip * (sCfg and (sCfg.StrengthMul or 1) or 1)
+        
+        return {
+            total = math.min(totalSlip, 1),
+            side = sideFactor,
+            forward = forwardFactor,
+            forwardActive = forwardActive,
+            forwardType = forwardType,
+            skidValue = longitudinalSlip,
+            roll = math.clamp((wheelSpeed - (SkidmarkCore.Config.MinRollSpeed or 100)) / (SkidmarkCore.Config.RollSpeedRange or 500), 0, 1),
+            brake = brakeFactor,
+            forwardDir = groundFwd
+        }
+    end
+
+    local function destroyQuadMesh(quad)
+        if not quad or not quad.mesh then return end
+        if quad.mesh.destroy then
+            quad.mesh:destroy()
+        end
+        quad.mesh = nil
+    end
+
+    local function acquireQuadHologram()
+        local quadLimit = getQuadLimit()
+        
+        if #HologramPool > 0 then
+            return table.remove(HologramPool)
+        end
+        
+        if #ActiveQuads >= quadLimit then
+            local recycled = table.remove(ActiveQuads, 1)
+            if recycled and isValid(recycled.holo) then
+                destroyQuadMesh(recycled)
+                return recycled.holo
+            end
+        end
+        
+        return hologram.create(Vector(), Angle(), "models/Combine_Helicopter/helicopter_bomb01.mdl")
+    end
+
+    local function releaseQuad(quad)
+        if not quad or not isValid(quad.holo) then return end
+        destroyQuadMesh(quad)
+        
+        quad.holo:setNoDraw(true)
+        quad.holo:setPos(Vector())
+        quad.holo:setScale(Vector(1))
+        
+        if #HologramPool < getQuadLimit() then
+            table.insert(HologramPool, quad.holo)
+        else
+            quad.holo:remove()
+        end
+    end
+
+    local function buildQuadMesh(p1, p2, p3, p4, uStart, uEnd, vStart, vEnd, sCfg)
+        if mesh.trianglesLeft() < 4 then return nil end
+        
+        local center = (p1 + p2 + p3 + p4) * 0.25
+        local normal = (p2 - p1):cross(p4 - p1):getNormalized()
+        if normal:getLength() < 0.001 then return nil end
+        if normal:dot(Vector(0, 0, 1)) < 0 then
+            normal = -normal
+            p1, p2, p3, p4 = p4, p3, p2, p1
+        end
+
+        local lp1 = p1 - center
+        local lp2 = p2 - center
+        local lp3 = p3 - center
+        local lp4 = p4 - center
+        
+        local u1, v1 = mapSegmentUV(uStart, vStart, sCfg)
+        local u2, v2 = mapSegmentUV(uStart, vEnd, sCfg)
+        local u3, v3 = mapSegmentUV(uEnd, vEnd, sCfg)
+        local u4, v4 = mapSegmentUV(uEnd, vStart, sCfg)
+        
+        local quadMesh = mesh.createFromTable({
+            {pos = lp1, normal = normal,   u = u1, v = v1},
+            {pos = lp2, normal = normal,   u = u2, v = v2},
+            {pos = lp3, normal = normal,   u = u3, v = v3},
+            {pos = lp3, normal = normal,   u = u3, v = v3},
+            {pos = lp4, normal = normal,   u = u4, v = v4},
+            {pos = lp1, normal = normal,   u = u1, v = v1},
+
+            {pos = lp1, normal = -normal,  u = u1, v = v1},
+            {pos = lp4, normal = -normal,  u = u4, v = v4},
+            {pos = lp3, normal = -normal,  u = u3, v = v3},
+            {pos = lp3, normal = -normal,  u = u3, v = v3},
+            {pos = lp2, normal = -normal,  u = u2, v = v2},
+            {pos = lp1, normal = -normal,  u = u1, v = v1},
+        })
+
+        if not quadMesh then return nil end
+
+        local minBounds = Vector(
+            math.min(lp1.x, lp2.x, lp3.x, lp4.x),
+            math.min(lp1.y, lp2.y, lp3.y, lp4.y),
+            math.min(lp1.z, lp2.z, lp3.z, lp4.z)
+        )
+        local maxBounds = Vector(
+            math.max(lp1.x, lp2.x, lp3.x, lp4.x),
+            math.max(lp1.y, lp2.y, lp3.y, lp4.y),
+            math.max(lp1.z, lp2.z, lp3.z, lp4.z)
+        )
+
+        return {
+            mesh = quadMesh,
+            center = center,
+            minBounds = minBounds,
+            maxBounds = maxBounds
+        }
+    end
+
+    local function addQuad(startPos, endPos, startNormal, endNormal, mat, color, width, strength, uStart, uEnd, tintTexture, sCfg, matType, filter)
+        local normal = (startNormal + endNormal):getNormalized()
+        if normal:getLength() < 0.001 then
+            normal = Vector(0, 0, 1)
+        end
+        
+        local delta = endPos - startPos
+        local length = delta:getLength()
+        if length < 1 then return end
+        
+        local forward = delta / length
+        local overlapMul = SkidmarkCore.Config.SegmentOverlapMul or 0.6
+        local useCustomTexture = matType ~= nil and MaterialUsesCustomTexture[matType] == true
+        if useCustomTexture then
+            overlapMul = SkidmarkCore.Config.TexturedSegmentOverlapMul or 0
+        end
+        local overlap = math.max(width * overlapMul, overlapMul > 0 and 1 or 0)
+        startPos = startPos - forward * overlap
+        endPos = endPos + forward * overlap
+        delta = endPos - startPos
+        length = delta:getLength()
+        forward = delta / length
+        local right = normal:cross(forward):getNormalized()
+        if right:getLength() < 0.001 then return end
+
+        local traceLift = math.max(SkidmarkCore.Config.EdgeTraceLift or 6, 1)
+        local traceDepth = math.max(SkidmarkCore.Config.EdgeTraceDepth or 24, 4)
+
+        local function traceEdge(pos, edgeRight, edgeNormal)
+            local edgePos = pos + edgeRight
+            local hit = trace.line(edgePos + edgeNormal * traceLift, edgePos - edgeNormal * traceDepth, filter)
+            if hit.Hit then
+                return hit.HitPos + hit.HitNormal * (SkidmarkCore.Config.SurfaceLift or 0.03)
+            end
+            return edgePos + edgeNormal * (SkidmarkCore.Config.SurfaceLift or 0.03)
+        end
+
+        local startLeft = traceEdge(startPos, right * width, startNormal or normal)
+        local startRight = traceEdge(startPos, -right * width, startNormal or normal)
+        local endLeft = traceEdge(endPos, right * width, endNormal or normal)
+        local endRight = traceEdge(endPos, -right * width, endNormal or normal)
+        
+        local holo = acquireQuadHologram()
+        if not isValid(holo) then return end
+        
+        local quadData = buildQuadMesh(startLeft, startRight, endRight, endLeft, uStart or 0, uEnd or 1, 0, 1, sCfg)
+        if not quadData then
+            releaseQuad({holo = holo})
+            return
+        end
+        
+        local intensity = math.min(math.max(strength or 0, 0), 1)
+        local alphaMul = 0.22 + intensity * 0.78
+        local shadeMul = 0.7 + intensity * 0.3
+        
+        holo:setPos(quadData.center)
+        holo:setAngles(Angle())
+        holo:setScale(Vector(1))
+        holo:setMesh(quadData.mesh)
+        holo:setMeshMaterial(mat)
+        holo:setRenderBounds(quadData.minBounds - Vector(1, 1, 1), quadData.maxBounds + Vector(1, 1, 1))
+        if tintTexture then
+            holo:setColor(Color(
+                math.floor(color.r * shadeMul),
+                math.floor(color.g * shadeMul),
+                math.floor(color.b * shadeMul),
+                math.max(30, math.floor(color.a * alphaMul))
+            ))
+        else
+            holo:setColor(Color(255, 255, 255, math.max(30, math.floor(color.a * alphaMul))))
+        end
+        holo:suppressEngineLighting(true)
+        holo:setNoDraw(false)
+        
+        table.insert(ActiveQuads, {
+            holo = holo,
+            mesh = quadData.mesh,
+            dieTime = timer.curtime() + (SkidmarkCore.Config.Lifetime or 10)
+        })
+    end
+
+    local function getTraceFilter(wheels, chassis)
+        local filter = {}
+        if isValid(chassis) then table.insert(filter, chassis) end
+        if wheels then
+            for _, w in ipairs(wheels) do 
+                local ent = w.ent or w
+                if isValid(ent) then table.insert(filter, ent) end 
+            end
+        end
+        -- Include all extra filter entities (vehicle body, constraints, extras)
+        for _, ent in ipairs(NetworkedFilterEntities) do
+            if isValid(ent) then table.insert(filter, ent) end
+        end
+        return filter
+    end
+    
+    local function smoothFactor(previous, current, rate)
+        local appliedRate = math.clamp(rate or 0.35, 0, 1)
+        if current < previous then
+            appliedRate = math.min(appliedRate * 2.5, 1)
+        end
+        return previous + (current - previous) * appliedRate
+    end
+
+    -- Receive wheel/chassis data from server (sent on initialization)
+    local lastCheck = 0
+    local nextWheelRequest = 0
+    
+    -- Request wheel data from server until the client has valid wheel/base entities.
+    hook.add("tick", "skidmark_request_wheels", function()
+        local now = timer.curtime()
+        if now < nextWheelRequest then return end
+
+        local hasValidSetup = NetworkedWheels and #NetworkedWheels > 0 and isValid(NetworkedBase)
+        if hasValidSetup then return end
+
+        net.start("skidmark_requestWheels")
+        net.send()
+        nextWheelRequest = now + (SkidmarkCore.Config.MetadataRequestDelay or 0.5)
+    end)
+    
+    hook.add("tick", "skidmark_check_data", function()
+        if timer.curtime() < lastCheck + 0.1 then return end
+        lastCheck = timer.curtime()
+        
+        local wheels = NetworkedWheels
+        local base = NetworkedBase
+        
+        if wheels and #wheels > 0 and isValid(base) then
+            SkidmarkCore.Config.Wheels = wheels
+            SkidmarkCore.Config.Chassis = base
+            SkidmarkCore.Config.Enabled = true
+        else
+            SkidmarkCore.Config.Enabled = false
+        end
+    end)
+
+    local nextProcess = 0
+    local lastDebug = 0
+    
+    hook.add("think", "skidmark_logic", function()
+        if not SkidmarkCore.Config.Enabled then return end
+
+        local config = SkidmarkCore.Config
+        local wheels = config.Wheels
+        local chassis = config.Chassis
+        
+        if isDebugEnabled() and timer.curtime() > lastDebug + 2 then
+            print("[SKD-LOGIC] Wheels: " .. (wheels and #wheels or "nil") .. " | Chassis: " .. (isValid(chassis) and "valid" or "invalid"))
+            lastDebug = timer.curtime()
+        end
+        
+        if not wheels or #wheels == 0 or not isValid(chassis) then return end
+        
+        local time = timer.curtime()
+        if time < nextProcess then return end
+        nextProcess = time + (config.SegmentDelay or 0.05)
+
+        local filter = getTraceFilter(wheels, chassis)
+        local axleSpinState = buildAxleSpinState(wheels, chassis)
+        local up = chassis:getUp()
+        
+        local traceCount = 0
+        local hitCount = 0
+
+        for idx, wheelInfo in ipairs(wheels) do
+            local w = wheelInfo.ent or wheelInfo
+            local axle = wheelInfo.axle or "front"
+            if not isValid(w) then continue end
+            
+            traceCount = traceCount + 1
+            
+            local wIdx = w:entIndex()
+            local data = SkidmarkCore.WheelData[wIdx] or {}
+            SkidmarkCore.WheelData[wIdx] = data
+            
+            local wPos = w:getPos()
+            local radius = (w:obbSize().z * 0.5) or 10
+            local startPos = wPos
+            local endPos = wPos - up * (radius + 5)
+            
+            local tr = trace.line(startPos, endPos, filter)
+            
+            if tr.Hit then hitCount = hitCount + 1 end
+            
+            -- Check if we should create a skid or roll mark
+            local markMode = nil
+            local markForward = nil
+            local strength = 0
+            
+            if tr.Hit then
+                -- Get surface config
+                local matType = tr.MatType or 0
+                local sCfg = config.Surfaces and config.Surfaces[matType] or config.Surfaces[0]
+                
+                if not sCfg or not sCfg.CreateMarks then
+                    data.lastPos = nil
+                    data.lastNormal = nil
+                    continue
+                end
+                
+                -- Calculate mark factors
+                local slip = calcSkidData(w, chassis, radius, sCfg, tr.HitNormal, axle, axleSpinState)
+                data.smoothedSide = smoothFactor(data.smoothedSide or 0, slip.side, config.SlipSmoothing or 0.35)
+                if slip.forwardActive then
+                    data.forwardActiveTicks = math.min((data.forwardActiveTicks or 0) + 1, 32)
+                else
+                    data.forwardActiveTicks = 0
+                end
+                if data.lastSkidType == "forward" and not slip.forwardActive then
+                    data.smoothedForward = 0
+                else
+                    local forwardSmoothing = slip.forwardActive and (config.ForwardSlipSmoothing or config.SlipSmoothing or 0.35) or 1
+                    data.smoothedForward = smoothFactor(data.smoothedForward or 0, slip.forwardActive and slip.forward or 0, forwardSmoothing)
+                end
+                data.smoothedRoll = smoothFactor(data.smoothedRoll or 0, slip.roll, config.RollSmoothing or 0.2)
+                data.smoothedTotal = smoothFactor(
+                    data.smoothedTotal or 0,
+                    math.min(
+                        data.smoothedSide * (config.LateralSlipWeight or 1.0) +
+                        data.smoothedForward * (config.ForwardSlipWeight or 0.85),
+                        1
+                    ),
+                    config.SlipSmoothing or 0.35
+                )
+                
+                local skidEnter = config.SkidThreshold or 0.1
+                local skidExit = config.SkidReleaseThreshold or skidEnter * 0.65
+                local forwardSkidEnter = config.ForwardSkidThreshold or skidEnter * 2
+                local forwardSkidExit = config.ForwardSkidReleaseThreshold or forwardSkidEnter * 0.7
+                local rollEnter = config.RollThreshold or 0.05
+                local rollExit = config.RollReleaseThreshold or rollEnter * 0.6
+                local allowRollMarks = (config.EnableRollMarks == true) and sCfg.AlwaysRoll
+                local sideRollSkidEnter = allowRollMarks and (config.RollSurfaceSideSkidThreshold or math.max(skidEnter * 2.5, 0.1)) or skidEnter
+                local sideRollSkidExit = allowRollMarks and (config.RollSurfaceSideSkidReleaseThreshold or math.max(skidExit * 2.0, 0.06)) or skidExit
+                
+                local allowForwardSkid = true
+                if slip.forwardType ~= "lockup" and config.RearOnlyForwardSkid ~= false then
+                    allowForwardSkid = axle == "rear"
+                end
+                local nextSkidType = nil
+                
+                local forwardConfirmed = allowForwardSkid and (data.forwardActiveTicks or 0) >= (config.ForwardSkidDebounceTicks or 2)
+
+                if data.lastMode == "skid" then
+                    if data.lastSkidType == "side" and data.smoothedSide > sideRollSkidExit then
+                        markMode = "skid"
+                    elseif data.lastSkidType == "forward" and forwardConfirmed and data.smoothedForward > forwardSkidExit then
+                        markMode = "skid"
+                    end
+                elseif data.lastMode == "roll" then
+                    if allowRollMarks and data.smoothedRoll > rollExit and data.smoothedSide < sideRollSkidExit and (not forwardConfirmed or data.smoothedForward <= forwardSkidExit) then
+                        markMode = "roll"
+                    end
+                end
+                
+                if not markMode and forwardConfirmed and data.smoothedForward > forwardSkidEnter then
+                    markMode = "skid"
+                    nextSkidType = "forward"
+                elseif not markMode and data.smoothedSide > sideRollSkidEnter then
+                    markMode = "skid"
+                    nextSkidType = "side"
+                elseif not markMode and allowRollMarks and data.smoothedRoll > rollEnter and data.smoothedSide < sideRollSkidEnter then
+                    markMode = "roll"
+                end
+                
+                if markMode == "skid" then
+                    local activeSkidType = nextSkidType or data.lastSkidType or "side"
+                    if activeSkidType == "forward" then
+                        strength = data.smoothedForward * (config.ForwardSlipWeight or 0.85)
+                    else
+                        strength = data.smoothedSide * (config.LateralSlipWeight or 1.0)
+                    end
+                elseif markMode == "roll" then
+                    strength = math.max(data.smoothedRoll * (sCfg.RollStrengthMul or 0.35), 0.05)
+                end
+                
+                markForward = slip.forwardDir
+                
+                if isDebugEnabled() and timer.curtime() % 2 < 0.05 then
+                    print("[SKD-DETECT] Wheel " .. idx ..
+                        " - Mode: " .. tostring(markMode) ..
+                        " | Side: " .. string.format("%.3f", data.smoothedSide or 0) ..
+                        " | Forward: " .. string.format("%.3f", data.smoothedForward or 0) ..
+                        " | Brake: " .. string.format("%.3f", slip.brake or 0) ..
+                        " | Roll: " .. string.format("%.3f", data.smoothedRoll or 0) ..
+                        " | Strength: " .. string.format("%.3f", strength))
+                end
+            end
+
+            if markMode and tr.Hit then
+                local matType = tr.MatType or 0
+                local sCfg = config.Surfaces and config.Surfaces[matType] or config.Surfaces[0]
+                
+                if not sCfg then continue end
+                
+                if data.lastMode ~= markMode then
+                    data.uvCursor = 0
+                    data.pendingPos = nil
+                    data.pendingNormal = nil
+                end
+                
+                local mat = loadMaterial(matType, sCfg, axle)
+                local axleWidthMul =
+                    axle == "front" and (config.FrontWheelWidthMul or 1) or
+                    axle == "rear" and (config.RearWheelWidthMul or 1) or
+                    1
+                local widthScale = markMode == "skid" and (sCfg.SkidWidthMul or 1) or (sCfg.RollWidthMul or 0.85)
+                local width = radius * (config.WidthMult or 0.45) * widthScale
+                width = width * axleWidthMul
+                
+                -- Calculate marks at contact point
+                local trNormal = tr.HitNormal
+                local leadVel = w:getVelocity() - trNormal * w:getVelocity():dot(trNormal)
+                local trPos = tr.HitPos + trNormal * (config.SurfaceLift or 0.03) + leadVel * (config.ContactLead or 0.04)
+                local trForward = markForward or data.lastForward or w:getForward()
+                local uvScale = config.TextureWorldScale or 64
+                local minSegmentLength = config.MinSegmentLength or 0
+                
+                -- Always create starting mark or connect to previous
+                if data.lastPos and data.lastMode == markMode then
+                    local tint = markMode == "skid" and sCfg.SkidColor or sCfg.RollColor
+                    local segStart = data.pendingPos or data.lastPos
+                    local segStartNormal = data.pendingNormal or data.lastNormal or trNormal
+                    local segmentLen = (trPos - segStart):getLength()
+                    if segmentLen >= minSegmentLength then
+                        local uStart = data.uvCursor or 0
+                        local uEnd = uStart + (segmentLen / math.max(uvScale, 1))
+                        addQuad(segStart, trPos, segStartNormal, trNormal, mat, tint, width, strength, uStart, uEnd, shouldTintTexture(sCfg), sCfg, matType, filter)
+                        data.uvCursor = uEnd
+                        data.pendingPos = nil
+                        data.pendingNormal = nil
+                    else
+                        data.pendingPos = segStart
+                        data.pendingNormal = segStartNormal
+                    end
+                    if isDebugEnabled() and timer.curtime() % 2 < 0.05 then
+                        print("[SKD-MARK] Added " .. markMode .. " quad for wheel " .. idx)
+                    end
+                end
+                
+                data.lastPos = trPos
+                data.lastNormal = trNormal
+                data.lastForward = trForward
+                data.lastMode = markMode
+                data.uvCursor = data.uvCursor or 0
+                if markMode == "skid" then
+                    data.lastSkidType = nextSkidType or data.lastSkidType or "side"
+                else
+                    data.lastSkidType = nil
+                end
+                data.activeMat = mat
+            else
+                data.lastPos = nil
+                data.lastNormal = nil
+                data.lastForward = nil
+                data.lastMode = nil
+                data.lastSkidType = nil
+                data.forwardActiveTicks = 0
+                data.pendingPos = nil
+                data.pendingNormal = nil
+                data.uvCursor = 0
+            end
+        end
+        
+        if isDebugEnabled() and timer.curtime() > lastDebug + 2 then
+            print("[SKD-TRACE] Traces: " .. traceCount .. " | Hits: " .. hitCount)
+        end
+    end)
+
+    -- Cleanup expired quads
+    hook.add("think", "skidmark_cleanup", function()
+        if not SkidmarkCore.Config.Enabled then return end
+        
+        local time = timer.curtime()
+        local removed = 0
+        
+        for i = #ActiveQuads, 1, -1 do
+            local q = ActiveQuads[i]
+            if q.dieTime <= time then
+                if isValid(q.holo) then
+                    releaseQuad(q)
+                end
+                table.remove(ActiveQuads, i)
+                removed = removed + 1
+            end
+        end
+        
+        if isDebugEnabled() and removed > 0 and timer.curtime() % 2 < 0.1 then
+            print("[SKD-CLEANUP] Removed " .. removed .. " expired quads, remaining: " .. #ActiveQuads)
+        end
+    end)
+
+    -- Cleanup when chip is removed
+    hook.add("remove", "skidmark_cleanup_holograms", function()
+        for _, q in ipairs(ActiveQuads) do
+            if isValid(q.holo) then
+                q.holo:remove()
+            end
+        end
+        for _, holo in ipairs(HologramPool) do
+            if isValid(holo) then
+                holo:remove()
+            end
+        end
+        ActiveQuads = {}
+        HologramPool = {}
+    end)
+end
+
+-- ============================================================================
+-- SERVER: Wire integration & Broadcasting
+-- ============================================================================
+if SERVER then
+    wire.adjustInputs(
+        {"FrontWheels", "RearWheels", "Base", "ExtraFilterStatic", "ExtraFilterSemiDynamic"},
+        {"array", "array", "entity", "array", "array"}
+    )
+    
+    -- Vehicle filter (same pattern as tire simulation)
+    local VehicleFilter = {}
+    local CheckedEntities = {}
+    
+    local function rebuildVehicleFilter()
+        VehicleFilter = {}
+        CheckedEntities = {}
+        
+        local base = wire.ports.Base
+        if not isValid(base) then return end
+        
+        -- Add all constrained entities from base (vehicle body parts)
+        local allParts = base:getAllConstrained()
+        table.insert(allParts, base)
+        for _, part in pairs(allParts) do
+            if part and part:isValid() and not CheckedEntities[part] then
+                CheckedEntities[part] = true
+                table.insert(VehicleFilter, part)
+            end
+        end
+        
+        -- Add all wheels
+        local frontWheels = wire.ports.FrontWheels or {}
+        local rearWheels = wire.ports.RearWheels or {}
+        for _, wheel in ipairs(frontWheels) do
+            if isValid(wheel) and not CheckedEntities[wheel] then
+                CheckedEntities[wheel] = true
+                table.insert(VehicleFilter, wheel)
+            end
+        end
+        for _, wheel in ipairs(rearWheels) do
+            if isValid(wheel) and not CheckedEntities[wheel] then
+                CheckedEntities[wheel] = true
+                table.insert(VehicleFilter, wheel)
+            end
+        end
+        
+        -- ExtraFilterStatic: add entity + all constrained to it
+        local staticFilter = wire.ports.ExtraFilterStatic
+        if staticFilter and #staticFilter > 0 then
+            for _, ent in ipairs(staticFilter) do
+                if ent and ent:isValid() and not CheckedEntities[ent] then
+                    CheckedEntities[ent] = true
+                    table.insert(VehicleFilter, ent)
+                    local subParts = ent:getAllConstrained()
+                    for _, sub in pairs(subParts) do
+                        if not CheckedEntities[sub] then
+                            CheckedEntities[sub] = true
+                            table.insert(VehicleFilter, sub)
+                        end
+                    end
+                end
+            end
+        end
+        
+        if SkidmarkCore.Config.EnableDebug then
+            print("[SKD-FILTER] Built vehicle filter with " .. #VehicleFilter .. " entities")
+        end
+    end
+    
+    local function updateSemiDynamicFilter()
+        local semiDynamic = wire.ports.ExtraFilterSemiDynamic
+        if not semiDynamic or #semiDynamic == 0 then return end
+        
+        local newEnts = 0
+        for _, ent in ipairs(semiDynamic) do
+            if ent and ent:isValid() and not CheckedEntities[ent] then
+                local subParts = ent:getAllConstrained()
+                table.insert(subParts, ent)
+                for _, part in pairs(subParts) do
+                    if not CheckedEntities[part] then
+                        CheckedEntities[part] = true
+                        table.insert(VehicleFilter, part)
+                    end
+                end
+                newEnts = newEnts + 1
+            end
+        end
+        
+        if newEnts > 0 and SkidmarkCore.Config.EnableDebug then
+            print("[SKD-FILTER] Semi-dynamic filter found " .. newEnts .. " new entities")
+        end
+    end
+    
+    -- Periodically update semi-dynamic filter
+    timer.create("SKD_SemiDynamicFilterUpdate", 10, 0, updateSemiDynamicFilter)
+    
+    -- Build filter on initial load
+    rebuildVehicleFilter()
+
+    local function getAxisComponent(vec, axisName)
+        if axisName == "x" then return vec.x end
+        if axisName == "z" then return vec.z end
+        return vec.y
+    end
+    
+    local function getWheelStateAxis(axle)
+        if axle == 1 then
+            return SkidmarkCore.Config.FrontSpinAxis or SkidmarkCore.Config.WheelSpinAxis or "y"
+        elseif axle == 2 then
+            return SkidmarkCore.Config.RearSpinAxis or SkidmarkCore.Config.WheelSpinAxis or "y"
+        end
+        return SkidmarkCore.Config.WheelSpinAxis or "y"
+    end
+    
+    local function collectWheels()
+        local allWheels = {}
+        local frontWheels = wire.ports.FrontWheels or {}
+        local rearWheels = wire.ports.RearWheels or {}
+        local genericWheels = {}
+        
+        for _, wheel in ipairs(frontWheels) do
+            if isValid(wheel) then
+                table.insert(allWheels, {ent = wheel, axle = 1})
+            end
+        end
+        for _, wheel in ipairs(rearWheels) do
+            if isValid(wheel) then
+                table.insert(allWheels, {ent = wheel, axle = 2})
+            end
+        end
+        if #allWheels == 0 then
+            for _, wheel in ipairs(genericWheels) do
+                if isValid(wheel) then
+                    table.insert(allWheels, {ent = wheel, axle = 0})
+                end
+            end
+        end
+        
+        return allWheels
+    end
+
+    local function buildWheelBroadcastSignature(allWheels, base)
+        local parts = {
+            isValid(base) and tostring(base:entIndex()) or "0",
+            tostring(#allWheels)
+        }
+
+        for _, wheelInfo in ipairs(allWheels) do
+            local ent = wheelInfo.ent
+            parts[#parts + 1] = tostring(isValid(ent) and ent:entIndex() or 0)
+            parts[#parts + 1] = tostring(wheelInfo.axle or 0)
+        end
+
+        return table.concat(parts, "|")
+    end
+
+    local function sendNetTargets(targets, unreliable)
+        if targets == nil then
+            net.send(find.allPlayers(), unreliable)
+        elseif istable(targets) then
+            net.send(targets, unreliable)
+        else
+            net.send(targets, unreliable)
+        end
+    end
+    
+    -- Send wheel data to a player (sent when requested, or to all players on update)
+    local function broadcastWheels(targets)
+        if istable(targets) and #targets == 0 then return end
+        
+        local allWheels = collectWheels()
+        local base = wire.ports.Base
+
+        -- Validate filter before sending
+        for j = #VehicleFilter, 1, -1 do
+            if not (VehicleFilter[j] and VehicleFilter[j]:isValid()) then
+                table.remove(VehicleFilter, j)
+            end
+        end
+        
+        net.start("skidmark_sendWheels")
+        net.writeBool(isValid(base))
+        if isValid(base) then
+            net.writeEntity(base)
+        end
+        
+        net.writeUInt(#allWheels, 32)
+        for _, wheelInfo in ipairs(allWheels) do
+            net.writeEntity(wheelInfo.ent)
+            net.writeUInt(wheelInfo.axle, 2)
+        end
+        
+        -- Send filter entities
+        net.writeUInt(#VehicleFilter, 16)
+        for _, ent in ipairs(VehicleFilter) do
+            net.writeEntity(ent)
+        end
+
+        sendNetTargets(targets, false)
+    end
+    
+    local function broadcastWheelState(targets)
+        if istable(targets) and #targets == 0 then return end
+        
+        local allWheels = collectWheels()
+        if #allWheels == 0 then return end
+
+        net.start("skidmark_sendWheelState")
+        net.writeUInt(#allWheels, 32)
+        for _, wheelInfo in ipairs(allWheels) do
+            local pobj = wheelInfo.ent:getPhysicsObject()
+            local angVel = isValid(pobj) and pobj:getAngleVelocity() or Vector()
+            local axis = getWheelStateAxis(wheelInfo.axle)
+            
+            net.writeUInt(wheelInfo.ent:entIndex(), 16)
+            net.writeVector(wheelInfo.ent:getVelocity())
+            net.writeFloat(getAxisComponent(angVel, axis))
+        end
+
+        sendNetTargets(targets, true)
+    end
+    
+    -- CLIENT request handler
+    net.receive("skidmark_requestWheels", function(_, ply)
+        broadcastWheels(ply)
+    end)
+    
+    -- Continuously broadcast on update (whenever wires change)
+    local lastWheelBroadcastSignature = nil
+    local pendingWheelBroadcastSignature = nil
+    local pendingWheelBroadcast = false
+    local nextWheelBroadcast = 0
+    local nextPeriodicWheelBroadcast = 0
+    local nextStateBroadcast = 0
+
+    hook.add("tick", "skidmark_server_broadcast", function()
+        local allWheels = collectWheels()
+        local base = wire.ports.Base
+        local now = timer.curtime()
+        local wheelBroadcastSignature = buildWheelBroadcastSignature(allWheels, base)
+        local metadataDelay = SkidmarkCore.Config.MetadataBroadcastDelay or 0.25
+        local metadataRefreshDelay = SkidmarkCore.Config.MetadataRefreshDelay or 1.0
+
+        if wheelBroadcastSignature ~= lastWheelBroadcastSignature then
+            pendingWheelBroadcast = true
+            pendingWheelBroadcastSignature = wheelBroadcastSignature
+            rebuildVehicleFilter()
+        end
+
+        if pendingWheelBroadcast and now >= nextWheelBroadcast then
+            broadcastWheels(find.allPlayers())
+            lastWheelBroadcastSignature = pendingWheelBroadcastSignature
+            pendingWheelBroadcastSignature = nil
+            pendingWheelBroadcast = false
+            nextWheelBroadcast = now + metadataDelay
+            nextPeriodicWheelBroadcast = now + metadataRefreshDelay
+        elseif now >= nextPeriodicWheelBroadcast then
+            broadcastWheels(find.allPlayers())
+            lastWheelBroadcastSignature = wheelBroadcastSignature
+            nextPeriodicWheelBroadcast = now + metadataRefreshDelay
+        end
+
+        local stateDelay = SkidmarkCore.Config.StateBroadcastDelay
+        if stateDelay == nil then
+            stateDelay = math.max((SkidmarkCore.Config.SegmentDelay or 0.05) * 0.5, 0.025)
+        end
+        if now < nextStateBroadcast then return end
+        nextStateBroadcast = now + stateDelay
+
+        broadcastWheelState(find.allPlayers())
+    end)
+end

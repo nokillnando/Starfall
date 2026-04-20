@@ -1,0 +1,255 @@
+--@name Skidmark System
+--@author [C17] Red Fox
+--@shared
+--@include skidmark_system/skidmark_core.txt
+local Version = "1.00"
+
+-- Load core first
+dofile("skidmark_system/skidmark_core.txt")
+
+-- ============================================================================
+-- CONFIGURATION - Customize these values
+-- ============================================================================
+
+local Config = {
+    AllowCheckVersion = true,  -- Check GitHub for updates to the core script on spawn
+    
+    -- BUFFER & LIFETIME
+    MaxQuads = 96,             -- Max number of quad segments alive at once
+    Lifetime = 10,             -- How long skidmarks persist (seconds)
+    SegmentDelay = 0.05,       -- Interval between adding new mark segments
+    HologramLimit = 96,        -- Safety cap to stay below Starfall's hologram limit
+    
+    -- RENDERING & APPEARANCE
+    WidthMult = 0.45,          -- Half-width multiplier based on wheel radius
+    FrontWheelWidthMul = 1.0,  -- Extra width multiplier for front axle wheels
+    RearWheelWidthMul = 1.0,   -- Extra width multiplier for rear axle wheels
+    ContactLead = 0.04,        -- Push marks slightly along wheel velocity for smoother joins
+    SurfaceLift = 0.08,        -- Small lift above the traced surface to avoid z-fighting
+    EdgeTraceLift = 6,         -- How far above the guessed strip edge to start side traces
+    EdgeTraceDepth = 24,       -- How far downward to trace strip edges so marks hug uneven slopes
+    SegmentOverlapMul = 0.08,  -- Extends each segment slightly to hide visible gaps between quads
+    TexturedSegmentOverlapMul = 0.0, -- Patterned tread textures should not overlap or they double-darken at joins
+    MinSegmentLength = 8,      -- Do not spawn a new segment until the wheel has advanced this far
+    TextureWorldScale = 64,    -- World-units per texture repeat along the skid trail
+    MetadataBroadcastDelay = 1.0,  -- Server->client wheel/base metadata resend interval when wiring changes
+    MetadataRefreshDelay = 5.0, -- Periodic server->client wheel/base refresh so late-valid entities still recover
+    MetadataRequestDelay = 1.0,  -- Client retry interval while waiting for valid wheel/base entities
+    StateBroadcastDelay = 0.1,  -- Server->client wheel-state send interval; higher saves CPU/network
+
+    EnableRollMarks = true,    -- Only surfaces with AlwaysRoll will create rolling tracks
+    EnableDebug = false,       -- Prints trace/detect/material spam when true; keep off for normal play
+    MaterialConfig = {
+        UseModTexture = true,  -- true: create a shader and apply Texture / URL to it; false: use Material directly
+        Shader = "VertexLitGeneric",
+        Texture = "https://dl.dropbox.com/scl/fi/lwy1gpwmkz7m7bvyaiamd/tirethread.png?rlkey=x50qq67we5tmnao8i0p23upe0&dl=1", -- Raw basetexture path or direct image URL
+        FrontTexture = nil,    -- Optional: specific texture for front axle wheels
+        RearTexture = nil,     -- Optional: specific texture for rear axle wheels
+        Material = nil,        -- In-game material path, e.g. "sprites/lvs/skidmark"
+        TintTexture = true,   -- false keeps custom texture RGB; true multiplies it by skid color
+        TextureRotationDeg = 90, -- Rotate tread textures to match trail direction
+        TextureScaleU = 1.0,   -- Material UV transform scale on U
+        TextureScaleV = 1.0,   -- Material UV transform scale on V
+        FlipTextureU = false,  -- Flip UVs horizontally after rotation
+        FlipTextureV = false,  -- Flip UVs vertically after rotation
+        AlphaTest = false,     -- Enable alpha test for textures with real alpha channels
+        AlphaTestReference = 0.5, -- Alpha cutoff when AlphaTest is enabled
+    },
+    WheelSpinAxis = "x",       -- Local wheel axis used to read angular velocity for burnouts/lockups
+    FrontSpinAxis = "x",       -- Override spin axis for front wheels if needed
+    RearSpinAxis = "x",        -- Override spin axis for rear wheels if needed
+    
+    -- DETECTION THRESHOLDS
+    SkidThreshold = 0.08,      -- Slip amount needed to create skidmarks
+    SkidReleaseThreshold = 0.015, -- Extremely low threshold to heavily prevent "jumping" when sliding fluctuates
+    RearOnlyForwardSkid = false,-- Restrict powered forward skids/burnouts to the rear axle; natural wheel lockup can still mark on the front
+    MinRollSpeed = 100,        -- Minimum speed for roll marks on soft surfaces
+    RollThreshold = 0.05,      -- Minimum rolling intensity before roll marks appear
+    RollReleaseThreshold = 0.03, -- Lower threshold to keep roll marks from flickering off
+    RollSurfaceSideSkidThreshold = 0.15, -- On AlwaysRoll surfaces, require clearer sideways slip before replacing roll with skid
+    RollSurfaceSideSkidReleaseThreshold = 0.04, -- Lower hold threshold so soft-surface skids do not flicker back to roll too quickly
+    SlipSmoothing = 0.10,      -- Make it stick around longer visually, further preventing gap "jumping"
+    RollSmoothing = 0.12,      -- Temporal smoothing for roll intensity
+    -- SIDEWAYS DRIFTING (Based purely on lateral slide speed, immune to steer-arc geometric errors)
+    SideSlipVelocityDeadzone = 80, -- Absolute side-sliding speed required before marks appear (e.g. 80 UPS lateral slide ~ 4.5 mph sideways)
+    SideSlipVelocityRange = 250,   -- Additional sideways speed needed to reach 100% black skid opacity
+    SideSlipExponent = 1.3,        -- Lower = marks get darker faster as you slide harder
+    FrontAxleDeadzoneMul = 0.5,        -- Multiplier for the drift deadzone on the front axle; lower to make front wheels skid earlier in a drift
+    FrontAxleDriftMultiplier = 2,    -- Multiplier for lateral slip on the front wheels during a chassis drift
+    RearAxleDeadzoneMul = 0.5,         -- Multiplier for the drift deadzone on the rear axle
+    RearAxleDriftMultiplier = 2,     -- Multiplier for lateral slip on the rear wheels during a chassis drift
+    ForwardSlipDeadzone = 120, -- Ignore small wheel-speed mismatch while rolling normally
+    ForwardSlipRange = 700,    -- Wheel-speed mismatch needed to reach full burnout/lockup intensity
+    ForwardSlipExponent = 1.15,-- Slightly softens burnout/lockup intensity ramp
+    ForwardSlipRatioDeadzone = 0.35, -- Require a large relative lockup mismatch, not just a small absolute speed error
+    BurnoutSlipRatioDeadzone = 0.35, -- Require a large relative overspin mismatch before burnout marks appear
+    ForwardSlipMinAbsolute = 180, -- Require a meaningful absolute wheel-speed mismatch before forward skid can exist
+    LockupRatioHardThreshold = 0.45, -- Rolling noise should not count; lockup needs to be almost fully stopped versus road speed
+    BrakeDecelDeadzone = 100,   -- Ignore light speed changes; forward lockup needs real deceleration if no brake input is wired
+    BrakeDecelRange = 450,     -- How much decel is needed to reach full brake factor
+    LockupBrakeThreshold = 0.12, -- Minimum brake/decel confirmation before rear lockup can mark
+    BurnoutSkidTrigger = 400,   -- The absolute speed difference between wheel spin and ground speed to trigger burnout (wheels_fx style)
+    ForwardSkidThreshold = 0.05, -- Very low entry threshold so burnout starts immediately
+    ForwardSkidReleaseThreshold = 0.02, -- Lower threshold for holding burnout
+    LateralSlipWeight = 1.0,   -- Contribution of sideways slip to skid intensity
+    ForwardSlipWeight = 0.85,  -- Contribution of wheelspin/lockup to skid intensity
+    ForwardSlipSmoothing = 0.45, -- High smoothing so burnout marks react instantly
+    ForwardSkidDebounceTicks = 1, -- Forward lockup should react immediately once confirmed
+    RollSpeedRange = 500,      -- Speed range used to ramp soft roll marks
+    SpinSpeedDeadzone = 8,     -- Treat near-zero wheel spin as locked
+    MinLockupSpeed = 120,      -- Minimum forward speed before lockups force skid marks
+    LockupSpinSpeed = 20,      -- Wheel spin speed below this counts as a lockup at speed
+    BurnoutSlipWeight = 1.0,   -- Extra weighting for wheelspin-driven skid intensity
+    
+    -- SURFACE CONFIGURATIONS (keyed by MAT_ENUM)
+    -- Only surfaces with CreateMarks = true will generate marks
+    Surfaces = {
+        [0] = { -- DEFAULT
+            name = "default",
+            CreateMarks = true,
+            AlwaysRoll = false,
+            SkidColor = Color(20, 20, 20, 170),
+            RollColor = Color(50, 50, 50, 70),
+            SkidWidthMul = 1.0,
+            RollWidthMul = 0.85,
+            RollStrengthMul = 0.35,
+        },
+        [67] = { -- CONCRETE
+            name = "concrete",
+            CreateMarks = true,
+            AlwaysRoll = false,
+            -- Material = "sprites/lvs/skidmark",
+            -- Texture = "https://example.com/concrete_skid.png",
+            StrengthMul = 1.6,
+            SkidColor = Color(10, 10, 10, 220),
+            RollColor = Color(55, 55, 55, 75),
+            SkidWidthMul = 1.0,
+            RollWidthMul = 0.8,
+            RollStrengthMul = 0.3,
+        },
+        [68] = { -- DIRT
+            name = "dirt",
+            CreateMarks = true,
+            AlwaysRoll = true,
+            -- Texture = "https://example.com/dirt_roll.png",
+            SkidColor = Color(55, 40, 28, 165),
+            RollColor = Color(85, 65, 40, 95),
+            SkidWidthMul = 1.0,
+            RollWidthMul = 0.95,
+            RollStrengthMul = 0.45,
+        },
+        [71] = { -- GRATE
+            name = "grate",
+            CreateMarks = false,
+        },
+        [74] = { -- SNOW
+            name = "snow",
+            CreateMarks = true,
+            AlwaysRoll = true,
+            SkidColor = Color(90, 90, 110, 150),
+            RollColor = Color(120, 120, 140, 85),
+            RollStrengthMul = 0.4,
+        },
+        [77] = { -- METAL
+            name = "metal",
+            CreateMarks = true,
+            AlwaysRoll = false,
+            SkidColor = Color(40, 40, 40, 160),
+            RollColor = Color(40, 40, 40, 160),
+        },
+        [78] = { -- SAND
+            name = "sand",
+            CreateMarks = true,
+            AlwaysRoll = true,
+            SkidColor = Color(110, 90, 55, 150),
+            RollColor = Color(135, 115, 70, 90),
+            RollStrengthMul = 0.45,
+        },
+        [84] = { -- TILE
+            name = "tile",
+            CreateMarks = true,
+            AlwaysRoll = false,
+            SkidColor = Color(50, 50, 50, 170),
+            RollColor = Color(50, 50, 50, 170),
+        },
+        [85] = { -- GRASS
+            name = "grass",
+            CreateMarks = true,
+            AlwaysRoll = true,
+            SkidColor = Color(45, 65, 28, 120),
+            RollColor = Color(65, 85, 40, 75),
+            RollStrengthMul = 0.4,
+        },
+        [87] = { -- WOOD
+            name = "wood",
+            CreateMarks = true,
+            AlwaysRoll = false,
+            SkidColor = Color(60, 60, 60, 140),
+            RollColor = Color(60, 60, 60, 140),
+        },
+        [88] = { -- DEFAULT (garrysmod specific)
+            name = "default_gmod",
+            CreateMarks = true,
+            AlwaysRoll = false,
+            SkidColor = Color(20, 20, 20, 170),
+            RollColor = Color(50, 50, 50, 70),
+        },
+    }
+}
+
+-- Copy initial config to core
+SkidmarkCore.Config = Config
+SkidmarkCore.Config.Enabled = false
+
+if CLIENT then
+    -- Config Version Check Logic
+    local function checkConfigVersionOnSpawn()
+        if not Config.AllowCheckVersion then return end
+        local githubURL = "https://raw.github.com/nokillnando/Starfall/main/skidmark_system/skidmark_config.txt"
+        local localVersion = Version
+        local maxRetries = 10
+
+        local function doVersionCheck()
+            if not http.canRequest() then
+                maxRetries = maxRetries - 1
+                if maxRetries <= 0 then return end
+                timer.simple(0.5, doVersionCheck)
+                return
+            end
+
+            http.get(githubURL,
+                function(data)
+                    if not (data and data ~= "") then return end
+
+                    local versionStart = data:find('Version = "')
+                    if not versionStart then return end
+
+                    versionStart = versionStart + 11
+                    local versionEnd = data:find('"', versionStart)
+                    if not versionEnd or versionEnd <= versionStart then return end
+
+                    local remoteVersion = data:sub(versionStart, versionEnd - 1)
+                    local remoteParts = string.explode(".", remoteVersion)
+                    local localParts = string.explode(".", localVersion)
+
+                    local remoteMajor = tonumber(remoteParts[1]) or 0
+                    local remoteMinor = tonumber(remoteParts[2]) or 0
+                    local localMajor = tonumber(localParts[1]) or 0
+                    local localMinor = tonumber(localParts[2]) or 0
+
+                    if remoteMajor > localMajor or (remoteMajor == localMajor and remoteMinor > localMinor) then
+                        print(Color(255, 255, 255), "Skidmark Config Update available! Local: ", Color(0, 255, 0), localVersion, Color(255, 255, 255), " | Remote: ", Color(0, 255, 0), remoteVersion)
+                    else
+                        print(Color(255, 255, 255), "Local Skidmark Config is up to date! Version: ", Color(0, 255, 0), localVersion)
+                    end
+                end,
+                function(err) end
+            )
+        end
+        timer.simple(1.5, doVersionCheck) -- Offset slightly from core check
+    end
+
+    timer.simple(1, checkConfigVersionOnSpawn)
+
+    print("[Skidmark] System loaded. Wire FrontWheels, RearWheels, and Base to activate.")
+end
