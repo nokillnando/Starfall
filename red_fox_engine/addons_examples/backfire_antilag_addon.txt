@@ -393,7 +393,13 @@ return {
                 
                 -- Initialize URL Stream Pool to prevent HTTP spam and limit BASS channel usage!
                 self._urlPools = {}
+                local loadQueue = {}
+                
                 if self.UseURLSounds and #self.URLSounds > 0 then
+                    local urlCount = #self.URLSounds
+                    -- Ensure we have at least 3 total streams across all URLs to support overlapping pops
+                    local streamsPerUrl = math.max(1, math.ceil(3 / urlCount))
+                    
                     for _, url in ipairs(self.URLSounds) do
                         local dlUrl = url
                         if string.find(dlUrl, "github.com") then
@@ -401,23 +407,36 @@ return {
                             dlUrl = string.replace(dlUrl, "/blob/", "/")
                         end
                         
-                        self._urlPools[dlUrl] = {}
-                        -- Pre-load 3 concurrent streams per URL. This creates a finite, reusable pool
-                        -- that supports overlapping backfires without repeatedly spamming http.get
-                        for i = 1, 3 do
-                            bass.loadURL(dlUrl, "3d noblock noplay", function(s, errId, errStr)
-                                if s then
-                                    s:setLooping(true) -- CRITICAL: prevents stream from dying
-                                    s:pause()
-                                    pcall(function() s:setTime(0) end)
-                                    table.insert(self._urlPools[dlUrl], {stream = s, idle = true})
-                                else
-                                    print("[Backfire Addon] Pool Load Failed: ", errId, errStr)
-                                end
-                            end)
+                        self._urlPools[dlUrl] = self._urlPools[dlUrl] or {}
+                        -- Queue streams strategically to minimize HTTP requests while maintaining a reusable pool
+                        for i = 1, streamsPerUrl do
+                            table.insert(loadQueue, dlUrl)
                         end
                     end
                 end
+                
+                local function processLoadQueue()
+                    if #loadQueue == 0 then return end
+                    local dlUrl = table.remove(loadQueue, 1)
+                    
+                    bass.loadURL(dlUrl, "3d noblock noplay", function(s, errId, errStr)
+                        if s then
+                            s:setLooping(true) -- CRITICAL: prevents stream from dying
+                            s:pause()
+                            pcall(function() s:setTime(0) end)
+                            table.insert(self._urlPools[dlUrl], {stream = s, idle = true})
+                        else
+                            print("[Backfire Addon] Pool Load Failed: ", errId, errStr)
+                        end
+                        
+                        if #loadQueue > 0 then
+                            timer.simple(0.15, processLoadQueue)
+                        end
+                    end)
+                end
+                
+                -- Start queue processing with an initial delay
+                timer.simple(2 + math.rand(0, 1), processLoadQueue)
 
                 net.receive("Backfire_SyncExhausts", function()
                     self.clientExhaustIDs = {}
@@ -597,17 +616,22 @@ return {
                 
                 if sndPath ~= "" then
                     if isUrl and CLIENT then
-                        local pool = self._urlPools[sndPath]
-                        if pool then
-                            local selected = nil
+                        -- Find all idle streams across ALL URLs to allow dynamic overlapping
+                        local idleStreams = {}
+                        for _, pool in pairs(self._urlPools) do
                             for _, item in ipairs(pool) do
                                 if item.idle and item.stream and item.stream:isValid() then
-                                    selected = item
-                                    break
+                                    table.insert(idleStreams, item)
                                 end
                             end
-                            
-                            if selected then
+                        end
+                        
+                        local selected = nil
+                        if #idleStreams > 0 then
+                            selected = idleStreams[math.random(1, #idleStreams)]
+                        end
+                        
+                        if selected then
                                 selected.idle = false
                                 local s = selected.stream
                                 
@@ -646,7 +670,6 @@ return {
                                     end
                                 end)
                             end
-                        end
                     elseif not isUrl then
                         if SERVER then
                             local finalPitch = math.random(self.SoundPitchMin, self.SoundPitchMax) / 100
