@@ -2,7 +2,7 @@
 --@author [C17] Red Fox
 --@shared
 
-local Version = "1.13"
+local Version = "1.14"
 
 if CLIENT then
     
@@ -498,6 +498,12 @@ else -- SERVER
             end
 
             local previousMass = TotalRealMass
+            
+            -- [SPIKE FILTER] Silently ignore impossible mass spikes caused by Physgun (often adds 50,000kg)
+            if totalMass > (previousMass > 0 and previousMass + 10000 or Config.TotalVehicleMass + 10000) then
+                totalMass = previousMass > 0 and previousMass or Config.TotalVehicleMass
+            end
+            
             TotalRealMass = totalMass
 
             local massChanged = math.abs(TotalRealMass - lastReportedMass) > 0.1

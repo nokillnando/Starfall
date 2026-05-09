@@ -3,13 +3,21 @@
 
 local Core = {}
 _G.RedFoxEngineCore = Core
-local Version = "3.03" -- v3 Alpha
+local Version = "3.04" -- v3 Alpha
 
 --[[
 Changelog:
 
+V3.04
+    Small fix regarding physgun mass for vehicle mass calculation
+
+V3.03
+    Some fixes
+    Optmization
+    Vehicle weight calculation option, so heavier gets slower, engine doesnt ignore that
+
 V3.01
-Initial public version
+    Initial public version
 
 ]]--
 
@@ -257,10 +265,14 @@ if SERVER then
             local nextCheck = state.NextMassCheck or 0
             if state.MassCacheChassis ~= chassis or timer.curtime() >= nextCheck then
                 local previousActual = state.ActualVehicleMass
-                local previousActual = state.ActualVehicleMass
                 local previousSimulated = state.SimulatedVehicleMass
                 local previousEffective = state.EffectiveVehicleMass
                 local actualMass = calculateVehicleMass(chassis) or config.Engine_SimulatedVehicleMass or 1000
+                
+                -- [SPIKE FILTER] Silently ignore impossible mass spikes caused by Physgun (often adds 50,000kg)
+                if actualMass > ((previousActual and previousActual > 0) and previousActual + 10000 or (config.Engine_SimulatedVehicleMass or 1000) + 10000) then
+                    actualMass = (previousActual and previousActual > 0) and previousActual or config.Engine_SimulatedVehicleMass or 1000
+                end
                 local simulatedMass = config.Engine_SimulatedVehicleMass or 1000
                 local effectiveMass = simulatedMass
 
