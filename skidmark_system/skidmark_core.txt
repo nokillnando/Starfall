@@ -2,7 +2,7 @@
 --@author [C17] Red Fox
 --@shared
 
-local Version = "1.00"
+local Version = "1.01"
 
 -- Skidmark Core - Pure logic and rendering, no configuration
 local SkidmarkCore = {}
@@ -806,7 +806,8 @@ if CLIENT then
         
         local time = timer.curtime()
         if time < nextProcess then return end
-        nextProcess = time + (config.SegmentDelay or 0.05)
+        local delay = config.UpdateRate and (1 / config.UpdateRate) or (config.SegmentDelay or 0.05)
+        nextProcess = time + delay
 
         local filter = getTraceFilter(wheels, chassis)
         local axleSpinState = buildAxleSpinState(wheels, chassis)
@@ -1310,25 +1311,32 @@ if SERVER then
         end
 
         if pendingWheelBroadcast and now >= nextWheelBroadcast then
-            broadcastWheels(find.allPlayers())
-            lastWheelBroadcastSignature = pendingWheelBroadcastSignature
-            pendingWheelBroadcastSignature = nil
-            pendingWheelBroadcast = false
-            nextWheelBroadcast = now + metadataDelay
-            nextPeriodicWheelBroadcast = now + metadataRefreshDelay
+            if net.getBytesLeft() > 1024 then
+                broadcastWheels(find.allPlayers())
+                lastWheelBroadcastSignature = pendingWheelBroadcastSignature
+                pendingWheelBroadcastSignature = nil
+                pendingWheelBroadcast = false
+                nextWheelBroadcast = now + metadataDelay
+                nextPeriodicWheelBroadcast = now + metadataRefreshDelay
+            end
         elseif now >= nextPeriodicWheelBroadcast then
-            broadcastWheels(find.allPlayers())
-            lastWheelBroadcastSignature = wheelBroadcastSignature
-            nextPeriodicWheelBroadcast = now + metadataRefreshDelay
+            if net.getBytesLeft() > 1024 then
+                broadcastWheels(find.allPlayers())
+                lastWheelBroadcastSignature = wheelBroadcastSignature
+                nextPeriodicWheelBroadcast = now + metadataRefreshDelay
+            end
         end
 
         local stateDelay = SkidmarkCore.Config.StateBroadcastDelay
         if stateDelay == nil then
-            stateDelay = math.max((SkidmarkCore.Config.SegmentDelay or 0.05) * 0.5, 0.025)
+            local logicDelay = SkidmarkCore.Config.UpdateRate and (1 / SkidmarkCore.Config.UpdateRate) or (SkidmarkCore.Config.SegmentDelay or 0.05)
+            stateDelay = math.max(logicDelay * 0.5, 0.025)
         end
         if now < nextStateBroadcast then return end
-        nextStateBroadcast = now + stateDelay
 
-        broadcastWheelState(find.allPlayers())
+        if net.getBytesLeft() > 512 then
+            broadcastWheelState(find.allPlayers())
+            nextStateBroadcast = now + stateDelay
+        end
     end)
 end

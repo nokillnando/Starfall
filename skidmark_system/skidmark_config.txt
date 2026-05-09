@@ -17,7 +17,7 @@ local Config = {
     -- BUFFER & LIFETIME
     MaxQuads = 96,             -- Max number of quad segments alive at once
     Lifetime = 10,             -- How long skidmarks persist (seconds)
-    SegmentDelay = 0.05,       -- Interval between adding new mark segments
+    UpdateRate = 66,           -- Calculation frequency (Hz). Higher = smoother marks but more CPU cost.
     HologramLimit = 96,        -- Safety cap to stay below Starfall's hologram limit
     
     -- RENDERING & APPEARANCE

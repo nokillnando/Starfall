@@ -2,7 +2,7 @@
 --@author [C17] Red Fox
 --@shared
 
-local Version = "2.11"
+local Version = "2.13"
 
 --Offset fix??
 
@@ -143,6 +143,95 @@ if CLIENT then
         table.insert(vtfQueue, { url = url, callback = callback })
         pumpVtfQueue()
     end
+    
+    local imageDownloads = imageDownloads or {}
+    
+    local function asyncDownloadImage(url, callback)
+        local cleanUrl = url:match("^([^?]+)") or url
+        local fileName = cleanUrl:match("([^/]+%.png)$") or cleanUrl:match("([^/]+%.jpg)$") or cleanUrl:match("([^/]+%.jpeg)$")
+        
+        if not fileName then
+            callback(nil)
+            return
+        end
+        
+        local tempPath = "../data/sf_filedatatemp/" .. owner():getSteamID64(false) .. "/" .. fileName
+
+        local function safeCallback(path)
+            if isValid(chip()) then callback(path) end
+        end
+
+        if file.existsTemp(fileName) then
+            timer.simple(0.1, function() safeCallback(tempPath) end)
+            return
+        end
+
+        if imageDownloads[url] then
+            local tries = 0
+            local poll
+            poll = function()
+                tries = tries + 1
+                if file.existsTemp(fileName) then
+                    timer.simple(0.3, function() safeCallback(tempPath) end)
+                elseif tries < 30 then
+                    timer.simple(0.25, poll)
+                else
+                    callback(nil)
+                end
+            end
+            timer.simple(0.1, poll)
+            return
+        end
+
+        imageDownloads[url] = true
+
+        local function safeGet()
+            if http.getActiveRequests() >= http.getMaximumRequests() then
+                timer.simple(0.25, safeGet)
+                return
+            end
+
+            file.deleteTemp(fileName)
+
+            http.get(url,
+                function(data)
+                    imageDownloads[url] = nil
+                    if data and #data > 0 then
+                        file.writeTemp(fileName, data)
+                        timer.simple(0.3, function() safeCallback(tempPath) end)
+                    else
+                        callback(nil)
+                    end
+                end,
+                function()
+                    imageDownloads[url] = nil
+                    callback(nil)
+                end
+            )
+        end
+        safeGet()
+    end
+
+    local imageQueue = {}
+    local imageRunning = 0
+
+    local function pumpImageQueue()
+        local max = http.getMaximumRequests()
+        while imageRunning < max and #imageQueue > 0 do
+            local job = table.remove(imageQueue, 1)
+            imageRunning = imageRunning + 1
+            asyncDownloadImage(job.url, function(path)
+                imageRunning = imageRunning - 1
+                if job.callback then job.callback(path) end
+                pumpImageQueue()
+            end)
+        end
+    end
+
+    local function queueImageDownload(url, callback)
+        table.insert(imageQueue, { url = url, callback = callback })
+        pumpImageQueue()
+    end
 
 
 
@@ -152,6 +241,91 @@ if CLIENT then
     local activeConfig = {}
     local spawnedHolograms = {}
     local networkedEntities = {}
+    local fixAnglesHolos = {}
+
+    local function getRestingAngle(wheelEnt, fixEnt, fixP, fixY, fixR, invertAxis)
+        local restingWorldAng = fixEnt:getAngles()
+        
+        if type(fixP) == "number" then restingWorldAng = restingWorldAng:rotateAroundAxis(restingWorldAng:getRight(), fixP) end
+        if type(fixY) == "number" then restingWorldAng = restingWorldAng:rotateAroundAxis(restingWorldAng:getUp(), fixY) end
+        if type(fixR) == "number" then restingWorldAng = restingWorldAng:rotateAroundAxis(restingWorldAng:getForward(), fixR) end
+
+        if fixP ~= nil and fixP ~= false then
+            local R1 = restingWorldAng:getRight()
+            local R2 = wheelEnt:getRight()
+            if invertAxis then R2 = -R2 end
+            local axis = R1:cross(R2)
+            local len = axis:getLength()
+            if len > 0.0001 then
+                axis:normalize()
+                local dot = math.clamp(R1:dot(R2), -1, 1)
+                restingWorldAng = restingWorldAng:rotateAroundAxis(axis, math.deg(math.acos(dot)))
+            elseif R1:dot(R2) < 0 then
+                restingWorldAng = restingWorldAng:rotateAroundAxis(restingWorldAng:getUp(), 180)
+            end
+        elseif fixY ~= nil and fixY ~= false then
+            local U1 = restingWorldAng:getUp()
+            local U2 = wheelEnt:getUp()
+            if invertAxis then U2 = -U2 end
+            local axis = U1:cross(U2)
+            local len = axis:getLength()
+            if len > 0.0001 then
+                axis:normalize()
+                local dot = math.clamp(U1:dot(U2), -1, 1)
+                restingWorldAng = restingWorldAng:rotateAroundAxis(axis, math.deg(math.acos(dot)))
+            elseif U1:dot(U2) < 0 then
+                restingWorldAng = restingWorldAng:rotateAroundAxis(restingWorldAng:getRight(), 180)
+            end
+        elseif fixR ~= nil and fixR ~= false then
+            local F1 = restingWorldAng:getForward()
+            local F2 = wheelEnt:getForward()
+            if invertAxis then F2 = -F2 end
+            local axis = F1:cross(F2)
+            local len = axis:getLength()
+            if len > 0.0001 then
+                axis:normalize()
+                local dot = math.clamp(F1:dot(F2), -1, 1)
+                restingWorldAng = restingWorldAng:rotateAroundAxis(axis, math.deg(math.acos(dot)))
+            elseif F1:dot(F2) < 0 then
+                restingWorldAng = restingWorldAng:rotateAroundAxis(restingWorldAng:getUp(), 180)
+            end
+        else
+            restingWorldAng = wheelEnt:getAngles()
+        end
+        
+        return restingWorldAng
+    end
+    
+    local function registerFixAnglesHolo(holo)
+        local cfg = holo.MeshConfig
+        if not cfg or not cfg.FixAngles then return end
+        
+        -- Pre-cache all the config values so the render loop does zero table lookups
+        local entry = {
+            holo = holo,
+            parentName = holo.MeshTargetParentName,
+            fixTargetName = cfg.AngleFixTarget or "Base",
+            offsetPos = cfg.offsetPos or activeConfig.offsetPos or Vector(0, 0, 0),
+            offsetAng = cfg.offsetAngle or activeConfig.offsetAngle or Angle(0, 0, 0),
+            fixP = cfg.FixAngles.pitch,
+            fixY = cfg.FixAngles.yaw,
+            fixR = cfg.FixAngles.roll,
+            invertAxis = cfg.FixAngles.invert,
+        }
+        table.insert(fixAnglesHolos, entry)
+    end
+    
+    local function refreshFixAnglesRefs()
+        for i = #fixAnglesHolos, 1, -1 do
+            local e = fixAnglesHolos[i]
+            if not isValid(e.holo) then
+                table.remove(fixAnglesHolos, i)
+            else
+                e.parent = (e.parentName and networkedEntities[e.parentName] and isValid(networkedEntities[e.parentName])) and networkedEntities[e.parentName] or base
+                e.fixTarget = (e.fixTargetName ~= "Base" and networkedEntities[e.fixTargetName] and isValid(networkedEntities[e.fixTargetName])) and networkedEntities[e.fixTargetName] or base
+            end
+        end
+    end
 
     local function updateHoloTransforms(holo)
         if not isValid(holo) then return end
@@ -161,15 +335,75 @@ if CLIENT then
             targetParent = networkedEntities[holo.MeshTargetParentName]
         end
         
-        holo:setParent(targetParent)
-
-        -- Use individual mesh offsets if they exist, otherwise global, or default to 0 if not loaded yet
         local meshOffsetPos = (holo.MeshConfig and holo.MeshConfig.offsetPos) or activeConfig.offsetPos or Vector(0, 0, 0)
         local meshOffsetAng = (holo.MeshConfig and holo.MeshConfig.offsetAngle) or activeConfig.offsetAngle or Angle(0, 0, 0)
         
-        holo:setPos(targetParent:localToWorld(meshOffsetPos))
-        holo:setAngles(targetParent:localToWorldAngles(meshOffsetAng))
+        if holo.MeshConfig and holo.MeshConfig.FixAngles then
+            -- Stay parented for free position interpolation
+            if holo:getParent() ~= targetParent then
+                holo:setParent(targetParent)
+            end
+            holo:setPos(targetParent:localToWorld(meshOffsetPos))
+            
+            local fixTargetName = holo.MeshConfig.AngleFixTarget or "Base"
+            local fixTarget = base
+            if fixTargetName ~= "Base" and networkedEntities[fixTargetName] and isValid(networkedEntities[fixTargetName]) then
+                fixTarget = networkedEntities[fixTargetName]
+            end
+            
+            local restingWorldAng = getRestingAngle(targetParent, fixTarget, holo.MeshConfig.FixAngles.pitch, holo.MeshConfig.FixAngles.yaw, holo.MeshConfig.FixAngles.roll, holo.MeshConfig.FixAngles.invert)
+            
+            local m = Matrix()
+            m:setAngles(restingWorldAng)
+            m:rotate(meshOffsetAng)
+            
+            holo:setAngles(m:getAngles())
+        else
+            holo:setParent(targetParent)
+            holo:setPos(targetParent:localToWorld(meshOffsetPos))
+            holo:setAngles(targetParent:localToWorldAngles(meshOffsetAng))
+        end
     end
+    
+    -- Think (tickrate, cheap quota): compute the heavy vector math and cache the result
+    hook.add("Think", "MeshLoader_AngleCalc", function()
+        for i = #fixAnglesHolos, 1, -1 do
+            local e = fixAnglesHolos[i]
+            if not isValid(e.holo) then
+                table.remove(fixAnglesHolos, i)
+            else
+                local parent = e.parent
+                if not isValid(parent) then parent = base end
+                local fix = e.fixTarget
+                if not isValid(fix) then fix = base end
+                
+                -- Re-sync position periodically to self-heal after void/teleport (throttled to avoid net burst)
+                local now = timer.curtime()
+                if not e.lastPosSync or now - e.lastPosSync > 1 then
+                    e.holo:setPos(parent:localToWorld(e.offsetPos))
+                    e.lastPosSync = now
+                end
+                
+                local ang = getRestingAngle(parent, fix, e.fixP, e.fixY, e.fixR, e.invertAxis)
+                
+                local m = Matrix()
+                m:setAngles(ang)
+                m:rotate(e.offsetAng)
+                
+                e.cachedWorldAng = m:getAngles()
+            end
+        end
+    end)
+    
+    -- Render hook (framerate): only a single setAngles per holo, no math
+    hook.add("PreDrawOpaqueRenderables", "MeshLoader_AngleFix", function()
+        for i = 1, #fixAnglesHolos do
+            local e = fixAnglesHolos[i]
+            if e.cachedWorldAng and isValid(e.holo) then
+                e.holo:setAngles(e.cachedWorldAng)
+            end
+        end
+    end)
 
     net.receive("sendBase", function()
         local ent = net.readEntity()
@@ -178,6 +412,7 @@ if CLIENT then
         for i, holo in ipairs(spawnedHolograms) do
             updateHoloTransforms(holo)
         end
+        refreshFixAnglesRefs()
     end)
     
     net.receive("sendMeshParent", function()
@@ -190,9 +425,84 @@ if CLIENT then
                 updateHoloTransforms(holo)
             end
         end
+        refreshFixAnglesRefs()
     end)
     local activeWireSwaps = {}
     
+    local function applyHoloSwaps(holo)
+        if not isValid(holo) or not holo.MeshConfig then return end
+        
+        local swapConfig = holo.MeshConfig.TextureSwaps
+        local activeSwapName = nil
+        
+        if swapConfig and holo.ActiveSwaps then
+            for name, _ in pairs(swapConfig) do
+                if holo.ActiveSwaps[name] then
+                    activeSwapName = name
+                    break
+                end
+            end
+        end
+        
+        local mat = holo.MeshConfig.mat
+        local swapData = activeSwapName and swapConfig[activeSwapName]
+        
+        if holo.MeshConfig.OriginalTexture and mat and mat.setTexture then
+            if activeSwapName then
+                local t = holo.MeshConfig.preloadedSwaps and holo.MeshConfig.preloadedSwaps[activeSwapName]
+                if t then
+                    mat:setTexture("$basetexture", t)
+                else
+                    mat:setTexture("$basetexture", holo.MeshConfig.OriginalTexture)
+                end
+            else
+                mat:setTexture("$basetexture", holo.MeshConfig.OriginalTexture)
+            end
+        end
+        
+        local isHighlight = type(swapData) == "table" and swapData.highlight == true
+        local swapColor = type(swapData) == "table" and swapData.color
+        local isDynamic = type(swapData) == "table" and swapData.dynamic == true
+        local dynamicMin = type(swapData) == "table" and swapData.dynamicMin or 0
+        local dynamicMax = type(swapData) == "table" and swapData.dynamicMax or 1
+        local wireVal = activeSwapName and activeWireSwaps[activeSwapName] or 1
+        
+        if isHighlight then
+            holo:suppressEngineLighting(true)
+        else
+            holo:suppressEngineLighting(holo.MeshConfig.SuppressEngineLighting or false)
+        end
+        
+        local defaultColor = holo.MeshConfig.ColorAndAlpha or Color(255, 255, 255, 255)
+        local targetColor = swapColor or defaultColor
+        
+        if isDynamic then
+            local mult = 1
+            if dynamicMax ~= dynamicMin then
+                mult = math.clamp((wireVal - dynamicMin) / (dynamicMax - dynamicMin), 0, 1)
+            end
+            local r = math.clamp(defaultColor.r + (targetColor.r - defaultColor.r) * mult, 0, 255)
+            local g = math.clamp(defaultColor.g + (targetColor.g - defaultColor.g) * mult, 0, 255)
+            local b = math.clamp(defaultColor.b + (targetColor.b - defaultColor.b) * mult, 0, 255)
+            local a = math.clamp(defaultColor.a + (targetColor.a - defaultColor.a) * mult, 0, 255)
+            holo:setColor(Color(r, g, b, a))
+        else
+            if activeSwapName then
+                holo:setColor(targetColor)
+            else
+                holo:setColor(defaultColor)
+            end
+        end
+    end
+    
+    local function triggerHoloSwapsForConfig(v)
+        for _, holo in ipairs(spawnedHolograms) do
+            if isValid(holo) and holo.MeshConfig == v then
+                applyHoloSwaps(holo)
+            end
+        end
+    end
+
     net.receive("sendMeshSwap", function()
         local inputName = net.readString()
         local val = net.readFloat()
@@ -208,55 +518,7 @@ if CLIENT then
                     holo.ActiveSwaps[inputName] = nil
                 end
                 
-                local activeSwapName = nil
-                for name, _ in pairs(holo.MeshConfig.TextureSwaps) do
-                    if holo.ActiveSwaps[name] then
-                        activeSwapName = name
-                        break
-                    end
-                end
-                
-                local mat = holo.MeshConfig.mat
-                
-                if activeSwapName then
-                    local swapData = holo.MeshConfig.TextureSwaps[activeSwapName]
-                    local isHighlight = type(swapData) == "table" and swapData.highlight == true
-                    local swapColor = type(swapData) == "table" and swapData.color
-                    
-                    if mat and mat.setTexture then
-                        local t = holo.MeshConfig.preloadedSwaps[activeSwapName]
-                        if t then
-                            mat:setTexture("$basetexture", t)
-                        elseif holo.MeshConfig.OriginalTexture then
-                            mat:setTexture("$basetexture", holo.MeshConfig.OriginalTexture)
-                        else
-                            mat:setTexture("$basetexture", "hunter/myplastic")
-                        end
-                    end
-                    
-                    if isHighlight then
-                        holo:suppressEngineLighting(true)
-                    else
-                        holo:suppressEngineLighting(holo.MeshConfig.SuppressEngineLighting or false)
-                    end
-                    
-                    if swapColor then
-                        holo:setColor(swapColor)
-                    else
-                        holo:setColor(holo.MeshConfig.ColorAndAlpha or Color(255, 255, 255, 255))
-                    end
-                else
-                    -- No active swaps remaining, revert completely to default mesh state
-                    if mat and mat.setTexture then
-                        if holo.MeshConfig.OriginalTexture then
-                            mat:setTexture("$basetexture", holo.MeshConfig.OriginalTexture)
-                        else
-                            mat:setTexture("$basetexture", "hunter/myplastic")
-                        end
-                    end
-                    holo:suppressEngineLighting(holo.MeshConfig.SuppressEngineLighting or false)
-                    holo:setColor(holo.MeshConfig.ColorAndAlpha or Color(255, 255, 255, 255))
-                end
+                applyHoloSwaps(holo)
             end
         end
     end)
@@ -331,6 +593,9 @@ if CLIENT then
             -- Apply proper transforms and parenting via central function
             updateHoloTransforms(holo)
             
+            -- Register into optimized render-frequency list if needed
+            registerFixAnglesHolo(holo)
+            
             holo:setFilterMag(v.LowPolyTexture)
             holo:setFilterMin(v.LowPolyTexture)
             holo:setMesh(holomesh)
@@ -353,38 +618,7 @@ if CLIENT then
                         holo.ActiveSwaps[swapName] = true
                     end
                 end
-                
-                local activeSwapName = nil
-                for name, _ in pairs(v.TextureSwaps) do
-                    if holo.ActiveSwaps[name] then
-                        activeSwapName = name
-                        break
-                    end
-                end
-                
-                if activeSwapName then
-                    local swapData = v.TextureSwaps[activeSwapName]
-                    local isHighlight = type(swapData) == "table" and swapData.highlight == true
-                    local swapColor = type(swapData) == "table" and swapData.color
-                    
-                    if v.mat and v.mat.setTexture then
-                        local t = v.preloadedSwaps[activeSwapName]
-                        if t then
-                            v.mat:setTexture("$basetexture", t)
-                        elseif v.OriginalTexture then
-                            v.mat:setTexture("$basetexture", v.OriginalTexture)
-                        else
-                            v.mat:setTexture("$basetexture", "hunter/myplastic")
-                        end
-                    end
-                    
-                    if isHighlight then
-                        holo:suppressEngineLighting(true)
-                    end
-                    if swapColor then
-                        holo:setColor(swapColor)
-                    end
-                end
+                applyHoloSwaps(holo)
             end
 
             if #spawnQueue > 0 then
@@ -611,7 +845,21 @@ if CLIENT then
                             end
                         end)
                     elseif v.EnvMapLink:sub(1, 4) == "http" then
-                        if hasPermission("material.urlcreate", v.EnvMapLink) then
+                        local isImage = v.EnvMapLink:lower():find("%.png") or v.EnvMapLink:lower():find("%.jpg") or v.EnvMapLink:lower():find("%.jpeg")
+                        if activeConfig.DownloadImages and isImage then
+                            queueImageDownload(v.EnvMapLink, function(path)
+                                if path then
+                                    local dummy = material.createFromImage(path, "VertexLitGeneric")
+                                    if dummy then
+                                        mat:setTexture("$envmapmask", dummy:getTexture("$basetexture"))
+                                    else
+                                        mat:setUndefined("$envmapmask")
+                                    end
+                                else
+                                    mat:setUndefined("$envmapmask")
+                                end
+                            end)
+                        elseif hasPermission("material.urlcreate", v.EnvMapLink) then
                             mat:setTextureURL("$envmapmask", v.EnvMapLink, function(_, _, w, h, layout)
                                 if not (w and h) then
                                     mat:setUndefined("$envmapmask")
@@ -638,7 +886,21 @@ if CLIENT then
                             end
                         end)
                     elseif v.PhongExponentTexture:sub(1, 4) == "http" then
-                        if hasPermission("material.urlcreate", v.PhongExponentTexture) then
+                        local isImage = v.PhongExponentTexture:lower():find("%.png") or v.PhongExponentTexture:lower():find("%.jpg") or v.PhongExponentTexture:lower():find("%.jpeg")
+                        if activeConfig.DownloadImages and isImage then
+                            queueImageDownload(v.PhongExponentTexture, function(path)
+                                if path then
+                                    local dummy = material.createFromImage(path, "VertexLitGeneric")
+                                    if dummy then
+                                        mat:setTexture("$phongexponenttexture", dummy:getTexture("$basetexture"))
+                                    else
+                                        mat:setUndefined("$phongexponenttexture")
+                                    end
+                                else
+                                    mat:setUndefined("$phongexponenttexture")
+                                end
+                            end)
+                        elseif hasPermission("material.urlcreate", v.PhongExponentTexture) then
                             mat:setTextureURL("$phongexponenttexture", v.PhongExponentTexture, function(_, _, w, h, layout)
                                 if not (w and h) then
                                     mat:setUndefined("$phongexponenttexture")
@@ -665,7 +927,21 @@ if CLIENT then
                             end
                         end)
                     elseif v.BumpMapLink:sub(1, 4) == "http" then
-                        if hasPermission("material.urlcreate", v.BumpMapLink) then
+                        local isImage = v.BumpMapLink:lower():find("%.png") or v.BumpMapLink:lower():find("%.jpg") or v.BumpMapLink:lower():find("%.jpeg")
+                        if activeConfig.DownloadImages and isImage then
+                            queueImageDownload(v.BumpMapLink, function(path)
+                                if path then
+                                    local dummy = material.createFromImage(path, "VertexLitGeneric")
+                                    if dummy then
+                                        mat:setTexture("$bumpmap", dummy:getTexture("$basetexture"))
+                                    else
+                                        mat:setUndefined("$bumpmap")
+                                    end
+                                else
+                                    mat:setUndefined("$bumpmap")
+                                end
+                            end)
+                        elseif hasPermission("material.urlcreate", v.BumpMapLink) then
                             mat:setTextureURL("$bumpmap", v.BumpMapLink, function(_, _, w, h, layout)
                                 if not (w and h) then
                                     mat:setUndefined("$bumpmap")
@@ -695,15 +971,45 @@ if CLIENT then
                                 if materialCache[fingerprint] then
                                     materialCache[fingerprint].originalTexture = path
                                 end
+                                triggerHoloSwapsForConfig(v)
                             else
                                 mat:setTexture("$basetexture", "hunter/myplastic")
+                                v.OriginalTexture = "hunter/myplastic"
+                                triggerHoloSwapsForConfig(v)
                             end
                         end)
                     elseif v.texture:sub(1, 4) == "http" then
-                        if hasPermission("material.urlcreate", v.texture) then
+                        local isImage = v.texture:lower():find("%.png") or v.texture:lower():find("%.jpg") or v.texture:lower():find("%.jpeg")
+                        if activeConfig.DownloadImages and isImage then
+                            mat:setTexture("$basetexture", "hunter/myplastic")
+                            queueImageDownload(v.texture, function(path)
+                                if path then
+                                    local dummy = material.createFromImage(path, "VertexLitGeneric")
+                                    if dummy then
+                                        local tex = dummy:getTexture("$basetexture")
+                                        mat:setTexture("$basetexture", tex)
+                                        v.OriginalTexture = tex
+                                        if materialCache[fingerprint] then
+                                            materialCache[fingerprint].originalTexture = tex
+                                        end
+                                        triggerHoloSwapsForConfig(v)
+                                    else
+                                        mat:setTexture("$basetexture", "hunter/myplastic")
+                                        v.OriginalTexture = "hunter/myplastic"
+                                        triggerHoloSwapsForConfig(v)
+                                    end
+                                else
+                                    mat:setTexture("$basetexture", "hunter/myplastic")
+                                    v.OriginalTexture = "hunter/myplastic"
+                                    triggerHoloSwapsForConfig(v)
+                                end
+                            end)
+                        elseif hasPermission("material.urlcreate", v.texture) then
                             mat:setTextureURL("$basetexture", v.texture, function(_, _, w, h, layout)
                                 if not (w and h) then
                                     mat:setTexture("$basetexture", "hunter/myplastic")
+                                    v.OriginalTexture = "hunter/myplastic"
+                                    triggerHoloSwapsForConfig(v)
                                     return
                                 end
                                 local sx, sy = 1024 / w, 1024 / h
@@ -714,6 +1020,7 @@ if CLIENT then
                                         if materialCache[fingerprint] then
                                             materialCache[fingerprint].originalTexture = v.OriginalTexture
                                         end
+                                        triggerHoloSwapsForConfig(v)
                                     end
                                 end)
                             end)
@@ -737,18 +1044,37 @@ if CLIENT then
                             if url then
                                 if url:lower():find("%.vtf") then
                                     queueVtfDownload(url, function(path)
-                                        if path then v.preloadedSwaps[inputName] = path end
+                                        if path then 
+                                            v.preloadedSwaps[inputName] = path 
+                                            triggerHoloSwapsForConfig(v)
+                                        end
                                     end)
                                 elseif url:sub(1, 4) == "http" then
-                                     local dummy = material.create("VertexLitGeneric")
-                                     dummy:setTextureURL("$basetexture", url, function(_, _, w, h, layout)
-                                         if w and h then
-                                             layout(0,0, w * (1024/w), h * (1024/h))
-                                             timer.simple(0.2, function()
-                                                 if isValid(chip()) and dummy then v.preloadedSwaps[inputName] = dummy:getTexture("$basetexture") end
-                                             end)
-                                         end
-                                     end)
+                                    local isImage = url:lower():find("%.png") or url:lower():find("%.jpg") or url:lower():find("%.jpeg")
+                                    if activeConfig.DownloadImages and isImage then
+                                        queueImageDownload(url, function(path)
+                                            if path then
+                                                local dummy = material.createFromImage(path, "VertexLitGeneric")
+                                                if dummy then
+                                                    v.preloadedSwaps[inputName] = dummy:getTexture("$basetexture") 
+                                                    triggerHoloSwapsForConfig(v)
+                                                end
+                                            end
+                                        end)
+                                    else
+                                        local dummy = material.create("VertexLitGeneric")
+                                        dummy:setTextureURL("$basetexture", url, function(_, _, w, h, layout)
+                                            if w and h then
+                                                layout(0,0, w * (1024/w), h * (1024/h))
+                                                timer.simple(0.2, function()
+                                                    if isValid(chip()) and dummy then 
+                                                        v.preloadedSwaps[inputName] = dummy:getTexture("$basetexture") 
+                                                        triggerHoloSwapsForConfig(v)
+                                                    end
+                                                end)
+                                            end
+                                        end)
+                                    end
                                 else
                                     v.preloadedSwaps[inputName] = material.load(url):getTexture("$basetexture")
                                 end
@@ -896,78 +1222,145 @@ if CLIENT then
         end)
     end
 
-    local function checkVersionOnSpawn(config)
-        if not config.AllowCheckVersion then return end
+    local function initClient(config)
+        -- Allow checking version
+        local function checkVersionOnSpawn(cfg)
+            if not cfg.AllowCheckVersion then return end
+            local githubCoreURL = "https://raw.githubusercontent.com/nokillnando/Starfall/main/mesh_loaders_new/mesh_loader_core.txt"
+            local githubConfigURL = "https://raw.githubusercontent.com/nokillnando/Starfall/main/mesh_loaders_new/mesh_loader_config.txt"
+            local localVersion = Version
+            local localConfigVersion = cfg.ConfigVersion or "2.00"
+            local maxRetries = 10
+            local W, G, R = cfg.W or Color(255,255,255), cfg.G or Color(0,255,0), cfg.R or Color(255,0,0)
 
-        local githubURL = "https://raw.github.com/nokillnando/Starfall/main/mesh_loaders_new/mesh_loader_core.txt"
-        local localVersion = Version
-        local maxRetries = 10
+            local function doVersionCheck()
+                if not http.canRequest() then
+                    maxRetries = maxRetries - 1
+                    if maxRetries <= 0 then return end
+                    timer.simple(0.5, doVersionCheck)
+                    return
+                end
 
-        local function doVersionCheck()
-            if not http.canRequest() then
-                maxRetries = maxRetries - 1
-            if maxRetries <= 0 then return end
-                timer.simple(0.5, doVersionCheck)
-                return
-            end
-
-            http.get(githubURL,
-                function(data)
-                    if not (data and data ~= "") then
-                        if config.AllowCheckVersion then
-                            print(config.W, "Core MeshLoader version check failed - no data received")
+                -- Core check
+                http.get(githubCoreURL, function(data)
+                    if data and data ~= "" then
+                        local versionStart = data:find('local Version = "')
+                        if versionStart then
+                            versionStart = versionStart + 17
+                            local versionEnd = data:find('"', versionStart)
+                            if versionEnd then
+                                local remoteVersion = data:sub(versionStart, versionEnd - 1)
+                                if tonumber(remoteVersion) and tonumber(localVersion) and tonumber(remoteVersion) > tonumber(localVersion) then
+                                    print(W, "Mesh Loader Core Update available! Local: ", R, localVersion, W, " | Remote: ", G, remoteVersion)
+                                else
+                                    print(W, "Mesh Loader Core is up to date! Version: ", G, localVersion)
+                                end
+                            else
+                                print(W, "Mesh Loader Core is up to date! (Remote version unreadable) Version: ", G, localVersion)
+                            end
+                        else
+                            print(W, "Mesh Loader Core is up to date! (Remote version missing) Version: ", G, localVersion)
                         end
-                        return
-                    end
-
-                    local versionStart = data:find('Version = "')
-                    if not versionStart then
-                        if config.AllowCheckVersion then
-                            print(config.W, "Core MeshLoader version check failed - version string not found")
-                        end
-                        return
-                    end
-
-                    versionStart = versionStart + 11
-                    local versionEnd = data:find('"', versionStart)
-                    if not versionEnd or versionEnd <= versionStart then
-                        if config.AllowCheckVersion then
-                            print(config.W, "Core MeshLoader version check failed - could not parse remote version")
-                        end
-                        return
-                    end
-
-                    local remoteVersion = data:sub(versionStart, versionEnd - 1)
-                    local remoteParts = string.explode(".", remoteVersion)
-                    local localParts = string.explode(".", localVersion)
-
-                    local remoteMajor = tonumber(remoteParts[1]) or 0
-                    local remoteMinor = tonumber(remoteParts[2]) or 0
-                    local localMajor = tonumber(localParts[1]) or 0
-                    local localMinor = tonumber(localParts[2]) or 0
-
-                    if remoteMajor > localMajor or (remoteMajor == localMajor and remoteMinor > localMinor) then
-                        print(config.W, "Check config file for updated default variables")
-                        print(config.W, "Core MeshLoader Update available! Local: ", config.G, localVersion, config.W, " | Remote: ", config.G, remoteVersion)
-                        print(config.W, "Check config file for URL")
                     else
-                        print(config.W, "Local Core MeshLoader is up to date or higher than online! Version: ", config.G, localVersion)
+                        print(W, "Mesh Loader Core is up to date! (Download failed) Version: ", G, localVersion)
                     end
-                end,
-                function(err)
-                    if config.AllowCheckVersion then
-                        print(config.W, "Core MeshLoader version check failed - could not connect to remote: ", config.R, err)
+                end, function(err)
+                    print(R, "Mesh Loader Core version check HTTP error: ", W, err)
+                end)
+
+                -- Config check (delayed to prevent http burst)
+                timer.simple(0.5, function()
+                    if not http.canRequest() then return end
+                    http.get(githubConfigURL, function(data)
+                        if data and data ~= "" then
+                            local versionStart = data:find('local ConfigVersion = "')
+                            if versionStart then
+                                versionStart = versionStart + 23
+                                local versionEnd = data:find('"', versionStart)
+                                if versionEnd then
+                                    local remoteVersion = data:sub(versionStart, versionEnd - 1)
+                                    if tonumber(remoteVersion) and tonumber(localConfigVersion) and tonumber(remoteVersion) > tonumber(localConfigVersion) then
+                                        print(W, "Mesh Loader Config Update available! Local: ", R, localConfigVersion, W, " | Remote: ", G, remoteVersion)
+                                    else
+                                        print(W, "Mesh Loader Config is up to date! Version: ", G, localConfigVersion)
+                                    end
+                                else
+                                    print(W, "Mesh Loader Config is up to date! (Remote version unreadable) Version: ", G, localConfigVersion)
+                                end
+                            else
+                                print(W, "Mesh Loader Config is up to date! (Remote version missing) Version: ", G, localConfigVersion)
+                            end
+                        else
+                            print(W, "Mesh Loader Config is up to date! (Download failed) Version: ", G, localConfigVersion)
+                        end
+                    end, function(err)
+                        print(R, "Mesh Loader Config version check HTTP error: ", W, err)
+                    end)
+                end)
+            end
+            timer.simple(1, doVersionCheck)
+        end
+        
+        activeConfig = config
+        
+        -- Sanitize all URLs in meshes before any downloads
+        local function sanitizeURL(url)
+            if type(url) ~= "string" or url == "" then return url end
+            
+            -- GitHub: convert browser links to raw content links
+            if url:find("github.com") and not url:find("raw.githubusercontent.com") then
+                url = string.replace(url, "github.com", "raw.githubusercontent.com")
+                url = string.replace(url, "/blob/", "/")
+                url = string.replace(url, "/raw/", "/")
+            end
+            
+            -- Dropbox: convert www/browser links to direct download links
+            if url:find("dropbox.com") then
+                url = string.replace(url, "www.dropbox.com", "dl.dropboxusercontent.com")
+                url = string.replace(url, "?dl=0", "")
+                url = string.replace(url, "&dl=0", "")
+            end
+            
+            -- Google Drive: convert sharing links to direct download
+            -- Handles: https://drive.google.com/file/d/FILE_ID/view?...
+            if url:find("drive.google.com/file/d/") then
+                local fileId = url:match("drive.google.com/file/d/([^/]+)")
+                if fileId then
+                    url = "https://drive.google.com/uc?export=download&id=" .. fileId
+                end
+            end
+            -- Handles: https://drive.google.com/open?id=FILE_ID
+            if url:find("drive.google.com/open%?id=") then
+                local fileId = url:match("id=([^&]+)")
+                if fileId then
+                    url = "https://drive.google.com/uc?export=download&id=" .. fileId
+                end
+            end
+            
+            return url
+        end
+        
+        local function sanitizeMeshURLs(meshes)
+            for _, v in ipairs(meshes) do
+                v.mdl = sanitizeURL(v.mdl)
+                v.texture = sanitizeURL(v.texture)
+                if v.BumpMapLink then v.BumpMapLink = sanitizeURL(v.BumpMapLink) end
+                if v.EnvMapLink then v.EnvMapLink = sanitizeURL(v.EnvMapLink) end
+                if v.PhongExponentTexture then v.PhongExponentTexture = sanitizeURL(v.PhongExponentTexture) end
+                
+                if v.TextureSwaps then
+                    for swapName, swapData in pairs(v.TextureSwaps) do
+                        if type(swapData) == "table" and swapData.texture then
+                            swapData.texture = sanitizeURL(swapData.texture)
+                        elseif type(swapData) == "string" then
+                            v.TextureSwaps[swapName] = sanitizeURL(swapData)
+                        end
                     end
                 end
-            )
+            end
         end
-
-        -- Delay start by 1s just like before
-        timer.simple(1, doVersionCheck)
-    end
-
-    local function initClient(config)
-        activeConfig = config
+        
+        sanitizeMeshURLs(config.meshes)
         
         -- Request base now that we are initialized
         net.start("requestBase")
@@ -1069,6 +1462,7 @@ else -- SERVER
     local trackedNormalInputs = {}
     local lastParentEntities = {}
     local lastNormalInputs = {}
+    local serverUpdateRate = 0.1
 
     local function initServer(config)
         trackedParentEntities = {}
@@ -1079,12 +1473,23 @@ else -- SERVER
         local inputNames = { "Base" }
         local inputTypes = { "entity" }
         local usedInputs = { ["Base"] = true }
+        serverUpdateRate = config.UpdateRate and (1 / config.UpdateRate) or 0.1
         
         -- Dynamically collect Parent and TextureSwap inputs
         if config and config.meshes then
             for _, meshData in ipairs(config.meshes) do
                 if meshData.Parent and type(meshData.Parent) == "string" then
                     local wireInputName = meshData.Parent
+                    if not usedInputs[wireInputName] then
+                        table.insert(inputNames, wireInputName)
+                        table.insert(inputTypes, "entity")
+                        usedInputs[wireInputName] = true
+                        table.insert(trackedParentEntities, wireInputName)
+                    end
+                end
+                
+                if meshData.AngleFixTarget and type(meshData.AngleFixTarget) == "string" and meshData.AngleFixTarget ~= "Base" then
+                    local wireInputName = meshData.AngleFixTarget
                     if not usedInputs[wireInputName] then
                         table.insert(inputNames, wireInputName)
                         table.insert(inputTypes, "entity")
@@ -1176,8 +1581,15 @@ else -- SERVER
             end
         end
     end)
-
+    local nextMonitor = 0
     hook.add("tick", "monitorBase", function()
+        local now = timer.curtime()
+        if now < nextMonitor then return end
+        
+        nextMonitor = now + serverUpdateRate
+
+        if net.getBytesLeft() < 512 then return end
+
         local currentBase = wire.ports.Base
         if currentBase ~= lastBase then
             lastBase = currentBase
@@ -1187,6 +1599,7 @@ else -- SERVER
         end
         
         for _, parentName in ipairs(trackedParentEntities) do
+            if net.getBytesLeft() < 256 then break end
             local currentEnt = wire.ports[parentName]
             if currentEnt ~= lastParentEntities[parentName] then
                 lastParentEntities[parentName] = currentEnt
@@ -1199,6 +1612,7 @@ else -- SERVER
         end
         
         for _, inputName in ipairs(trackedNormalInputs) do
+            if net.getBytesLeft() < 256 then break end
             local currentVal = wire.ports[inputName] or 0
             if currentVal ~= lastNormalInputs[inputName] then
                 lastNormalInputs[inputName] = currentVal

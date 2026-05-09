@@ -8,6 +8,12 @@ dofile("mesh_loaders_new/mesh_loader_core.txt")
 
     Changelog:
     
+V2.12
+    Some fixes
+    Angle locking, for things like brake calipers
+    Dynamic texture swap coloring and alpha
+    Using png/jpeg for downloading to temp files, as a way to bypass default textureurl limits(Afaik up to 60 materials now)      
+    
 V2.11
     Minor bug fixes
     
@@ -136,12 +142,17 @@ Now that this has been said, go scroll down
     offsetPos = Vector(0, 0, 0)-----As name implies
     offsetAngle = Angle(0, 0, 0)----Same as above, both are local-able for each mesh entry    
     Parent = "Wheel_Front_Left"-----Now you can set wheels and more in a single chip, works as a custom parent for each mesh entry
+    FixAngles = { pitch=false, yaw=false, roll=false, invert=false } -- Set axes to lock to AngleFixTarget's world rotation. Use invert=true for mirrored wheels (like right-side calipers).
+    AngleFixTarget = "Base"---------Entity input name whose angle is used for FixAngles (defaults to Base)
     
     TextureSwaps = {
         ["Brake"] = { --Input name
             texture = "url here", --optional url or texture path
             highlight = false, -- disable lighting or not when activating the swap, and optionally change color/alpha
-            color = Color(255,0,0,255) --optional
+            color = Color(255,0,0,255), --optional
+            dynamic = true, -- If true, the input float maps to a color/alpha multiplier
+            dynamicMin = 0, -- Float value representing 0% multiplier (faint)
+            dynamicMax = 300 -- Float value representing 100% multiplier (full glow)
         } 
     }
 
@@ -189,6 +200,7 @@ Now that this has been said, go scroll down
     ]]--
 --############################################################################################################################################
 --Actual things to change
+local ConfigVersion = "2.13"
 local meshName = "Body - Main" --Just the chip name when finished
 local globalScale = Vector(1) -- Scale all meshes added by this amount, or add a scale vector to individual meshes
 local offsetPos = Vector(0, 0, 0) -- Offsets are relative to chip/base
@@ -201,6 +213,8 @@ local showProgressDisplay = true  -- Set to true to show 3D2D progress display, 
 local progressDisplayType = "bar"  -- "bar" or "text" for the display style
 local progressDisplayHeight = 35  -- Height above the chip
 local AllowCheckVersion = true  -- Set to false to disable online version checking
+local UpdateRate = 33           -- Network update frequency (Hz)
+local DownloadImages = true     -- Set to true to bypass texture limits by downloading png/jpg to temp
 
 -- scale parameters can be added optionally for individual meshes, can leave them out if they aren't used
 local meshes = {
@@ -219,15 +233,20 @@ local meshes = {
             Flags = {2048},   --be careful of the flags, the order matters as well as the type     
             
             --Parent = "Wheel_Front_Left" --now you can set wheels and more in a single chip
-           -[[
+            --FixAngles = { pitch=false, yaw=false, roll=false },
+            --AngleFixTarget = "Base",
+           --[[
             TextureSwaps = {
                 ["Brake"] = { --Input name
                     texture = "url here", --optional url or texture path
                     highlight = false, -- disable lighting or not when activating the swap, and optionally change color/alpha
-                    color = Color(255,0,0,255) --optional
+                    color = Color(255,0,0,255), --optional
+                    dynamic = true,
+                    dynamicMin = 0,
+                    dynamicMax = 300
                 } 
             }
-            -]]
+            --]]
         },
 
 
@@ -337,6 +356,9 @@ local W, R, G = Color(255, 255, 255), Color(255, 0, 0), Color(0, 255, 0)
 if _G.MeshLoaderCore then
     local configTbl = {
         AllowCheckVersion = AllowCheckVersion,
+        ConfigVersion = ConfigVersion,
+        UpdateRate = UpdateRate,
+        DownloadImages = DownloadImages,
         meshName = meshName,
         globalScale = globalScale,
         offsetPos = offsetPos,

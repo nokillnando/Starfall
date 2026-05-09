@@ -12,8 +12,10 @@ if SERVER then
         "Entity", "Number", "Number", "Number", "Number", "Number", "Number", "Number"
     })
     
-    local engineMaxRpm = 9000
+    local engineMaxRpm = 10000
     local TurboPsiMax = 6
+    
+    local UpdateRate = 33 -- Networking update frequency (Hz)
     
     -- The queueing system is redesigned to be more robust and prevent the burst limit error.
     local sendQueue = {}
@@ -35,7 +37,7 @@ if SERVER then
 
         -- Enforce minimum per-player interval to avoid burst limit (`net.send` can fail in rapid bursts)
         local now = timer.systime()
-        local minInterval = 0.1 -- 10Hz max (adjust higher for safety)
+        local minInterval = 1 / UpdateRate
         if lastSendTime[ply] and now - lastSendTime[ply] < minInterval then
             if not table.hasValue(sendQueue, ply) then
                 table.insert(sendQueue, ply)
@@ -74,7 +76,7 @@ if SERVER then
         end
 
         local availableBytes = (net.getBytesLeft and net.getBytesLeft()) or math.huge
-        if availableBytes < messageSize then
+        if availableBytes < 256 then -- leave safe headroom for engine/other scripts
             if not table.hasValue(sendQueue, ply) then
                 table.insert(sendQueue, ply)
             end
@@ -123,6 +125,8 @@ if CLIENT then
     local AutoMode = false 
     local MultipleReverseGears = false
     local enableInterpolation = true
+    local playerScaleSpeed = true -- multiply displayed speed by 1.33 when enabled
+    local playerScaleFactor = 1.33
 
     --[[
         CUSTOMIZATION: Choose what to draw.
@@ -158,7 +162,13 @@ if CLIENT then
     
     local cos, sin, rad, clamp, round, floor, abs = math.cos, math.sin, math.rad, math.clamp, math.round, math.floor, math.abs
     
-    function unitsTo(u, t) return (u * 0.75) * (units[t] or 0) end
+    function unitsTo(u, t)
+        local converted = (u * 0.75) * (units[t] or 0)
+        if playerScaleSpeed then
+            converted = converted * playerScaleFactor
+        end
+        return converted
+    end
     
     local fonts = {}
     local materials = {
