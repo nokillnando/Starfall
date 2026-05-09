@@ -2365,30 +2365,18 @@ if CLIENT then
                     end
                 end
 
-                -- Check Core module
-                local coreURL = "https://raw.github.com/nokillnando/Starfall/main/red_fox_engine/simulated_engine_core_modular.txt"
-                http.get(coreURL, function(data)
-                    if data and data ~= "" then
-                        local startIdx = data:find('local Version = "')
-                        if startIdx then
-                            local endIdx = data:find('"', startIdx + 17)
-                            if endIdx then
-                                remoteCoreVer = data:sub(startIdx + 17, endIdx - 1)
-                                if parseVersions(Version, remoteCoreVer) then
-                                    coreUpToDate = false
-                                end
-                            end
-                        end
+                local function checkConfig()
+                    if not cfg.ConfigVersion then
+                        configDone = true
+                        evalResults()
+                        return
                     end
-                    coreDone = true
-                    evalResults()
-                end, function() 
-                    coreDone = true
-                    evalResults()
-                end)
-
-                -- Check Config template
-                if cfg.ConfigVersion then
+                    
+                    if not http.canRequest() then
+                        timer.simple(0.5, checkConfig)
+                        return
+                    end
+                    
                     local configURL = "https://raw.github.com/nokillnando/Starfall/main/red_fox_engine/red_fox_engine_config_modular.txt"
                     http.get(configURL, function(data)
                         if data and data ~= "" then
@@ -2410,8 +2398,32 @@ if CLIENT then
                         evalResults()
                     end)
                 end
+
+                -- Check Core module
+                local coreURL = "https://raw.github.com/nokillnando/Starfall/main/red_fox_engine/simulated_engine_core_modular.txt"
+                http.get(coreURL, function(data)
+                    if data and data ~= "" then
+                        local startIdx = data:find('local Version = "')
+                        if startIdx then
+                            local endIdx = data:find('"', startIdx + 17)
+                            if endIdx then
+                                remoteCoreVer = data:sub(startIdx + 17, endIdx - 1)
+                                if parseVersions(Version, remoteCoreVer) then
+                                    coreUpToDate = false
+                                end
+                            end
+                        end
+                    end
+                    coreDone = true
+                    checkConfig()
+                end, function() 
+                    coreDone = true
+                    checkConfig()
+                end)
             end
-            timer.simple(1, doVersionCheck)
+            
+            -- Randomize initial delay slightly to prevent multiple engines from bursting simultaneously
+            timer.simple(1 + math.rand(0, 2), doVersionCheck)
         end
     
         checkVersionOnSpawn(config)
