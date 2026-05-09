@@ -6,21 +6,27 @@
     Wheels = "array",
     SteerAngle = "number",
     Speed = "number",
-    Base = "entity"
+    Base = "entity",
+    StaticFilter = "array",
+    DynamicFilter = "array"
 },{SteerOut = "number", SpeedOut = "number"})
 local wheels = wire.ports.Wheels
 local base = wire.ports.Base
 
 
         local smoothingPitch = 5  -- Adjust the smoothing factor as needed
-        local smoothingRoll =10  -- Adjust the smoothing factor as needed
+        local smoothingRoll =18  -- Adjust the smoothing factor as needed
         local smoothingYaw = 0 -- Adjust the smoothing factor as needed
         
         local forceMultiplier = 100
         local YawMultAD = 0 --unless something has gone wrong or you changed Z value, dont change this
         local MaxTurnInput = 45
         
-        local Alpha = 0
+        local UpdateRate = 45 -- Update rate in Hz (Lower = less CPU, but might be less smooth)
+        local FilterRefreshRate = 2.0 -- How often the Dynamic Filter array and Player list updates (Seconds)
+        local AllowPrintFilter = true -- Print to console when the Dynamic filter adds or removes entities
+        
+        local Alpha = 255
         
         local ColorFR = Color(255,0,0,Alpha)
         local ColorFL = Color(0,255,0,Alpha)
@@ -39,8 +45,8 @@ end
     --E:setMass(150) E:setMaterial("sprops/sprops_grid_12x12")
    -- E:setColor(Color(255,255,255,255))
     
-    local HeightF, HeightB = 30, 30
-    local LengthF, LengthB, WidthF, WidthB = 65, 55, -45, -45
+    local HeightF, HeightB = 15, 15
+    local LengthF, LengthB, WidthF, WidthB = 55, 55, -30, -30
     
     local Holos = {}
     
@@ -158,18 +164,76 @@ function lerpNormalized(inputValue, maxInputValue)
     return lerpedValue
 end
 
-
-    timer.create("interval", 0.02, 0, function()
-
+    local E_phys = E:getPhysicsObject()
+    local E_inertia = isValid(E_phys) and E_phys:getInertia() or Vector(0,0,0)
+    
+    local baseFilter = {E, chip()}
+    for i=1, 4 do if wheels and wheels[i] then baseFilter[#baseFilter+1] = wheels[i] end end
+    
+    -- Add all physical constraints (entire car body) to the static filter
+    local constraints = E:getAllConstrained()
+    for _, ent in ipairs(constraints) do
+        if isValid(ent) then baseFilter[#baseFilter+1] = ent end
+    end
+    
+    -- Add manually wired StaticFilter arrays
+    local wiredStatic = wire.ports.StaticFilter
+    if type(wiredStatic) == "table" then
+        for _, ent in pairs(wiredStatic) do
+            if isValid(ent) then baseFilter[#baseFilter+1] = ent end
+        end
+    end
+    
+    local traceFilter = table.copy(baseFilter)
+    
+    local lastFilterCount = #traceFilter
+    
+    -- Update the trace filter periodically to include players and dynamic wired arrays
+    timer.create("update_player_filter", FilterRefreshRate, 0, function()
+        local plys = find.allPlayers()
+        traceFilter = table.copy(baseFilter)
+        for i=1, #plys do traceFilter[#traceFilter+1] = plys[i] end
         
-        local FL = rangerOffset(HeightF+14, E:localToWorld(Vector(LengthF, WidthF, 0)), -E:getUp(), {E,chip(),wheels[1],wheels[2],wheels[3],wheels[4]})
-        Holos[1]:setPos(FL.HitPos + (E:getUp() * 12.5))
-        local FR = rangerOffset(HeightF+14, E:localToWorld(Vector(LengthF, -WidthF, 0)), -E:getUp(), {E,chip(),wheels[1],wheels[2],wheels[3],wheels[4]})
-        Holos[2]:setPos(FR.HitPos + (E:getUp() * 12.5))
-        local BL = rangerOffset(HeightB+14, E:localToWorld(Vector(-LengthB, -WidthB, 0)), -E:getUp(), {E,chip(),wheels[1],wheels[2],wheels[3],wheels[4]})
-        Holos[3]:setPos(BL.HitPos + (E:getUp() * 12.5))
-        local BR = rangerOffset(HeightB+14, E:localToWorld(Vector(-LengthB, WidthB, 0)), -E:getUp(), {E,chip(),wheels[1],wheels[2],wheels[3],wheels[4]})
-        Holos[4]:setPos(BR.HitPos + (E:getUp() * 12.5))
+        local wiredDynamic = wire.ports.DynamicFilter
+        if type(wiredDynamic) == "table" then
+            for _, ent in pairs(wiredDynamic) do
+                if isValid(ent) then traceFilter[#traceFilter+1] = ent end
+            end
+        end
+        
+        if AllowPrintFilter and #traceFilter ~= lastFilterCount then
+            print(Color(0, 255, 0), "[Smoother] ", Color(255, 255, 255), "Dynamic Filter Updated. Ignoring ", #traceFilter, " total entities.")
+            lastFilterCount = #traceFilter
+        end
+    end)
+    local vFL = Vector(LengthF, WidthF, 0)
+    local vFR = Vector(LengthF, -WidthF, 0)
+    local vBL = Vector(-LengthB, -WidthB, 0)
+    local vBR = Vector(-LengthB, WidthB, 0)
+    
+    local tickMult = (1 / UpdateRate) / 0.02 -- Scale forces based on update rate relative to original 50Hz
+
+    timer.create("interval", 1 / UpdateRate, 0, function()
+        -- Prevent trace crash by removing entities that were deleted between slow filter updates
+        for i = #traceFilter, 1, -1 do
+            if not isValid(traceFilter[i]) then
+                table.remove(traceFilter, i)
+            end
+        end
+
+        local eUp = E:getUp()
+        local negUp = -eUp
+        local FL = rangerOffset(HeightF+14, E:localToWorld(vFL), negUp, traceFilter)
+        local FR = rangerOffset(HeightF+14, E:localToWorld(vFR), negUp, traceFilter)
+        local BL = rangerOffset(HeightB+14, E:localToWorld(vBL), negUp, traceFilter)
+        local BR = rangerOffset(HeightB+14, E:localToWorld(vBR), negUp, traceFilter)
+        
+        if Alpha > 0 then
+            Holos[1]:setPos(FL.HitPos + (eUp * 12.5))
+            Holos[2]:setPos(FR.HitPos + (eUp * 12.5))
+            Holos[3]:setPos(BL.HitPos + (eUp * 12.5))
+            Holos[4]:setPos(BR.HitPos + (eUp * 12.5))
+        end
         
         WheelSpin = WheelSpin + velL(E)[1] / 3.5
         vel = velL(E)
@@ -209,14 +273,16 @@ wire.ports.SpeedOut = speed
         local MaxTurn      = ((math.clamp(vel[1]/10,-55,55))-(math.clamp(vel[1]/90, -33, 33)))
         local Yaw          = E:getAngles()[2] + (lerpedValue * YawMultAD * speed)
         
-        Holos[1]:setAngles(E:localToWorldAngles(Angle(0,Turn,0)))
-        Holos[2]:setAngles(E:localToWorldAngles(Angle(0,Turn,0)))
+        if Alpha > 0 then
+            local visualTurn = Turn or 0 -- Fallback if Turn is undefined
+            Holos[1]:setAngles(E:localToWorldAngles(Angle(0,visualTurn,0)))
+            Holos[2]:setAngles(E:localToWorldAngles(Angle(0,visualTurn,0)))
 
-        
-        Holos[5]:setAngles(Holos[1]:localToWorldAngles(Angle(WheelSpin,0,0)))
-        Holos[6]:setAngles(Holos[2]:localToWorldAngles(Angle(WheelSpin,0,0)))
-        Holos[7]:setAngles(Holos[3]:localToWorldAngles(Angle(WheelSpin,0,0)))
-        Holos[8]:setAngles(Holos[4]:localToWorldAngles(Angle(WheelSpin,0,0)))
+            Holos[5]:setAngles(Holos[1]:localToWorldAngles(Angle(WheelSpin,0,0)))
+            Holos[6]:setAngles(Holos[2]:localToWorldAngles(Angle(WheelSpin,0,0)))
+            Holos[7]:setAngles(Holos[3]:localToWorldAngles(Angle(WheelSpin,0,0)))
+            Holos[8]:setAngles(Holos[4]:localToWorldAngles(Angle(WheelSpin,0,0)))
+        end
         
         local smoothingFactorPitch = smoothingPitch  -- Adjust the smoothing factor as needed
         local smoothingFactorRoll =smoothingRoll  -- Adjust the smoothing factor as needed
@@ -241,8 +307,8 @@ wire.ports.SpeedOut = speed
         --Entity:applyForceOffset(Vector force, Vector position)
         --E:applyForceCenter(ForceF * (E:getMass() / 3) * Hit)
         --E:applyForceCenter(ForceB * (E:getMass() / 3) * Hit)
-        
-        E:applyAngForce((Ang * forceMultiplier - angleVelocity * shiftLA(E:getInertia())) * Hit) --smoothing force
+        -- applyAngForce is an Entity method in Starfall, not a PhysObj method
+        E:applyAngForce((Ang * forceMultiplier - angleVelocity * shiftLA(E_inertia)) * Hit * tickMult) --smoothing force
        -- E:applyForceOffset(ForceF * (E:getMass() / 3) * Hit,E:localToWorld(Vector(LengthF,0,0)))
        -- E:applyForceOffset(ForceB * (E:getMass() / 3) * Hit,E:localToWorld(Vector(-LengthB,0,0)))
         
