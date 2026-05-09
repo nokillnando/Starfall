@@ -7,6 +7,8 @@
 dofile("red_fox_engine/simulated_engine_core_modular.txt")
 local Core = _G.RedFoxEngineCore
 
+--Make sure to wire an hud component to see hints
+
 -- Configuration Table
 local config = {
     ConfigVersion = "3.01",
@@ -46,6 +48,7 @@ local config = {
     ReverseGearSpeeds = { 15, 30 }, -- Used for Speed-Based Reverse Logic
     
     WheelRPMToSpeed = 0.15, -- [IMPORTANT] Approx KPH per wheel RPM. TUNING REQUIRED: Increase for big wheels.
+    SpeedScale = 1.33, -- Multiply wire speed outputs by this factor (use 1.33 for player-scale speed)
     
     PowerDistribution = 0, -- 0 = RWD, 100 = FWD, 50 = AWD
     
@@ -105,8 +108,15 @@ local config = {
     BrakeFeedBMult = 2,
     TorqueInvert = true,
     ForceMult = 0.015,
-    
-    
+
+    -- Vehicle Mass Scaling
+    Engine_SimulatedVehicleMass = 1000,       -- Virtual vehicle mass in KG used as the mass base
+    Engine_MassRefreshInterval = 1.0,        -- Seconds between mass recalculations
+    Engine_MassChangePrintThreshold = 0.1,   -- Minimum mass delta to print mass changes
+    Engine_PrintMassChanges = true,          -- Print mass update messages to console
+    Engine_MinMassScale = 0.2,               -- Prevent overly low force for heavy vehicles
+    Engine_MaxMassScale = 2.5,               -- Prevent overly high force for very light vehicles
+
     -- Manual Mode Controls
     ReverseWSonReverse = true,        -- In manual mode: true = use W for reverse throttle, false = use S for reverse throttle
     
@@ -222,6 +232,9 @@ config.Addons = {
         HeadlightKey = "h",          -- Key to toggle headlights (F)
         EnableCamera = false,         -- Enable/Disable Camera feature
         CameraKey = "p",             -- Key to toggle camera (P)
+        EnableFirstPerson = true,    -- Enable 1st person on hold (false = tap only toggles 3rd person)
+        CamThirdPersonValue = 1,     -- CamOn output value for 3rd person mode
+        CamFirstPersonValue = 2,     -- CamOn output value for 1st person mode
         CamDistance = 100,           -- Default Camera Distance
         CamOffset = Vector(0,0,0),   -- Default Camera Offset (Local to Chassis)
         
@@ -332,7 +345,7 @@ config.Addons = {
                         addon.PrintHint(driver, "W/A/S/D to drive | Space for Handbrake")
                         addon.PrintHint(driver, string.upper(addon.HeadlightKey) .. " for headlights (Tap: Low/High | Hold: Off)")
                         if addon.EnableCamera then
-                            addon.PrintHint(driver, string.upper(addon.CameraKey) .. " for camera")
+                            addon.PrintHint(driver, string.upper(addon.CameraKey) .. " for camera, tap for 3rd person or off, hold for 1st person")
                         end
                     end
                 end)
@@ -405,19 +418,49 @@ config.Addons = {
             end
             
             -- ========================================================================
-            -- CAMERA INPUT
+            -- CAMERA INPUT (Tap: 3rd Person | Hold: 1st Person)
+            -- CamOn output: 0 = Off, CamThirdPersonValue = 3rd Person, CamFirstPersonValue = 1st Person
             -- ========================================================================
-            if addon.EnableCamera and keyState and keyState.pressedKeys[addon.CameraKey] then
-                -- Consume key press
-                keyState.pressedKeys[addon.CameraKey] = nil
+            if addon.EnableCamera and keyState then
+                local isDown = keyState.downKeys and keyState.downKeys[addon.CameraKey]
+                local val3rd = addon.CamThirdPersonValue or 1
+                local val1st = addon.CamFirstPersonValue or 2
                 
-                addon.CamOn = 1 - addon.CamOn
+                -- Detect new press
+                if isDown and not addon.CameraKey_IsDown then
+                    addon.CameraKey_IsDown = true
+                    addon.CameraKey_PressTime = timer.curtime()
+                    addon.CameraKey_HoldHandled = false
                 
-                if addon.CamOn == 1 then
-                    addon.PrintHint(driver, "Camera: Active")
-                else
-                    addon.PrintHint(driver, "Camera: Disabled")
+                -- Detect hold (while held down) - only if 1st person is enabled
+                elseif isDown and addon.CameraKey_IsDown then
+                    if addon.EnableFirstPerson and not addon.CameraKey_HoldHandled and (timer.curtime() - (addon.CameraKey_PressTime or 0)) > 0.4 then
+                        addon.CamOn = val1st
+                        addon.PrintHint(driver, "Camera: 1st Person")
+                        addon.CameraKey_HoldHandled = true
+                        state.ForceNetNow = true
+                    end
+                
+                -- Detect release
+                elseif not isDown and addon.CameraKey_IsDown then
+                    addon.CameraKey_IsDown = false
+                    
+                    if not addon.CameraKey_HoldHandled then
+                        -- Tap Action: Toggle 3rd Person On/Off
+                        if addon.CamOn == 0 then
+                            addon.CamOn = val3rd
+                            addon.PrintHint(driver, "Camera: 3rd Person")
+                        else
+                            addon.CamOn = 0
+                            addon.PrintHint(driver, "Camera: Disabled")
+                        end
+                    end
+                    -- Hold release: 1st person stays active (tap again to turn off)
+                    state.ForceNetNow = true
                 end
+                
+                -- Clear legacy press state
+                keyState.pressedKeys[addon.CameraKey] = nil
             end
             
             -- Write to Cam wirelink if available (mimics E2 behavior)

@@ -3,7 +3,7 @@
 
 local Core = {}
 _G.RedFoxEngineCore = Core
-local Version = "3.01" -- v3 Alpha
+local Version = "3.02" -- v3 Alpha
 
 --[[
 Changelog:
@@ -214,6 +214,93 @@ if SERVER then
             return nil
         end
 
+        local function calculateVehicleMass(chassis)
+            if not isValid(chassis) then return nil end
+            local mass = 0
+            local seen = {}
+            local function scan(ent)
+                if not (ent and ent:isValid()) or seen[ent] then return end
+                seen[ent] = true
+                local phys = ent:getPhysicsObject()
+                if isValid(phys) then
+                    mass = mass + phys:getMass()
+                end
+                local constrained = ent:getAllConstrained()
+                if constrained then
+                    for _, sub in ipairs(constrained) do
+                        scan(sub)
+                    end
+                end
+            end
+            scan(chassis)
+            return mass
+        end
+
+        local function getEffectiveVehicleMass(state, config, chassis)
+            if not isValid(chassis) then
+                return config.Engine_SimulatedVehicleMass or 1000
+            end
+            local nextCheck = state.NextMassCheck or 0
+            if state.MassCacheChassis ~= chassis or timer.curtime() >= nextCheck then
+                local previousActual = state.ActualVehicleMass
+                local previousActual = state.ActualVehicleMass
+                local previousSimulated = state.SimulatedVehicleMass
+                local previousEffective = state.EffectiveVehicleMass
+                local actualMass = calculateVehicleMass(chassis) or config.Engine_SimulatedVehicleMass or 1000
+                local simulatedMass = config.Engine_SimulatedVehicleMass or 1000
+                local effectiveMass = simulatedMass
+
+                state.MassCacheChassis = chassis
+                state.ActualVehicleMass = actualMass
+                state.SimulatedVehicleMass = simulatedMass
+                state.EffectiveVehicleMass = effectiveMass
+                state.NextMassCheck = timer.curtime() + (config.Engine_MassRefreshInterval or 1.0)
+
+                if config.Engine_PrintMassChanges then
+                    local threshold = config.Engine_MassChangePrintThreshold or 0.1
+                    local actualDelta = previousActual and math.abs(actualMass - previousActual) or nil
+                    local simulatedDelta = previousSimulated and math.abs(simulatedMass - previousSimulated) or nil
+                    local effectiveDelta = previousEffective and math.abs(effectiveMass - previousEffective) or nil
+                    local shouldPrint = not previousEffective or
+                        (effectiveDelta and effectiveDelta > threshold) or
+                        (actualDelta and actualDelta > threshold) or
+                        (simulatedDelta and simulatedDelta > threshold)
+
+                    if shouldPrint then
+                        local ownerPlayer = owner()
+                        local function sendMessage(text)
+                            print(text)
+                            if SERVER and isValid(ownerPlayer) and ownerPlayer:isPlayer() then
+                                pcall(printHud, ownerPlayer, text)
+                            elseif player() == owner() then
+                                pcall(printHud, text)
+                            end
+                        end
+
+                        local massMsg = string.format("[RedFoxEngine] Total Physical Mass detected: %.1fkg (Config Virtual: %.1fkg)", actualMass, simulatedMass)
+                        sendMessage(massMsg)
+
+                        if previousEffective then
+                            local changes = {}
+                            if actualDelta and actualDelta > threshold then
+                                table.insert(changes, string.format("real mass %.1fkg -> %.1fkg", previousActual, actualMass))
+                            end
+                            if simulatedDelta and simulatedDelta > threshold then
+                                table.insert(changes, string.format("config virtual %.1fkg -> %.1fkg", previousSimulated, simulatedMass))
+                            end
+                            if effectiveDelta and effectiveDelta > threshold then
+                                table.insert(changes, string.format("effective mass %.1fkg -> %.1fkg", previousEffective, effectiveMass))
+                            end
+                            if #changes > 0 then
+                                sendMessage("[RedFoxEngine] Refresh update: " .. table.concat(changes, " | "))
+                            end
+                        end
+                    end
+                end
+            end
+            return state.EffectiveVehicleMass or config.Engine_SimulatedVehicleMass
+        end
+
         -- Driver key state tracking (networked from client)
         s.DriverKeyState = {}
         local function getDriverKeyState(ply)
@@ -407,6 +494,10 @@ if SERVER then
             s.Driver = Driver
             s.Chassis = Chassis
             s.Engine = Engine
+
+            if shouldUpdateEngine then
+                getEffectiveVehicleMass(s, c, Chassis)
+            end
             
             -- Store key inputs in state for addon access (physics control, etc)
             s.KeyInputs = {
@@ -515,7 +606,8 @@ if SERVER then
             
             -- Restoration: Speed & Direction
             local Velocity = Chassis:getVelocity()
-            s.Speed = Velocity:getLength() * 0.09144
+            local speedScale = c.SpeedScale or 1.0
+            s.Speed = Velocity:getLength() * 0.09144 * speedScale
             local EngineDir = Engine:getUp()
 
             -- "Active" means Engine is self-sustaining
@@ -868,12 +960,15 @@ if SERVER then
             s.Direction = 1
             s.SpeedN = 0
             if isValid(Chassis) then
-                s.Speed = Chassis:getVelocity():getLength() * 0.06858
+                local speedScale = c.SpeedScale or 1.0
+                local rawSpeed = Chassis:getVelocity():getLength() * 0.06858
                 local velLocal = Chassis:worldToLocal(Chassis:getVelocity() + Chassis:getPos())
                 -- Use configurable direction axis (default to X-forward if nil)
                 local dirAxis = c.ChassisFeedDirectionAxis or Vector(1, 0, 0)
                 -- Project local velocity onto direction axis
-                s.SpeedN = velLocal:dot(dirAxis) * 0.06858
+                local rawSpeedN = velLocal:dot(dirAxis) * 0.06858
+                s.Speed = rawSpeed * speedScale
+                s.SpeedN = rawSpeedN * speedScale
                 s.Direction = (s.SpeedN >= 0) and 1 or -1
             end
 
@@ -1936,12 +2031,18 @@ if SERVER then
             -- ============================================================================
             
             if s.Flywheel_Power and math.abs(s.Flywheel_Power) > 0.1 and s.Active then
+                local desiredMass = getEffectiveVehicleMass(s, c, Chassis)
+                local actualMass = s.ActualVehicleMass or desiredMass
+                local massScale = actualMass / math.max(desiredMass, 1)
+                massScale = math.clamp(massScale, c.Engine_MinMassScale or 0.2, c.Engine_MaxMassScale or 2.5)
+                local scaledPower = s.Flywheel_Power * massScale
+
                 local FrontPowerRatio = (c.PowerDistribution or 50) / 100
                 local RearPowerRatio = 1 - FrontPowerRatio
                 
                 -- Front wheels
                 if #FrontWheels > 0 and FrontPowerRatio > 0 then
-                    local FrontPower = s.Flywheel_Power * FrontPowerRatio
+                    local FrontPower = scaledPower * FrontPowerRatio
                     local PowerPerWheel = FrontPower / #FrontWheels
                     for i, w in pairs(FrontWheels) do
                         if isValid(w) then
@@ -1973,7 +2074,7 @@ if SERVER then
                 
                 -- Rear wheels  
                 if #RearWheels > 0 and RearPowerRatio > 0 then
-                    local RearPower = s.Flywheel_Power * RearPowerRatio
+                    local RearPower = scaledPower * RearPowerRatio
                     local PowerPerWheel = RearPower / #RearWheels
                     for i, w in pairs(RearWheels) do
                         if isValid(w) then
@@ -2018,7 +2119,7 @@ if SERVER then
                         local brakeInput = s.Brake or 0
                         local throttleInput = s.Throttle or 0
                         local accelScale = 1 - math.clamp(brakeInput, 0, 1)
-                        local forceMagnitude = s.Flywheel_Power * tickMult * accelScale
+                        local forceMagnitude = scaledPower * tickMult * accelScale
                         ChassisPhys:applyForceOffset(
                             ChassisFeedDirection * -forceMagnitude, 
                             Engine:getPos() - (ChassisFeedForwardDirection * ChassisAccFeed)
@@ -2031,7 +2132,7 @@ if SERVER then
                         -- Braking feedback (E2: if braking, apply reverse moment)
                         if s.Braking == 1 and throttleInput <= 0.05 then
                             local BrakeFeedMult = math.abs(c.BrakeFeedBMult or 0.5)
-                            local brakeForceMagnitude = math.abs(s.Flywheel_Power) * BrakeFeedMult * tickMult
+                            local brakeForceMagnitude = math.abs(scaledPower) * BrakeFeedMult * tickMult
                             ChassisPhys:applyForceOffset(
                                 ChassisFeedDirection * brakeForceMagnitude, 
                                 Engine:getPos() - (ChassisFeedForwardDirection * ChassisAccFeed)
@@ -2103,8 +2204,8 @@ if SERVER then
                 end
 
                 local bytesLeft = (net.getBytesLeft and net.getBytesLeft()) or math.huge
-                if bytesLeft < 256 then
-                    -- leave some headroom and skip this frame to avoid burst drop
+                if bytesLeft < 1024 then
+                    -- leave ample headroom and skip this frame to avoid burst drop with large string payloads
                     return
                 end
 
@@ -3519,7 +3620,8 @@ if CLIENT then
             local titleHeight = 48
             local addonCount = #addons
             local statsLines = 8
-            local totalLines = statsLines + (addonCount > 0 and addonCount + 1 or 0)
+            local versionLines = 2 -- Header + versions line
+            local totalLines = statsLines + (addonCount > 0 and addonCount + 1 or 0) + versionLines
             local panelHeight = titleHeight + (totalLines * lineHeight) + 30
             currentPanelHeight = panelHeight -- Store for world rendering
             
@@ -3614,6 +3716,31 @@ if CLIENT then
                 end
             end
             
+            -- Version Info
+            yPos = yPos + 5
+            render.setFont(hudFont)
+            render.setColor(Color(231, 76, 60))
+            render.drawSimpleText(leftX, yPos, "Versions:", 0, 1)
+            yPos = yPos + lineHeight
+            
+            render.setFont(hudFontSmall)
+            render.setColor(Color(180, 180, 180))
+            render.drawSimpleText(leftX, yPos, "Core: " .. Version, 0, 1)
+            
+            -- Status indicator for core
+            local statusMatch = Version == (config.ConfigVersion or "")
+            local statusText = statusMatch and "(up-to-date)" or "(outdated)"
+            local statusColor = statusMatch and Color(100, 255, 150) or Color(255, 150, 100)
+            render.setColor(statusColor)
+            render.drawSimpleText(leftX + 120, yPos, statusText, 0, 1)
+            
+            -- Config version and status on next line
+            yPos = yPos + lineHeight - 5
+            render.setColor(Color(180, 180, 180))
+            render.drawSimpleText(leftX, yPos, "Config: " .. (config.ConfigVersion or "N/A"), 0, 1)
+            render.setColor(statusColor)
+            render.drawSimpleText(leftX + 120, yPos, statusText, 0, 1)
+
             -- Reset RT selection
             render.selectRenderTarget(nil)
         end)

@@ -1,0 +1,139 @@
+-- Red Fox Engine Addon: Brake Temperature
+-- Simulates brake disc temperature per wheel based on braking force and speed
+-- Outputs temperature values for visual effects (e.g., glowing brake discs)
+-- Follows standard Red Fox Engine Addon Framework
+
+return {
+    BrakeTemperature = {
+        Enabled = true,
+        
+        -- Configuration
+        AmbientTemp = 20,               -- Ambient temperature (°C) - brakes cool towards this
+        MaxTemp = 800,                  -- Maximum brake temperature (°C) - cherry red hot
+        
+        -- Heat Generation
+        HeatRate = 0.35,                -- Base heat rate multiplier (higher = heats faster)
+        SpeedHeatScale = 1.0,           -- How much speed affects heat generation (higher speed = more heat from friction)
+        
+        -- Cooling
+        CoolRate = 0.08,                -- Base passive cooling rate per tick (°C)
+        SpeedCoolScale = 0.15,          -- Extra cooling from airflow at speed (per KPH)
+        StoppedCoolMult = 0.5,          -- Cooling multiplier when stopped (less airflow)
+        
+        -- Per-Wheel Temperatures (initialized in OnInit)
+        -- Index matches wheel order: FrontWheels[1], FrontWheels[2], ..., RearWheels[1], RearWheels[2], ...
+        FrontTemps = {},
+        RearTemps = {},
+        
+        -- Wire Outputs
+        WireOutputs = {
+            { name = "BrakeTempFL", source = "TempFL", type = "normal" },
+            { name = "BrakeTempFR", source = "TempFR", type = "normal" },
+            { name = "BrakeTempRL", source = "TempRL", type = "normal" },
+            { name = "BrakeTempRR", source = "TempRR", type = "normal" },
+            { name = "BrakeTempMax", source = "TempMax", type = "normal" },
+        },
+        
+        -- Synced to client (for client-side glow effects)
+        SyncedState = { "TempFL", "TempFR", "TempRL", "TempRR", "TempMax" },
+        
+        -- Output values (mapped by WireOutputs source)
+        TempFL = 0, TempFR = 0,
+        TempRL = 0, TempRR = 0,
+        TempMax = 0,
+        
+        -- Hook: Initialization
+        OnInit = function(state, config)
+            local addon = config.Addons.BrakeTemperature
+            addon.FrontTemps = {}
+            addon.RearTemps = {}
+            addon.TempFL = addon.AmbientTemp
+            addon.TempFR = addon.AmbientTemp
+            addon.TempRL = addon.AmbientTemp
+            addon.TempRR = addon.AmbientTemp
+            addon.TempMax = addon.AmbientTemp
+        end,
+        
+        -- Hook: Called every engine update tick
+        OnEngineUpdate = function(state, config)
+            local addon = config.Addons.BrakeTemperature
+            local speed = math.abs(state.Speed or 0)
+            local brakeF = state.BrakeF or 0
+            local brakeR = state.BrakeR or 0
+            local isBraking = (state.Brake or 0) > 0
+            
+            -- Get per-wheel RPMs for speed-dependent heat
+            local frontRPMs = state.FrontRPMs or {}
+            local rearRPMs = state.RearRPMs or {}
+            
+            -- Ensure temp arrays are populated
+            local frontCount = #frontRPMs
+            local rearCount = #rearRPMs
+            
+            -- Initialize any missing wheel temps
+            for i = 1, math.max(frontCount, 2) do
+                if not addon.FrontTemps[i] then addon.FrontTemps[i] = addon.AmbientTemp end
+            end
+            for i = 1, math.max(rearCount, 2) do
+                if not addon.RearTemps[i] then addon.RearTemps[i] = addon.AmbientTemp end
+            end
+            
+            -- === HEAT GENERATION ===
+            -- Heat = BrakeForce * WheelSpeed * HeatRate
+            -- Braking at high speed generates much more heat than at low speed
+            if isBraking then
+                for i = 1, math.max(frontCount, 1) do
+                    local wheelRPM = math.abs(frontRPMs[i] or 0)
+                    local wheelSpeed = wheelRPM * (config.WheelRPMToSpeed or 0.15)
+                    local heat = brakeF * wheelSpeed * addon.HeatRate * addon.SpeedHeatScale / 66
+                    addon.FrontTemps[i] = (addon.FrontTemps[i] or addon.AmbientTemp) + heat
+                end
+                for i = 1, math.max(rearCount, 1) do
+                    local wheelRPM = math.abs(rearRPMs[i] or 0)
+                    local wheelSpeed = wheelRPM * (config.WheelRPMToSpeed or 0.15)
+                    local heat = brakeR * wheelSpeed * addon.HeatRate * addon.SpeedHeatScale / 66
+                    addon.RearTemps[i] = (addon.RearTemps[i] or addon.AmbientTemp) + heat
+                end
+            end
+            
+            -- === COOLING ===
+            -- Passive cooling + airflow cooling (speed-dependent)
+            local airflowCooling = speed * addon.SpeedCoolScale / 66
+            local baseCooling = addon.CoolRate
+            if speed < 2 then
+                baseCooling = baseCooling * addon.StoppedCoolMult
+            end
+            
+            local maxTemp = addon.AmbientTemp
+            
+            for i = 1, #addon.FrontTemps do
+                local temp = addon.FrontTemps[i]
+                -- Cooling is proportional to temperature difference from ambient
+                local tempDiff = temp - addon.AmbientTemp
+                local cooling = (baseCooling + airflowCooling) * (tempDiff / addon.MaxTemp)
+                temp = temp - cooling
+                temp = math.clamp(temp, addon.AmbientTemp, addon.MaxTemp)
+                addon.FrontTemps[i] = temp
+                maxTemp = math.max(maxTemp, temp)
+            end
+            
+            for i = 1, #addon.RearTemps do
+                local temp = addon.RearTemps[i]
+                local tempDiff = temp - addon.AmbientTemp
+                local cooling = (baseCooling + airflowCooling) * (tempDiff / addon.MaxTemp)
+                temp = temp - cooling
+                temp = math.clamp(temp, addon.AmbientTemp, addon.MaxTemp)
+                addon.RearTemps[i] = temp
+                maxTemp = math.max(maxTemp, temp)
+            end
+            
+            -- === UPDATE OUTPUTS ===
+            -- Map to named outputs (FL/FR/RL/RR pattern)
+            addon.TempFL = math.round(addon.FrontTemps[1] or addon.AmbientTemp, 1)
+            addon.TempFR = math.round(addon.FrontTemps[2] or addon.FrontTemps[1] or addon.AmbientTemp, 1)
+            addon.TempRL = math.round(addon.RearTemps[1] or addon.AmbientTemp, 1)
+            addon.TempRR = math.round(addon.RearTemps[2] or addon.RearTemps[1] or addon.AmbientTemp, 1)
+            addon.TempMax = math.round(maxTemp, 1)
+        end,
+    }
+}

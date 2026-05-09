@@ -10,6 +10,9 @@ return {
         HeadlightKey = "h",          -- Key to toggle headlights (F)
         EnableCamera = true,         -- Enable/Disable Camera feature
         CameraKey = "g",             -- Key to toggle camera (P)
+        EnableFirstPerson = true,    -- Enable 1st person on hold (false = tap only toggles 3rd person)
+        CamThirdPersonValue = 1,     -- CamOn output value for 3rd person mode
+        CamFirstPersonValue = 2,     -- CamOn output value for 1st person mode
         CamDistance = 100,           -- Default Camera Distance
         CamOffset = Vector(0,0,0),   -- Default Camera Offset (Local to Chassis)
         
@@ -195,20 +198,49 @@ return {
             end
             
             -- ========================================================================
-            -- CAMERA INPUT
+            -- CAMERA INPUT (Tap: 3rd Person | Hold: 1st Person)
+            -- CamOn output: 0 = Off, CamThirdPersonValue = 3rd Person, CamFirstPersonValue = 1st Person
             -- ========================================================================
-            if addon.EnableCamera and keyState and keyState.pressedKeys[addon.CameraKey] then
-                -- Consume key press
-                keyState.pressedKeys[addon.CameraKey] = nil
+            if addon.EnableCamera and keyState then
+                local isDown = keyState.downKeys and keyState.downKeys[addon.CameraKey]
+                local val3rd = addon.CamThirdPersonValue or 1
+                local val1st = addon.CamFirstPersonValue or 2
                 
-                addon.CamOn = 1 - addon.CamOn
+                -- Detect new press
+                if isDown and not addon.CameraKey_IsDown then
+                    addon.CameraKey_IsDown = true
+                    addon.CameraKey_PressTime = timer.curtime()
+                    addon.CameraKey_HoldHandled = false
                 
-                if addon.CamOn == 1 then
-                    addon.PrintHint(driver, "Camera: Active")
-                else
-                    addon.PrintHint(driver, "Camera: Disabled")
+                -- Detect hold (while held down) - only if 1st person is enabled
+                elseif isDown and addon.CameraKey_IsDown then
+                    if addon.EnableFirstPerson and not addon.CameraKey_HoldHandled and (timer.curtime() - (addon.CameraKey_PressTime or 0)) > 0.4 then
+                        addon.CamOn = val1st
+                        addon.PrintHint(driver, "Camera: 1st Person")
+                        addon.CameraKey_HoldHandled = true
+                        state.ForceNetNow = true
+                    end
+                
+                -- Detect release
+                elseif not isDown and addon.CameraKey_IsDown then
+                    addon.CameraKey_IsDown = false
+                    
+                    if not addon.CameraKey_HoldHandled then
+                        -- Tap Action: Toggle 3rd Person On/Off
+                        if addon.CamOn == 0 then
+                            addon.CamOn = val3rd
+                            addon.PrintHint(driver, "Camera: 3rd Person")
+                        else
+                            addon.CamOn = 0
+                            addon.PrintHint(driver, "Camera: Disabled")
+                        end
+                    end
+                    -- Hold release: 1st person stays active (tap again to turn off)
+                    state.ForceNetNow = true
                 end
-                state.ForceNetNow = true  -- Force immediate net send for responsiveness
+                
+                -- Clear legacy press state
+                keyState.pressedKeys[addon.CameraKey] = nil
             end
             
             -- Write to Cam wirelink if available (mimics E2 behavior)

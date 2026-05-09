@@ -1,0 +1,668 @@
+-- Red Fox Engine Addon: Backfire & Anti-Lag
+-- Implements Overrun Backfire and Rev-Limiter Fire/Sounds
+-- Follows standard Red Fox Engine Addon Framework
+
+return {
+    BackfireAntiLag = {
+    Enabled = true,
+    
+    -- Configuration
+    TriggerMode = 3, -- 1: Overrun only, 2: RevLimit only, 3: Both
+    MinRPMThreshold = 4000, -- Minimum RPM to trigger overrun backfire
+    OverrunThrottleDrop = 0.4, -- Throttle must drop below this to trigger Overrun backfire
+    OverrunPopChance = 0.35, -- Chance when throttle is released after load
+    OverrunSustainChance = 0.12, -- Chance per second for extra pops while coasting at high RPM
+    OverrunMinLoadTime = 0.25, -- Must be on throttle this long before lift-off can pop
+    OverrunWindow = 0.55, -- Seconds after lift-off where overrun pops are allowed
+    OverrunCooldownMin = 0.06,
+    OverrunCooldownMax = 0.25,
+    OverrunBurstChance = 0.35,
+    OverrunBurstMin = 2,
+    OverrunBurstMax = 4,
+    BurstIntervalMin = 0.04,
+    BurstIntervalMax = 0.12,
+    RPMChancePower = 1.35, -- Higher values make low-RPM pops rarer
+    EnableAntiLag = true,
+    AntiLagBoostThreshold = 1.05,
+    AntiLagThrottleMax = 0.35,
+    AntiLagMinRPM = 3500,
+    AntiLagPopChance = 0.45, -- Chance per second while off-throttle with boost
+    AntiLagCooldownMin = 0.10,
+    AntiLagCooldownMax = 0.24,
+    EnableDownshiftPops = true,
+    DownshiftPopChance = 0.65, -- Chance when gear drops under RPM/load
+    DownshiftSustainChance = 0.18, -- Chance per second for follow-up burbles after downshift
+    DownshiftMinRPM = 3200,
+    DownshiftThrottleMax = 0.55,
+    DownshiftWindow = 0.45,
+    DownshiftCooldownMin = 0.05,
+    DownshiftCooldownMax = 0.18,
+    DownshiftBurstChance = 0.45,
+        
+    RevLimitPopChance = 10, -- Chance per second while on rev limiter
+    RevLimitRPMThreshold = 0.95, -- % of RevLimiter RPM required to start popping (0.95 = 95%)
+    RevLimitThrottle = 0.4, -- Minimum Throttle needed to trigger 2-Step / RevLimit popping
+    RevLimitCooldownMin = 0.01,
+    RevLimitCooldownMax = 0.05,
+    RevLimitBurstChance = 1,
+        
+        -- Sounds
+        SoundVolume = 1,
+        SoundPitchMin = 85,
+        SoundPitchMax = 115,
+        
+        -- Support for both Web URLs and standard paths
+        UseURLSounds = true,
+        URLSounds = {
+            -- Add URLs to raw .ogg or .mp3 files here
+            -- e.g. "https://raw.githubusercontent.com/nokillnando/forzaapexsounds/main/backfire1.ogg"
+            "https://github.com/nokillnando/forzaapexsounds/blob/main/misc/burble/burble_oneshot_test1.ogg",
+            "https://github.com/nokillnando/forzaapexsounds/blob/main/misc/burble/burble_oneshot_test2.ogg",
+            "https://github.com/nokillnando/forzaapexsounds/blob/main/misc/burble/burble_oneshot_test3.ogg"
+        },
+        InGameSounds = {
+            "acf_thecrew/useful/backfire/backfire_drain_10.wav",
+            "acf_thecrew/useful/backfire/backfire_gargle_15.wav",
+            "acf_thecrew/useful/backfire/backfire_splutter_20.wav"
+        },
+        
+        -- Effects: Multiple effects can play simultaneously
+        Effects = {
+            { effecttype = "effect", effectname = "MuzzleEffect", scale = 0.4 },
+            { effecttype = "effect", effectname = "AirboatMuzzleFlash", scale = 0.7 },
+        },
+        
+        -- Wire Inputs
+        WireInputs = {
+            { name = "Exhausts", type = "array" } -- User can wire an array of exhaust props here!
+        },
+        
+        -- Internal Addon logic
+        clientExhausts = {},
+        clientExhaustIDs = {},
+        lastThrottle = 0,
+        lastRPM = 0,
+        lastGear = 0,
+        lastPopTime = 0,
+        loadTime = 0,
+        overrunUntil = 0,
+        downshiftUntil = 0,
+        nextBackfireTime = 0,
+        burstPops = 0,
+        burstSource = "",
+        nextBurstTime = 0,
+        lastUpdateTime = 0,
+        -- Server actively monitors the Exhaust array and broadcasts changes to clients
+        OnPhysicsUpdate = function(s, config, physicsData)
+            local self = config.Addons.BackfireAntiLag
+            if not self.Enabled then return end
+            
+            if CLIENT and not self.clientInitialized then
+                self.clientInitialized = true
+                net.receive("Backfire_SyncExhausts", function()
+                    self.clientExhaustIDs = {}
+                    local count = net.readUInt(8)
+                    for i = 1, count do
+                        table.insert(self.clientExhaustIDs, net.readUInt(13))
+                    end
+                end)
+
+                net.receive("Backfire_DoPop", function()
+                    self.clientExhaustIDs = {}
+                    local count = net.readUInt(8)
+                    for i = 1, count do
+                        table.insert(self.clientExhaustIDs, net.readUInt(13))
+                    end
+                    self:DoPop()
+                end)
+            end
+            
+            if SERVER then
+                -- Check for changes in the wired array
+                local currentExhausts = wire.ports.Exhausts
+                local exTable = {}
+                if currentExhausts then
+                    local ok = pcall(function()
+                        for _, ent in pairs(currentExhausts) do
+                            table.insert(exTable, ent)
+                        end
+                    end)
+                    if not ok then exTable = { currentExhausts } end
+                end
+                
+                local count = 0
+                for _ in pairs(exTable) do count = count + 1 end
+                
+                if count ~= (self.lastExhaustCount or -1) then
+                    self.lastExhaustCount = count
+                    local ents = {}
+                    for _, ent in pairs(exTable) do
+                        local ok, idx = pcall(function() return ent:entIndex() end)
+                        if ok and type(idx) == "number" then
+                            table.insert(ents, idx) 
+                        end
+                    end
+                    
+                    net.start("Backfire_SyncExhausts")
+                    net.writeUInt(#ents, 8)
+                    for _, id in ipairs(ents) do
+                        net.writeUInt(id, 13)
+                    end
+                    net.send() 
+                end
+            end
+            
+            -- Detect and trigger backfire on BOTH server and client so they can operate independently!
+            local now = timer.curtime()
+            local dt = now - (self.lastUpdateTime or now)
+                if dt <= 0 or dt > 0.25 then dt = 1 / 66 end
+                self.lastUpdateTime = now
+
+                local function clamp01(v)
+                    return math.max(0, math.min(1, v or 0))
+                end
+
+                local function randomRange(minVal, maxVal)
+                    minVal = minVal or 0
+                    maxVal = maxVal or minVal
+                    return minVal + math.random() * (maxVal - minVal)
+                end
+
+                local function chancePerSecond(chance, deltaTime)
+                    return math.random() < clamp01((chance or 0) * (deltaTime or 0))
+                end
+
+                local currentThrottle = s.Throttle or 0
+                local currentRPM = s.RPM or 0
+                local currentGear = s.Gear or 0
+                local currentBoost = s.Turbo_Boost or 1
+                local redline = config.Engine_Redline or 9000
+                local revLimitRPM = config.Engine_RevLimitRPM or redline
+                local rpmRange = math.max(revLimitRPM - (self.MinRPMThreshold or 0), 1)
+                local rpmFactor = clamp01((currentRPM - (self.MinRPMThreshold or 0)) / rpmRange)
+                rpmFactor = rpmFactor ^ (self.RPMChancePower or 1.35)
+                local throttleDrop = math.max((self.lastThrottle or 0) - currentThrottle, 0)
+                local wasLoaded = (self.loadTime or 0) >= (self.OverrunMinLoadTime or 0.25)
+                
+                if currentThrottle > (self.OverrunThrottleDrop or 0.4) then
+                    self.loadTime = (self.loadTime or 0) + dt
+                else
+                    self.loadTime = math.max((self.loadTime or 0) - dt * 0.5, 0)
+                end
+
+                local triggerPop = false
+                local triggerSource = nil
+                local throttleLifted =
+                    currentRPM > (self.MinRPMThreshold or 0) and
+                    (self.lastThrottle or 0) > (self.OverrunThrottleDrop or 0.4) and
+                    currentThrottle <= (self.OverrunThrottleDrop or 0.4)
+
+                if throttleLifted and wasLoaded then
+                    self.overrunUntil = now + (self.OverrunWindow or 1.1)
+                    local dropFactor = clamp01(throttleDrop / math.max(self.OverrunThrottleDrop or 0.4, 0.01))
+                    local chance = (self.OverrunPopChance or 0.35) * rpmFactor * math.max(dropFactor, 0.25)
+                    if math.random() < chance then
+                        triggerPop = true
+                        triggerSource = "overrun"
+                        if math.random() < (self.OverrunBurstChance or 0.35) then
+                            self.burstPops = math.random(self.OverrunBurstMin or 2, self.OverrunBurstMax or 4) - 1
+                            self.burstSource = "overrun"
+                            self.nextBurstTime = now + randomRange(self.BurstIntervalMin or 0.11, self.BurstIntervalMax or 0.22)
+                        end
+                    end
+                end
+
+                local inOverrunWindow =
+                    now < (self.overrunUntil or 0) and
+                    currentThrottle <= (self.OverrunThrottleDrop or 0.4) and
+                    currentRPM > (self.MinRPMThreshold or 0)
+
+                if not triggerPop and inOverrunWindow then
+                    if chancePerSecond((self.OverrunSustainChance or 0.12) * rpmFactor, dt) then
+                        triggerPop = true
+                        triggerSource = "overrun"
+                    end
+                end
+
+                if not triggerPop and (self.burstPops or 0) > 0 and now >= (self.nextBurstTime or 0) and self.burstSource == "overrun" and inOverrunWindow then
+                    triggerPop = true
+                    triggerSource = "overrun"
+                    self.burstPops = self.burstPops - 1
+                    self.nextBurstTime = now + randomRange(self.BurstIntervalMin or 0.11, self.BurstIntervalMax or 0.22)
+                elseif self.burstSource == "overrun" and not inOverrunWindow then
+                    self.burstPops = 0
+                    self.burstSource = ""
+                end
+
+                local downshifted =
+                    self.EnableDownshiftPops and
+                    (self.lastGear or 0) > currentGear and
+                    currentGear > 0 and
+                    currentRPM > (self.DownshiftMinRPM or self.MinRPMThreshold or 0) and
+                    currentThrottle <= (self.DownshiftThrottleMax or 0.55)
+
+                if downshifted then
+                    self.downshiftUntil = now + (self.DownshiftWindow or 0.45)
+                    local rpmRise = math.max(currentRPM - (self.lastRPM or currentRPM), 0)
+                    local rpmKick = clamp01(rpmRise / math.max(revLimitRPM * 0.18, 1))
+                    local throttleFactor = 1 - clamp01(currentThrottle / math.max(self.DownshiftThrottleMax or 0.55, 0.01))
+                    local chance = (self.DownshiftPopChance or 0.65) * math.max(rpmFactor, 0.35) * math.max(throttleFactor, 0.35) * math.max(rpmKick, 0.55)
+                    if math.random() < chance then
+                        triggerPop = true
+                        triggerSource = "downshift"
+                        if math.random() < (self.DownshiftBurstChance or 0.45) then
+                            self.burstPops = math.random(2, 3) - 1
+                            self.burstSource = "downshift"
+                            self.nextBurstTime = now + randomRange(self.BurstIntervalMin or 0.11, self.BurstIntervalMax or 0.22)
+                        end
+                    end
+                end
+
+                local inDownshiftWindow =
+                    now < (self.downshiftUntil or 0) and
+                    currentGear > 0 and
+                    currentRPM > (self.DownshiftMinRPM or self.MinRPMThreshold or 0) and
+                    currentThrottle <= (self.DownshiftThrottleMax or 0.55)
+
+                if not triggerPop and inDownshiftWindow then
+                    if chancePerSecond((self.DownshiftSustainChance or 0.18) * math.max(rpmFactor, 0.35), dt) then
+                        triggerPop = true
+                        triggerSource = "downshift"
+                    end
+                end
+
+                if not triggerPop and (self.burstPops or 0) > 0 and now >= (self.nextBurstTime or 0) and self.burstSource == "downshift" and inDownshiftWindow then
+                    triggerPop = true
+                    triggerSource = "downshift"
+                    self.burstPops = self.burstPops - 1
+                    self.nextBurstTime = now + randomRange(self.BurstIntervalMin or 0.11, self.BurstIntervalMax or 0.22)
+                elseif self.burstSource == "downshift" and not inDownshiftWindow then
+                    self.burstPops = 0
+                    self.burstSource = ""
+                end
+
+                local onRevLimit =
+                    currentThrottle > (self.RevLimitThrottle or 0.8) and
+                    currentRPM > (revLimitRPM * (self.RevLimitRPMThreshold or 0.95))
+
+                local antiLagActive =
+                    self.EnableAntiLag and
+                    currentThrottle <= (self.AntiLagThrottleMax or 0.35) and
+                    currentRPM > (self.AntiLagMinRPM or 3500) and
+                    currentBoost >= (self.AntiLagBoostThreshold or 1.05)
+
+                if not triggerPop and antiLagActive then
+                    local boostFactor = clamp01((currentBoost - (self.AntiLagBoostThreshold or 1.05)) / 0.5)
+                    if chancePerSecond((self.AntiLagPopChance or 0.45) * math.max(rpmFactor, 0.35) * math.max(boostFactor, 0.25), dt) then
+                        triggerPop = true
+                        triggerSource = "antilag"
+                    end
+                end
+
+                if onRevLimit and chancePerSecond((self.RevLimitPopChance or 0.9) * math.max(rpmFactor, 0.5), dt) then
+                    triggerPop = true
+                    triggerSource = "revlimit"
+                    if math.random() < (self.RevLimitBurstChance or 0.2) then
+                        self.burstPops = math.random(2, 3) - 1
+                        self.burstSource = "revlimit"
+                        self.nextBurstTime = now + randomRange(self.BurstIntervalMin or 0.11, self.BurstIntervalMax or 0.22)
+                    end
+                end
+
+                if not triggerPop and (self.burstPops or 0) > 0 and now >= (self.nextBurstTime or 0) and self.burstSource == "revlimit" and onRevLimit then
+                    triggerPop = true
+                    triggerSource = "revlimit"
+                    self.burstPops = self.burstPops - 1
+                    self.nextBurstTime = now + randomRange(self.BurstIntervalMin or 0.11, self.BurstIntervalMax or 0.22)
+                elseif self.burstSource == "revlimit" and not onRevLimit then
+                    self.burstPops = 0
+                    self.burstSource = ""
+                end
+                
+                if self.TriggerMode == 1 and triggerSource == "revlimit" then
+                    triggerPop = false
+                end
+                if self.TriggerMode == 2 and triggerSource ~= "revlimit" then
+                    triggerPop = false
+                end
+                
+                if triggerPop and now >= (self.nextBackfireTime or 0) then
+                    self:DoPop()
+                    if triggerSource == "revlimit" then
+                        self.nextBackfireTime = now + randomRange(self.RevLimitCooldownMin or 0.11, self.RevLimitCooldownMax or 0.18)
+                    elseif triggerSource == "antilag" then
+                        self.nextBackfireTime = now + randomRange(self.AntiLagCooldownMin or 0.10, self.AntiLagCooldownMax or 0.24)
+                    elseif triggerSource == "downshift" then
+                        self.nextBackfireTime = now + randomRange(self.DownshiftCooldownMin or 0.05, self.DownshiftCooldownMax or 0.18)
+                    else
+                        self.nextBackfireTime = now + randomRange(self.OverrunCooldownMin or 0.16, self.OverrunCooldownMax or 0.45)
+                    end
+                end
+                
+                self.lastThrottle = currentThrottle
+                self.lastRPM = currentRPM
+                self.lastGear = currentGear
+                
+                -- Support late joiners requesting it
+                if SERVER then
+                    if not self.netRegistered then
+                        self.netRegistered = true
+                        net.receive("Backfire_RequestExhausts", function(_, ply)
+                            local ents = {}
+                            local ex = wire.ports.Exhausts
+                            local exTable = {}
+                            if ex then
+                                local ok = pcall(function()
+                                    for _, ent in pairs(ex) do
+                                        table.insert(exTable, ent)
+                                    end
+                                end)
+                                if not ok then exTable = { ex } end
+                            end
+                            
+                            for _, ent in pairs(exTable) do
+                                local ok, idx = pcall(function() return ent:entIndex() end)
+                                if ok and type(idx) == "number" then
+                                    table.insert(ents, idx) 
+                                end
+                            end
+                            net.start("Backfire_SyncExhausts")
+                            net.writeUInt(#ents, 8)
+                            for _, id in ipairs(ents) do
+                                net.writeUInt(id, 13)
+                            end
+                            net.send(ply)
+                        end)
+                    end
+                else
+                    if not self.requestedExhausts then
+                        self.requestedExhausts = true
+                        net.start("Backfire_RequestExhausts")
+                        net.send()
+                    end
+                end
+        end,
+        
+        -- The client-side hook, used to register networking listeners since OnPhysicsUpdate is server-only!
+        OnSoundUpdate = function(ClientState, config, sounds)
+            local self = config.Addons.BackfireAntiLag
+            if not self.Enabled then return end
+
+            if CLIENT and not self.clientInitialized then
+                self.clientInitialized = true
+                
+                -- Initialize URL Stream Pool to prevent HTTP spam and limit BASS channel usage!
+                self._urlPools = {}
+                if self.UseURLSounds and #self.URLSounds > 0 then
+                    for _, url in ipairs(self.URLSounds) do
+                        local dlUrl = url
+                        if string.find(dlUrl, "github.com") then
+                            dlUrl = string.replace(dlUrl, "github.com", "raw.githubusercontent.com")
+                            dlUrl = string.replace(dlUrl, "/blob/", "/")
+                        end
+                        
+                        self._urlPools[dlUrl] = {}
+                        -- Pre-load 3 concurrent streams per URL. This creates a finite, reusable pool
+                        -- that supports overlapping backfires without repeatedly spamming http.get
+                        for i = 1, 3 do
+                            bass.loadURL(dlUrl, "3d noblock noplay", function(s, errId, errStr)
+                                if s then
+                                    s:setLooping(true) -- CRITICAL: prevents stream from dying
+                                    s:pause()
+                                    pcall(function() s:setTime(0) end)
+                                    table.insert(self._urlPools[dlUrl], {stream = s, idle = true})
+                                else
+                                    print("[Backfire Addon] Pool Load Failed: ", errId, errStr)
+                                end
+                            end)
+                        end
+                    end
+                end
+
+                net.receive("Backfire_SyncExhausts", function()
+                    self.clientExhaustIDs = {}
+                    local count = net.readUInt(8)
+                    for i = 1, count do
+                        table.insert(self.clientExhaustIDs, net.readUInt(13))
+                    end
+                end)
+
+                net.receive("Backfire_DoPop", function()
+                    self.clientExhaustIDs = {}
+                    local count = net.readUInt(8)
+                    for i = 1, count do
+                        table.insert(self.clientExhaustIDs, net.readUInt(13))
+                    end
+                    self:DoPop()
+                end)
+            end
+        end,
+        
+        -- Backfire effects are rendered on the client; server handles sound playback where needed.
+        
+        _urlCache = {}, -- internal cache to reuse bass streams and save quota
+        
+        DoPop = function(self)
+            -- Debounce to prevent ear-rape from micro-bounces
+            if timer.curtime() - (self.lastPopTime or 0) < 0.1 then return end
+            self.lastPopTime = timer.curtime()
+            
+            local targets = {}
+            if SERVER then
+                -- On the server, we can directly read the wire port safely
+                local ex = wire.ports.Exhausts
+                local exTable = {}
+                local targetIDs = {}
+                if ex then
+                    local ok = pcall(function()
+                        for _, ent in pairs(ex) do
+                            table.insert(exTable, ent)
+                        end
+                    end)
+                    if not ok then exTable = { ex } end
+                end
+                
+                for _, ent in pairs(exTable) do
+                    local ok, idx = pcall(function() return ent:entIndex() end)
+                    if ok and type(idx) == "number" then
+                        table.insert(targets, ent)
+                        table.insert(targetIDs, idx)
+                    end
+                end
+
+                -- Broadcast a pop event to clients so they can render effects locally on the exhaust props
+                net.start("Backfire_DoPop")
+                net.writeUInt(#targetIDs, 8)
+                for _, id in ipairs(targetIDs) do
+                    net.writeUInt(id, 13)
+                end
+                net.send()
+            else
+                -- On the client, we must use the networked IDs
+                if self.clientExhaustIDs then
+                    for _, id in ipairs(self.clientExhaustIDs) do
+                        local e = entity(id)
+                        if isValid(e) then table.insert(targets, e) end
+                    end
+                end
+            end
+            
+            if #targets == 0 then
+                targets = { chip() } -- Fallback to the chip itself if no exhausts wired
+            end
+            
+            for _, ent in ipairs(targets) do
+                if not isValid(ent) then continue end
+                
+                local effects = self.Effects
+                if not effects then
+                    effects = {
+                        {
+                            effecttype = self.EffectType,
+                            effectname = self.EffectName,
+                            scale = self.EffectScale
+                        }
+                    }
+                end
+                
+                for _, effectCfg in ipairs(effects) do
+                    local effectType = effectCfg.effecttype or effectCfg.EffectType or self.EffectType
+                    local effectName = effectCfg.effectname or effectCfg.EffectName or self.EffectName
+                    local effectScale = effectCfg.scale or effectCfg.EffectScale or self.EffectScale or 1
+
+                    -- Visual Effect
+                    if CLIENT and effectType == "custom" then
+                        if not self._emitters then self._emitters = {} end
+                        if not self._fireMat then
+                            self._fireMat = material.load("effects/muzzleflash1")
+                            self._fireMat2 = material.load("effects/muzzleflash2")
+                        end
+                        
+                        local entID = ent:entIndex()
+                        if not self._emitters[entID] then
+                            -- particle.create strictly requires a Vector!
+                            self._emitters[entID] = particle.create(ent:getPos(), false)
+                        end
+                        local emitter = self._emitters[entID]
+                        
+                        pcall(function()
+                            if type(emitter.setPos) == "function" then
+                                emitter:setPos(ent:getPos())
+                            end
+                        end)
+                        
+                        -- Custom 2D Particle Sprite (Immune to the 16 limit, guaranteed to work)
+                        local pos = ent:getPos()
+                        local fwd = ent:getForward() * -1 -- Exhausts usually point backward
+                        
+                        pcall(function()
+                            for i = 1, 2 do -- 2 overlapping sprites for a thick flash
+                                local mat = (math.random(1,2) == 1) and self._fireMat or self._fireMat2
+                                if not mat then break end
+                                local sizeS = math.random(15, 25) * effectScale
+                                local sizeE = math.random(25, 45) * effectScale
+                                
+                                local p = emitter:add(mat, pos + fwd * math.random(0, 10), sizeS, sizeE, 0, 0, 255, 0, 0.08)
+                                if p then
+                                    p:setVelocity(fwd * math.random(50, 150))
+                                    if p.setRoll then p:setRoll(math.random(-314, 314) / 100) end
+                                    if p.setColor then p:setColor(Color(255, 200, 100)) end
+                                end
+                            end
+                        end)
+                    elseif CLIENT and effectType == "particle" then
+                        -- Attach the particle
+                        pcall(function()
+                            particleEffect.attach(ent, effectName, 1, { origin = ent:getPos(), angles = ent:getAngles() })
+                            
+                            -- Attempt to aggressively free up the 16 quota limit using known Starfall entity methods
+                            timer.simple(0.2, function() 
+                                if ent and ent:isValid() then 
+                                    pcall(function() ent:stopParticles() end)
+                                    pcall(function() ent:stopParticleEmission() end)
+                                end 
+                            end)
+                        end)
+                    elseif effectType == "effect" then
+                        pcall(function()
+                            local eff = effect.create()
+                            eff:setOrigin(ent:getPos())
+                            eff:setAngles(ent:getAngles())
+                            eff:setEntity(ent)
+                            eff:setScale(effectScale)
+                            
+                            -- Try different Starfall syntax variations safely
+                            local ok = pcall(function() eff:play(effectName) end)
+                            if not ok then
+                                pcall(function() effect.play(effectName, eff) end)
+                            end
+                        end)
+                    end
+                end
+                
+                -- Sound Effect
+                local sndPath = ""
+                local isUrl = false
+                
+                if self.UseURLSounds and #self.URLSounds > 0 then
+                    sndPath = self.URLSounds[math.random(1, #self.URLSounds)]
+                    if string.find(sndPath, "github.com") then
+                        sndPath = string.replace(sndPath, "github.com", "raw.githubusercontent.com")
+                        sndPath = string.replace(sndPath, "/blob/", "/")
+                    end
+                    isUrl = true
+                elseif not self.UseURLSounds and #self.InGameSounds > 0 then
+                    sndPath = self.InGameSounds[math.random(1, #self.InGameSounds)]
+                end
+                
+                if sndPath ~= "" then
+                    if isUrl and CLIENT then
+                        local pool = self._urlPools[sndPath]
+                        if pool then
+                            local selected = nil
+                            for _, item in ipairs(pool) do
+                                if item.idle and item.stream and item.stream:isValid() then
+                                    selected = item
+                                    break
+                                end
+                            end
+                            
+                            if selected then
+                                selected.idle = false
+                                local s = selected.stream
+                                
+                                pcall(function()
+                                    s:setPos(ent:getPos())
+                                    s:setVolume(self.SoundVolume)
+                                    s:setPitch(math.random(self.SoundPitchMin, self.SoundPitchMax) / 100)
+                                    s:play()
+                                end)
+                                
+                                local len = 0.5
+                                pcall(function() len = s:getLength() end)
+                                if not len or len <= 0 then len = 0.5 end
+                                
+                                -- Pause and rewind the stream gracefully after the pop finishes.
+                                -- By doing this AFTER the pop instead of directly before, BASS has plenty of time to buffer the HTTP stream for the rewind!
+                                local waitTime = math.max(len - 0.05, 0.05)
+                                
+                                timer.create("Backfire_PoolSync_" .. tostring(s), waitTime, 1, function()
+                                    if s and s:isValid() then
+                                        s:pause()
+                                        pcall(function() s:setTime(0) end)
+                                    end
+                                    selected.idle = true
+                                end)
+                                
+                                -- Sync position while playing
+                                local syncName = "Backfire_PosSync_" .. tostring(s)
+                                timer.create(syncName, 0.05, 0, function()
+                                    if not (s and s:isValid()) then timer.remove(syncName) return end
+                                    if selected.idle then timer.remove(syncName) return end
+                                    if isValid(ent) then
+                                        s:setPos(ent:getPos())
+                                    else
+                                        s:setVolume(0)
+                                    end
+                                end)
+                            end
+                        end
+                    elseif not isUrl then
+                        if SERVER then
+                            local finalPitch = math.random(self.SoundPitchMin, self.SoundPitchMax) / 100
+                            -- Hook into the Engine Core's custom sound quota manager!
+                            net.start("EngineCustomSound")
+                            net.writeString("BackfirePop_" .. tostring(ent:entIndex()))
+                            net.writeString(sndPath)
+                            net.writeFloat(finalPitch)
+                            net.writeFloat(self.SoundVolume)
+                            net.writeFloat(0) -- 0 = discrete, play once
+                            net.writeEntity(ent)
+                            net.send()
+                        end
+                    end
+                end
+            end
+        end
+    }
+}
