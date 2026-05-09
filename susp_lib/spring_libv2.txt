@@ -23,6 +23,8 @@ function Spring:initialize(e1, e2, lPos1, lPos2)
     if e1 == e2 then error("Failed to create spring: cannot constrain an entity to itself", 2) end
     self.e1, self.e2 = e1, e2
     self.phys1, self.phys2 = e1:getPhysicsObject(), e2:getPhysicsObject()
+    self.massCenter1 = isValid(self.phys1) and self.phys1:getMassCenter() or Vector()
+    self.massCenter2 = isValid(self.phys2) and self.phys2:getMassCenter() or Vector()
     self.lPos1, self.lPos2 = lPos1 or Vector(), lPos2 or Vector()
     self.constant, self.preload, self.dampingBump, self.dampingRebound = 0, 0, 0, 0
     self.restingLength = (e1:localToWorld(self.lPos1) - e2:localToWorld(self.lPos2)):getLength()
@@ -51,6 +53,8 @@ function AntiRollBar:initialize(e1, e2)
     self.e2 = e2
     self.phys1 = e1:getPhysicsObject()
     self.phys2 = e2:getPhysicsObject()
+    self.massCenter1 = isValid(self.phys1) and self.phys1:getMassCenter() or Vector()
+    self.massCenter2 = isValid(self.phys2) and self.phys2:getMassCenter() or Vector()
     self.constant = 0
     self.id = springID -- Can share the same ID pool
     antiRollBars[springID] = self
@@ -68,19 +72,34 @@ function AntiRollBar:remove()
 end
 
 
--- Fixed applyForceOffset
-local ENTITY = getMethods("Entity")
+-- Fast, optimized applyForceOffset that avoids boundary crossing
 local const = (1 / 39.3701 ^ 2) * 360 / (2 * 3.1416)
-function ENTITY:applyForceOffsetFixed(force, pos)
-    self:applyForceCenter(force)
-    local off = pos - self:localToWorld(self:getMassCenter())
-    self:applyTorque(off:cross(force) * const)
+
+local pendingForces = {}
+local pendingTorques = {}
+local pendingEnts = {}
+
+local function addForceOffset(ent, force, pos, cachedMassCenter)
+    local idx = ent:entIndex()
+    if not pendingEnts[idx] then
+        pendingEnts[idx] = ent
+        pendingForces[idx] = Vector()
+        pendingTorques[idx] = Vector()
+    end
+    pendingForces[idx] = pendingForces[idx] + force
+    local off = pos - ent:localToWorld(cachedMassCenter)
+    pendingTorques[idx] = pendingTorques[idx] + off:cross(force) * const
 end
 
 local dt = game.getTickInterval()
 
 -- Main tick hook now manages both springs and anti-roll bars
 hook.add("tick", "SuspensionLibTick_v2.2", function()
+    -- Clear accumulation tables
+    for k in pairs(pendingEnts) do pendingEnts[k] = nil end
+    for k in pairs(pendingForces) do pendingForces[k] = nil end
+    for k in pairs(pendingTorques) do pendingTorques[k] = nil end
+
     -- Spring Logic (unchanged from v2.1)
     local invDt = 1 / dt
     if dt == 0 then invDt = 0 end
@@ -103,8 +122,8 @@ hook.add("tick", "SuspensionLibTick_v2.2", function()
                     else dampingForceValue = -spring.dampingBump * displacementRate end
                     local totalForceValue = springForce + dampingForceValue + spring.preload
                     local totalForceVector = forceVector * totalForceValue
-                    if not e1:isFrozen() then e1:applyForceOffsetFixed(totalForceVector, wPos1) end
-                    if not e2:isFrozen() then e2:applyForceOffsetFixed(-totalForceVector, wPos2) end
+                    if not e1:isFrozen() then addForceOffset(e1, totalForceVector, wPos1, spring.massCenter1) end
+                    if not e2:isFrozen() then addForceOffset(e2, -totalForceVector, wPos2, spring.massCenter2) end
                 end
             end
         else spring:remove() end
@@ -126,10 +145,20 @@ hook.add("tick", "SuspensionLibTick_v2.2", function()
                 local forceMagnitude = verticalDifference * arb.constant
 
                 -- Apply a pure vertical force to each wheel
-                e1:applyForceOffsetFixed(WORLD_UP * -forceMagnitude, pos1)
-                e2:applyForceOffsetFixed(WORLD_UP * forceMagnitude, pos2)
+                addForceOffset(e1, WORLD_UP * -forceMagnitude, pos1, arb.massCenter1)
+                addForceOffset(e2, WORLD_UP * forceMagnitude, pos2, arb.massCenter2)
             end
         else arb:remove() end
+    end
+
+    -- Apply all accumulated forces and torques in a single batch
+    for idx, ent in pairs(pendingEnts) do
+        if isValid(ent) then
+            local f = pendingForces[idx]
+            local t = pendingTorques[idx]
+            if f.x ~= 0 or f.y ~= 0 or f.z ~= 0 then ent:applyForceCenter(f) end
+            if t.x ~= 0 or t.y ~= 0 or t.z ~= 0 then ent:applyTorque(t) end
+        end
     end
 end)
 
