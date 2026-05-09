@@ -3,7 +3,7 @@
 
 local Core = {}
 _G.RedFoxEngineCore = Core
-local Version = "3.02" -- v3 Alpha
+local Version = "3.03" -- v3 Alpha
 
 --[[
 Changelog:
@@ -148,6 +148,20 @@ if SERVER then
             LastSyncedValues = {}  -- Track last sent values for delta-based sending
         }
         
+        -- Physics Object Cache (Improves performance by avoiding C++ boundary crossings every tick)
+        local physCache = setmetatable({}, {__mode = "k"})
+        local function getPhys(ent)
+            if not isValid(ent) then return nil end
+            local phys = physCache[ent]
+            if not isValid(phys) then
+                phys = ent:getPhysicsObject()
+                if isValid(phys) then
+                    physCache[ent] = phys
+                end
+            end
+            return phys
+        end
+        
         -- Helper: Timer check
         local function clk(name, duration)
             if s.Timers[name] and timer.curtime() < s.Timers[name] then return false end
@@ -221,7 +235,7 @@ if SERVER then
             local function scan(ent)
                 if not (ent and ent:isValid()) or seen[ent] then return end
                 seen[ent] = true
-                local phys = ent:getPhysicsObject()
+                local phys = getPhys(ent)
                 if isValid(phys) then
                     mass = mass + phys:getMass()
                 end
@@ -824,6 +838,10 @@ if SERVER then
             local RearRPMs = s.RearRPMs or {}
             local Flywheels_RPM = s.Flywheels_RPM or {}
 
+            -- Prepare unified torque accumulators to minimize applyTorque calls
+            local netWheelTorqueFront = {}
+            local netWheelTorqueRear = {}
+
             -- Apply braking torque (runs every frame, uses cached BrakeF/BrakeR from gate)
             if s.Brake == 1 then
                 local brakeF = s.BrakeF or 0
@@ -855,31 +873,19 @@ if SERVER then
                     end
                 end
                 
-                for i, w in ipairs(FrontWheels) do
-                    if isValid(w) then
-                        local phys = w:getPhysicsObject()
-                        if isValid(phys) then
-                            local wheelRPM = FrontRPMs[i] or 0
-                            local force = 5 * wheelRPM * tickMult
-                            local brakeMult = c.BrakeMult or 1
-                            -- Use per-wheel brake force if available, otherwise scalar
-                            local finalBrake = (brakeForcesFront and brakeForcesFront[i]) or brakeF
-                            phys:applyTorque((EngineDirection) * force * finalBrake * brakeMult)
-                        end
-                    end
+                for i, _ in ipairs(FrontWheels) do
+                    local wheelRPM = FrontRPMs[i] or 0
+                    local force = 5 * wheelRPM * tickMult
+                    local brakeMult = c.BrakeMult or 1
+                    local finalBrake = (brakeForcesFront and brakeForcesFront[i]) or brakeF
+                    netWheelTorqueFront[i] = EngineDirection * force * finalBrake * brakeMult
                 end
-                for i, w in ipairs(RearWheels) do
-                    if isValid(w) then
-                        local phys = w:getPhysicsObject()
-                        if isValid(phys) then
-                            local wheelRPM = RearRPMs[i] or 0
-                            local force = 5 * wheelRPM * tickMult
-                            local brakeMult = c.BrakeMult or 1
-                            -- Use per-wheel brake force if available, otherwise scalar
-                            local finalBrake = (brakeForcesRear and brakeForcesRear[i]) or brakeR
-                            phys:applyTorque((EngineDirection) * force * finalBrake * brakeMult)
-                        end
-                    end
+                for i, _ in ipairs(RearWheels) do
+                    local wheelRPM = RearRPMs[i] or 0
+                    local force = 5 * wheelRPM * tickMult
+                    local brakeMult = c.BrakeMult or 1
+                    local finalBrake = (brakeForcesRear and brakeForcesRear[i]) or brakeR
+                    netWheelTorqueRear[i] = EngineDirection * force * finalBrake * brakeMult
                 end
             end
 
@@ -2045,30 +2051,24 @@ if SERVER then
                     local FrontPower = scaledPower * FrontPowerRatio
                     local PowerPerWheel = FrontPower / #FrontWheels
                     for i, w in pairs(FrontWheels) do
-                        if isValid(w) then
-                            local phys = w:getPhysicsObject()
-                            if isValid(phys) then
-                                -- PhysObj:applyTorque expects WORLD vector, not local
-                                local forceMult = (c.ForceMult or 1) * 39.37 * 2 * tickMult
-                                local torqueDir = (c.TorqueInvert and -1 or 1)
-                                local wheelScale = 1
-                                if s.FrontWheelPowerScale and s.FrontWheelPowerScale[i] then
-                                    wheelScale = s.FrontWheelPowerScale[i]
-                                end
-                                -- Use EngineDirection in world space
-                                local torque = EngineDirection * (PowerPerWheel * wheelScale) * forceMult * torqueDir
-                                
-                                -- Safety Clamp (Increased for functionality)
-                                local limit = 50000 
-                                if torque.x ~= torque.x then torque = Vector(0,0,0) end -- NaN check
-                                torque = Vector(
-                                    clamp(torque.x, -limit, limit),
-                                    clamp(torque.y, -limit, limit),
-                                    clamp(torque.z, -limit, limit)
-                                )
-                                phys:applyTorque(torque)
-                            end
+                        local forceMult = (c.ForceMult or 1) * 39.37 * 2 * tickMult
+                        local torqueDir = (c.TorqueInvert and -1 or 1)
+                        local wheelScale = 1
+                        if s.FrontWheelPowerScale and s.FrontWheelPowerScale[i] then
+                            wheelScale = s.FrontWheelPowerScale[i]
                         end
+                        -- Use EngineDirection in world space
+                        local torque = EngineDirection * (PowerPerWheel * wheelScale) * forceMult * torqueDir
+                        
+                        -- Safety Clamp (Increased for functionality)
+                        local limit = 50000 
+                        if torque.x ~= torque.x then torque = Vector(0,0,0) end -- NaN check
+                        torque = Vector(
+                            clamp(torque.x, -limit, limit),
+                            clamp(torque.y, -limit, limit),
+                            clamp(torque.z, -limit, limit)
+                        )
+                        netWheelTorqueFront[i] = (netWheelTorqueFront[i] or Vector(0,0,0)) + torque
                     end
                 end
                 
@@ -2077,35 +2077,29 @@ if SERVER then
                     local RearPower = scaledPower * RearPowerRatio
                     local PowerPerWheel = RearPower / #RearWheels
                     for i, w in pairs(RearWheels) do
-                        if isValid(w) then
-                            local phys = w:getPhysicsObject()
-                            if isValid(phys) then
-                                -- PhysObj:applyTorque expects WORLD vector
-                                local forceMult = (c.ForceMult or 1) * 39.37 * 2 * tickMult
-                                local torqueDir = (c.TorqueInvert and -1 or 1)
-                                local wheelScale = 1
-                                if s.RearWheelPowerScale and s.RearWheelPowerScale[i] then
-                                    wheelScale = s.RearWheelPowerScale[i]
-                                end
-                                local torque = EngineDirection * (PowerPerWheel * wheelScale) * forceMult * torqueDir
-                                -- Safety Clamp
-                                local limit = 50000
-                                if torque.x ~= torque.x then torque = Vector(0,0,0) end -- NaN check
-                                torque = Vector(
-                                    clamp(torque.x, -limit, limit),
-                                    clamp(torque.y, -limit, limit),
-                                    clamp(torque.z, -limit, limit)
-                                )
-                                phys:applyTorque(torque)
-                            end
+                        local forceMult = (c.ForceMult or 1) * 39.37 * 2 * tickMult
+                        local torqueDir = (c.TorqueInvert and -1 or 1)
+                        local wheelScale = 1
+                        if s.RearWheelPowerScale and s.RearWheelPowerScale[i] then
+                            wheelScale = s.RearWheelPowerScale[i]
                         end
+                        local torque = EngineDirection * (PowerPerWheel * wheelScale) * forceMult * torqueDir
+                        -- Safety Clamp
+                        local limit = 50000
+                        if torque.x ~= torque.x then torque = Vector(0,0,0) end -- NaN check
+                        torque = Vector(
+                            clamp(torque.x, -limit, limit),
+                            clamp(torque.y, -limit, limit),
+                            clamp(torque.z, -limit, limit)
+                        )
+                        netWheelTorqueRear[i] = (netWheelTorqueRear[i] or Vector(0,0,0)) + torque
                     end
                 end
                 
                 -- Chassis reaction forces (E2 Lines 1342-1343)
                 -- Applies acceleration feedback to chassis for realistic weight transfer
                 if isValid(Chassis) and isValid(Engine) then
-                    local ChassisPhys = Chassis:getPhysicsObject()
+                    local ChassisPhys = getPhys(Chassis)
                     if isValid(ChassisPhys) then
                         -- E2: C:applyOffsetForce(ChassisFeedDirection * -Flywheel_Power, E:pos() - (ChassisFeedDirection * ChassisAccFeed))
                         -- E2: C:applyOffsetForce(ChassisFeedDirection * Flywheel_Power, E:pos() + (ChassisFeedDirection * ChassisAccFeed))
@@ -2146,12 +2140,35 @@ if SERVER then
                 end
             end
             
+            -- ============================================================================
+            -- UNIFIED TORQUE APPLICATION (Runs Every Frame)
+            -- Merges brake and engine torques to minimize expensive physics calls
+            -- ============================================================================
+            for i, w in ipairs(FrontWheels) do
+                local tq = netWheelTorqueFront[i]
+                if tq and (tq.x ~= 0 or tq.y ~= 0 or tq.z ~= 0) and isValid(w) then
+                    local phys = getPhys(w)
+                    if isValid(phys) then
+                        phys:applyTorque(tq)
+                    end
+                end
+            end
+            for i, w in ipairs(RearWheels) do
+                local tq = netWheelTorqueRear[i]
+                if tq and (tq.x ~= 0 or tq.y ~= 0 or tq.z ~= 0) and isValid(w) then
+                    local phys = getPhys(w)
+                    if isValid(phys) then
+                        phys:applyTorque(tq)
+                    end
+                end
+            end
+            
             -- ====== ADDON HOOK: OnPhysicsUpdate ======
             -- Allow addons to modify physics (torque reactions, air control, etc)
             -- Runs every frame for smooth physics behavior
             if c.Addons and isValid(Chassis) and isValid(Engine) then
-                local ChassisPhys = Chassis:getPhysicsObject()
-                local EnginePhys = Engine:getPhysicsObject()
+                local ChassisPhys = getPhys(Chassis)
+                local EnginePhys = getPhys(Engine)
                 
                 if isValid(ChassisPhys) then
                     local physicsData = {
