@@ -2,7 +2,7 @@
 --@author [C17] Red Fox
 --@shared
 
-local Version = "1.12"
+local Version = "1.13"
 
 if CLIENT then
     
@@ -407,8 +407,107 @@ else -- SERVER
         local skipTicks = 0
         local lastAppliedForces = {}
         local cpuLoadPct = 0
+        local lastReportedMass = -1
+        local lastReportedFilterCount = -1
         
         local RightAxis = Config.RightAxis 
+
+        local function formatMass(value)
+            return string.format("%.1f", value or 0)
+        end
+
+        local function addFilterEntity(ent)
+            if ent and ent:isValid() and not CheckedEntities[ent] then
+                CheckedEntities[ent] = true
+                table.insert(VehicleFilter, ent)
+                return 1
+            end
+            return 0
+        end
+
+        local function addConstrainedTreeToFilter(ent)
+            if not (ent and ent:isValid()) then return 0 end
+            local added = addFilterEntity(ent)
+            local subParts = ent:getAllConstrained()
+            for _, part in pairs(subParts) do
+                added = added + addFilterEntity(part)
+            end
+            return added
+        end
+
+        local function rebuildVehicleFilter(Base)
+            if not Base then return 0 end
+
+            VehicleFilter = {}
+            CheckedEntities = {}
+
+            addConstrainedTreeToFilter(Base)
+
+            local staticFilter = wire.ports.ExtraFilterStatic
+            if staticFilter and #staticFilter > 0 then
+                for _, ent in ipairs(staticFilter) do
+                    addConstrainedTreeToFilter(ent)
+                end
+            end
+
+            for _, name in ipairs(OrderedWheelNames) do
+                local wData = Wheels[name]
+                if wData and wData.Entity and wData.Entity:isValid() then
+                    addFilterEntity(wData.Entity)
+                end
+            end
+
+            local semiDynamicFilter = wire.ports.ExtraFilterSemiDynamic
+            if semiDynamicFilter and #semiDynamicFilter > 0 then
+                for _, ent in ipairs(semiDynamicFilter) do
+                    addConstrainedTreeToFilter(ent)
+                end
+            end
+
+            return #VehicleFilter
+        end
+
+        local function recalculateTotalRealMass(Base)
+            if not Base then return false, 0, 0 end
+
+            local totalMass = 0
+            local massChecked = {}
+            local function addMassTree(ent)
+                if not (ent and ent:isValid()) then return end
+
+                local tree = ent:getAllConstrained()
+                table.insert(tree, ent)
+                for _, part in pairs(tree) do
+                    if part and part:isValid() and not massChecked[part] then
+                        massChecked[part] = true
+                        local phys = part:getPhysicsObject()
+                        if phys and phys:isValid() then
+                            totalMass = totalMass + phys:getMass()
+                        end
+                    end
+                end
+            end
+
+            addMassTree(Base)
+
+            local semiDynamicFilter = wire.ports.ExtraFilterSemiDynamic
+            if semiDynamicFilter and #semiDynamicFilter > 0 then
+                for _, ent in ipairs(semiDynamicFilter) do
+                    addMassTree(ent)
+                end
+            end
+
+            local previousMass = TotalRealMass
+            TotalRealMass = totalMass
+
+            local massChanged = math.abs(TotalRealMass - lastReportedMass) > 0.1
+            if massChanged then
+                print(Config.W, "[TireSim] Total Physical Mass detected: ", Config.G, formatMass(TotalRealMass) .. "kg", Config.W, " (Config Virtual: ", Config.G, formatMass(Config.TotalVehicleMass) .. "kg", Config.W, ")")
+                lastReportedMass = TotalRealMass
+            end
+
+            return massChanged, previousMass, TotalRealMass
+        end
     
         local function updateSemiDynamicFilter()
             local semiDynamicFilter = wire.ports.ExtraFilterSemiDynamic
@@ -416,23 +515,18 @@ else -- SERVER
     
             local newEnts = 0
             for _, ent in ipairs(semiDynamicFilter) do
-                if ent and ent:isValid() and not CheckedEntities[ent] then
-                    -- [OPTIMIZATION] Using getAllConstrained instead of recursion
-                    local subParts = ent:getAllConstrained()
-                    table.insert(subParts, ent)
-                    
-                    for _, part in pairs(subParts) do
-                        if not CheckedEntities[part] then
-                            CheckedEntities[part] = true
-                            table.insert(VehicleFilter, part)
-                        end
-                    end
-                    newEnts = newEnts + 1
-                end
+                newEnts = newEnts + addConstrainedTreeToFilter(ent)
             end
     
             if newEnts > 0 and Config.AllowPrintFilter then
                 print("[TireSim] Semi-dynamic filter found " .. newEnts .. " new entities.")
+            end
+
+            if newEnts > 0 then
+                local Base = getValidBase()
+                if Base then
+                    recalculateTotalRealMass(Base)
+                end
             end
         end
     
@@ -442,34 +536,6 @@ else -- SERVER
     
             for name, holo in pairs(WheelHolos) do if holo and holo:isValid() then holo:remove() end end
             Wheels, WheelHolos, OrderedWheelNames, NumWheels, VehicleFilter, CheckedEntities, lastAppliedForces = {}, {}, {}, 0, {}, {}, {}
-    
-            -- [OPTIMIZATION] Replaced recursive scan with O(N) lookup
-            local allParts = Base:getAllConstrained()
-            table.insert(allParts, Base)
-            
-            for _, part in pairs(allParts) do
-                if part and part:isValid() and not CheckedEntities[part] then
-                    CheckedEntities[part] = true
-                    table.insert(VehicleFilter, part)
-                end
-            end
-    
-            local staticFilter = wire.ports.ExtraFilterStatic
-            if staticFilter and #staticFilter > 0 then
-                for _, ent in ipairs(staticFilter) do
-                    if ent and ent:isValid() and not CheckedEntities[ent] then
-                        CheckedEntities[ent] = true
-                        table.insert(VehicleFilter, ent)
-                         local subConstrained = ent:getAllConstrained()
-                         for _, sub in pairs(subConstrained) do
-                            if not CheckedEntities[sub] then
-                                CheckedEntities[sub] = true
-                                table.insert(VehicleFilter, sub)
-                            end
-                         end
-                    end
-                end
-            end
     
             local minFwd, maxFwd = 9e9, -9e9
             local minRight, maxRight = 9e9, -9e9
@@ -485,10 +551,6 @@ else -- SERVER
                 if wheelArray and #wheelArray > 0 then
                     for i, wheelEntity in ipairs(wheelArray) do
                         if wheelEntity and wheelEntity:isValid() then
-                            if not CheckedEntities[wheelEntity] then
-                                table.insert(VehicleFilter, wheelEntity)
-                                CheckedEntities[wheelEntity] = true
-                            end
                             local localPos = Base:worldToLocal(wheelEntity:getPos())
                             minFwd = math.min(minFwd, localPos.x); maxFwd = math.max(maxFwd, localPos.x)
                             minRight = math.min(minRight, localPos.y); maxRight = math.max(maxRight, localPos.y)
@@ -537,26 +599,60 @@ else -- SERVER
                 TrackWidth = 0
             end
             
-            -- Calculate Total Physical Mass (Base + Wheels)
-            TotalRealMass = Base:getPhysicsObject():getMass()
-            for _, w in pairs(Wheels) do
-                if w.PhysObj and w.PhysObj:isValid() then
-                    TotalRealMass = TotalRealMass + w.PhysObj:getMass()
-                end
-            end
-            print(Config.W, "[TireSim] Total Physical Mass detected: ", Config.G, TotalRealMass .. "kg", Config.W, " (Config Virtual: ", Config.G, Config.TotalVehicleMass .. "kg", Config.W, ")")
-            
-            updateSemiDynamicFilter()
+            rebuildVehicleFilter(Base)
+            recalculateTotalRealMass(Base)
+            lastReportedFilterCount = #VehicleFilter
             
             print(Config.W, "[TireSim] Initialized with ", Config.G, NumWheels, Config.W, " wheels. Simcade Version " .. Version)
             wire.ports.NumWheels = NumWheels; wire.ports.WheelNames = OrderedWheelNames
         end
     
-        timer.create("TireSim_SemiDynamicFilterUpdate", 10, 0, updateSemiDynamicFilter)
+        timer.create("TireSim_SemiDynamicFilterUpdate", math.max(0.25, Config.ConstraintRefreshInterval or 2), 0, function()
+            local Base = getValidBase()
+            if not Base then return end
+
+            local previousFilterCount = lastReportedFilterCount
+            local filterCount = rebuildVehicleFilter(Base)
+            local massChanged, previousMass, currentMass = recalculateTotalRealMass(Base)
+            local filterChanged = filterCount ~= previousFilterCount
+
+            if Config.AllowPrintFilter and filterChanged then
+                print("[TireSim] Vehicle filter rebuilt with " .. filterCount .. " entities.")
+            end
+            if Config.AllowPrintMassRefresh and (massChanged or filterChanged) then
+                local prevMassText = (previousMass and previousMass >= 0) and formatMass(previousMass) or "?"
+                print(
+                    Config.W,
+                    "[TireSim] Refresh update: filter ",
+                    Config.G,
+                    tostring(previousFilterCount),
+                    Config.W,
+                    " -> ",
+                    Config.G,
+                    tostring(filterCount),
+                    Config.W,
+                    " | real mass ",
+                    Config.G,
+                    prevMassText .. "kg",
+                    Config.W,
+                    " -> ",
+                    Config.G,
+                    formatMass(currentMass) .. "kg"
+                )
+            end
+            lastReportedFilterCount = filterCount
+        end)
         
         wire.onInputsChanged = function(changed)
-            if changed.FrontWheels or changed.RearWheels or changed.ExtraFilterStatic or changed.Throttle or changed.Brake then
+            if changed.Base or changed.FrontWheels or changed.RearWheels or changed.ExtraFilterStatic or changed.Throttle or changed.Brake then
                 initializeWheels()
+            elseif changed.ExtraFilterSemiDynamic then
+                local Base = getValidBase()
+                if Base then
+                    rebuildVehicleFilter(Base)
+                    recalculateTotalRealMass(Base)
+                    lastReportedFilterCount = #VehicleFilter
+                end
             end
         end
     
@@ -614,12 +710,13 @@ else -- SERVER
                 local accel = (currentVel - lastVel) / dt
                 lastVel = currentVel
                 local localAccel = Base:worldToLocalVector(accel)
+                local effectiveVehicleMass = (TotalRealMass > 0) and TotalRealMass or Config.TotalVehicleMass
     
                 local weightTransferFwd = 0
                 local weightTransferRight = 0
                 if Wheelbase > 0 and TrackWidth > 0 then
-                    weightTransferFwd = (localAccel.x / Config.Gravity) * Config.TotalVehicleMass * Config.CenterOfMassHeight / Wheelbase
-                    weightTransferRight = (localAccel.y / Config.Gravity) * Config.TotalVehicleMass * Config.CenterOfMassHeight / TrackWidth
+                    weightTransferFwd = (localAccel.x / Config.Gravity) * effectiveVehicleMass * Config.CenterOfMassHeight / Wheelbase
+                    weightTransferRight = (localAccel.y / Config.Gravity) * effectiveVehicleMass * Config.CenterOfMassHeight / TrackWidth
                 end
     
                 local function normalizeInput(rawValue, maxValueRef)
@@ -642,6 +739,8 @@ else -- SERVER
                 
                 local loads_t, grip_pcts_t, forces_t, damping_t = {}, {}, {}, {}
                 local baseUp = Base:localToWorldVector(Config.UpAxis)
+                local baseRight = Base:localToWorldVector(RightAxis)
+                local baseAngVel = basePhys:getAngleVelocity()
                 
                 -- [FIX] Validate Filter
                 for j=#VehicleFilter, 1, -1 do
@@ -659,7 +758,7 @@ else -- SERVER
                         -- Load Calc
                         local totalRatio = Config.WeightRatioFront + Config.WeightRatioRear
                         local frontRatioNormalized = Config.WeightRatioFront / totalRatio
-                        local staticLoad = Config.TotalVehicleMass * Config.Gravity * (string.find(name, "Front") and frontRatioNormalized or (1 - frontRatioNormalized)) / (NumWheels / 2)
+                        local staticLoad = effectiveVehicleMass * Config.Gravity * (string.find(name, "Front") and frontRatioNormalized or (1 - frontRatioNormalized)) / (NumWheels / 2)
                         
                         local rightSign = string.find(name, "Right") and 1 or (string.find(name, "Left") and -1 or 0)
                         -- [BIKE FIX] Center wheels (rightSign=0) skip lateral weight transfer entirely.
@@ -670,15 +769,15 @@ else -- SERVER
                         local contactPointVel = basePhys:getVelocityAtPoint(wheelData.Entity:getPos())
                         local trueSpeed = contactPointVel:getLength()
                         local speedMph = trueSpeed / 17.6
-                        local aeroLoad = (isFrontWheel and Config.FrontAeroFactor or Config.RearAeroFactor) * Config.TotalVehicleMass * (speedMph / 100)^2
+                        local aeroLoad = (isFrontWheel and Config.FrontAeroFactor or Config.RearAeroFactor) * effectiveVehicleMass * (speedMph / 100)^2
     
                         -- Transfer
                         local transferLoad = 0
                         if brakeInput > Config.InputDeadzone then
-                            local transferForce = brakeInput * Config.BrakeTransferFactor * Config.TotalVehicleMass
+                            local transferForce = brakeInput * Config.BrakeTransferFactor * effectiveVehicleMass
                             transferLoad = isFrontWheel and transferForce or -transferForce
                         elseif throttleInput > Config.InputDeadzone then
-                            local transferForce = throttleInput * Config.ThrottleTransferFactor * Config.TotalVehicleMass
+                            local transferForce = throttleInput * Config.ThrottleTransferFactor * effectiveVehicleMass
                             transferLoad = isFrontWheel and -transferForce or transferForce
                         end
     
@@ -727,7 +826,7 @@ else -- SERVER
                                 local dampedMag = prevMag + (forceChange / math.max(1, Config.GripDampingFactor))
                                 
                                 -- Clamp
-                                local maxOneG = Config.TotalVehicleMass * Config.Gravity
+                                local maxOneG = effectiveVehicleMass * Config.Gravity
                                 local maxForceLim = maxOneG * 1.5 
                                 dampedMag = math.clamp(dampedMag, -maxForceLim, maxForceLim)
     
@@ -750,8 +849,27 @@ else -- SERVER
                             slipMetric = 0
                         end
                         
+                        -- Yaw Stability Precalc
+                        local yawMag = 0
+                        if Config.YawStabilityFactor > 0 then
+                            local yawVel = baseAngVel.z
+                            if math.abs(yawVel) > 1 and trueSpeed > 0.1 then
+                                local counterForce = -(contactPointVel / trueSpeed) * (math.abs(yawVel) * Config.YawStabilityFactor * 50)
+                                yawMag = counterForce:dot(baseRight)
+                            end
+                        end
+                        
+                        -- Damping Update (State Checked)
+                        local targetDampPos = wheelData.IsStatic and 100 or 0
+                        local targetDampAng = wheelData.IsStatic and 100 or rollingResistance
+                        if wheelData.LastDampAng ~= targetDampAng or wheelData.LastDampPos ~= targetDampPos then
+                            wheelData.PhysObj:setDamping(targetDampPos, targetDampAng)
+                            wheelData.LastDampPos = targetDampPos
+                            wheelData.LastDampAng = targetDampAng
+                        end
+                        
                         lastAppliedForces[name] = { mag = latForceMag }
-                        wheelData.LastComponents = { Mag = latForceMag, IsStatic = wheelData.IsStatic, Damping = rollingResistance, Slip = math.abs(slipMetric) }
+                        wheelData.LastComponents = { Mag = latForceMag, YawMag = yawMag, IsStatic = wheelData.IsStatic, Damping = rollingResistance, Slip = math.abs(slipMetric) }
                         
                         loads_t[i] = wheelData.Load
                         grip_pcts_t[i] = gripPct
@@ -793,8 +911,11 @@ else -- SERVER
             end 
             
             -- Force Apply Block 
-            local massRatio = math.min(1.0, TotalRealMass / Config.TotalVehicleMass)
+            local effectiveVehicleMass = (TotalRealMass > 0) and TotalRealMass or Config.TotalVehicleMass
+            local massRatio = math.min(1.0, effectiveVehicleMass / Config.TotalVehicleMass)
             massRatio = math.max(0.1, massRatio) 
+            
+            local vehicleRight = Base:localToWorldVector(RightAxis)
             
             for i, name in ipairs(OrderedWheelNames) do
                 local wheelData = Wheels[name]
@@ -802,34 +923,23 @@ else -- SERVER
                     local comps = wheelData.LastComponents
                     if comps then
                         local wheelPhys = wheelData.PhysObj
+                        local totalForceVec = Vector(0, 0, 0)
                         
                         -- 1. Apply Lateral Grip
                         if math.abs(comps.Mag) > 0.1 then
-                             local vehicleRight = Base:localToWorldVector(RightAxis)
                              local wheelRight = wheelData.Entity:getRight()
                              if wheelRight:dot(vehicleRight) < 0 then wheelRight = -wheelRight end
-                             
-                             local forceVec = -wheelRight * comps.Mag * massRatio
-                             wheelPhys:applyForceCenter(forceVec)
+                             totalForceVec = totalForceVec + (-wheelRight * comps.Mag * massRatio)
                         end
                         
                         -- 2. Yaw Stability
-                        if Config.YawStabilityFactor > 0 then
-                            local angVel = basePhys:getAngleVelocity()
-                            local yawVel = angVel.z
-                            if math.abs(yawVel) > 1 then 
-                                local counterForce = -basePhys:getVelocityAtPoint(wheelData.Entity:getPos()):getNormalized() * (math.abs(yawVel) * Config.YawStabilityFactor * 50)
-                                local rightVec = basePhys:localToWorldVector(RightAxis)
-                                local latCounter = rightVec * counterForce:dot(rightVec)
-                                wheelPhys:applyForceCenter(latCounter * massRatio)
-                            end
+                        if comps.YawMag and math.abs(comps.YawMag) > 0.1 then
+                             totalForceVec = totalForceVec + (vehicleRight * comps.YawMag * massRatio)
                         end
                         
-                        -- 3. Damping
-                        if comps.IsStatic then
-                            wheelPhys:setDamping(100, 100)
-                        else
-                            wheelPhys:setDamping(0, comps.Damping or 0)
+                        -- Apply unified force
+                        if totalForceVec.x ~= 0 or totalForceVec.y ~= 0 or totalForceVec.z ~= 0 then
+                             wheelPhys:applyForceCenter(totalForceVec)
                         end
                     end
                 end

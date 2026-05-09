@@ -76,6 +76,7 @@ local UserConfig = {
     ShowWheelHolograms = false, -- Draws dummy wheel models for debug
     VisualizerLength = 2,       -- Length of debug axes
     AllowPrintFilter = false,   -- Print when new entities are added to filter
+    AllowPrintMassRefresh = true, -- Print when the periodic constraint refresh changes the detected real physical mass
     AllowCheckVersion = true,   -- Check for Core updates on spawn
 
     W = Color(255, 255, 255),   -- Console Print Color: Text
@@ -95,6 +96,7 @@ local UserConfig = {
     
     -- Simulation Quality
     UpdateRate = 66,           -- [OPTIMIZATION] Target updates per second (Hz). Lower this (e.g. 33) to save CPU.
+    ConstraintRefreshInterval = 2.0, -- Re-scan base constraints and recalculate real physical mass this often (seconds)
     
     -- Tire Setup
     TireSetup = {
