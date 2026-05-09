@@ -1,0 +1,845 @@
+--@name  Advanced Car CameraV1.7
+--@author [C17] Red Fox, Manus, KimiV2, Gemini (refactor)
+--@version 1.6 - Timer-based networking refactor
+
+--[[ 
+    =========================================================
+    INSTRUCTIONS!!
+    
+    1) DONT use a cam controller alongside it, you either activate one or the other
+    2) Spawn the chip AND and SF Hud Component, link the Hud to the chip and then to the seat
+    3) Make sure the ForwardAxis is CORRECT, as soon as you activate it, it should direct itself forward
+    4) Read the configuration comments for what does what
+    5) Keep testing whats the best config for your case
+    6) Wire a button or a value to the "TrailerMode" input to toggle the alternate camera settings.
+
+]]--
+-- =========================================================
+--  SHARED CONFIGURATION
+-- =========================================================
+local CFG = {
+    --[[ Input Scaling ]]
+    maxThrottleInput = 1, 
+    maxBrakeInput    = 1,
+
+    --[[ Spring Physics Effects ]]
+    posDamping    = 15,
+    centerForce   = 15,
+    boundaryForce = 75,
+    accelLag      = 5,
+    brakeKick     = 7,
+    gearKick      = 200,
+
+    --[[ Standard Settings ]]
+    angleResponsiveness = 3.5,
+    maxDist       = 160,
+    minDist       = 130,
+    heightOffset  = 55,
+    pitchOffset   = 5,
+    lookAhead     = true,
+    lookAheadDist = 200,
+    mouseSens     = 0.05,
+    idleTimeout   = 2.0,
+    invertPitch   = false,
+    mouseThreshold= 5,
+    
+    --[[ Collision Settings ]]
+    doCollision   = true,
+    colMask       = 131083, -- MASK_SOLID_BRUSHONLY
+    colExtra      = 8,
+
+    --[[ Vehicle Axis ]]
+    ForwardAxis   = Vector(1,0,0)
+}
+
+--[[
+    =========================================================
+    TRAILER MODE CONFIGURATION
+    =========================================================
+]]--
+local TRAILER_CFG = {
+    maxDist       = 350,
+    minDist       = 300,
+    heightOffset  = 80,
+    pitchOffset   = 10
+}
+
+--[[
+    =========================================================
+    FIRST PERSON CONFIGURATION
+    =========================================================
+]]--
+local FPV_CFG = {
+    ForwardAxis = Vector(0, 1, 0), -- Forward direction relative to the seat model
+    offset = Vector(10, 0, 35), -- Offset from seat entity. Adjust to match driver's head (X: Forward, Y: Left/Right, Z: Up)
+    
+    -- Real Head Motion (Horizon Lock)
+    horizonLockPitch = 0.5,   -- 0 = Head rigidly follows car pitch (bumpy). 1 = Level with track slope (smooth)
+    horizonLockRoll = 0.7,    -- 0 = Head rigidly follows car roll. 1 = Head stays upright relative to world.
+    
+    -- Dynamic Head Movement (Apex Looking)
+    apexLookYaw = true,       -- Look into corners based on steering/yaw
+    apexYawFactor = 0.45,     -- Degrees of head yaw per degree/sec of car yaw
+    apexMaxYaw = 65,          -- Maximum degrees the head will turn for a corner
+    
+    -- G-Forces Simulation (Angle & 3D Shifting)
+    enableGForces = true,
+    gForcePitch = 0.009,       -- Positive = Pitch down under braking, up under acceleration (Radians/Degrees scaling)
+    gForceRoll = 0.007,       -- Intensity of head roll under lateral forces
+    rollIntoCorner = false,     -- True = compensates for sideways forces (lean in). False = centrifugal (lean out)
+    
+    -- Individual G-Force Max (Inches)
+    gForcePosMax = {
+        forward = 2.5,   -- Braking displacement
+        backward = 1.0,  -- Accel displacement
+        left = 1.0,      -- Cornering Left
+        right = 1.0,     -- Cornering Right
+        up = 1.0,        -- Bumps
+        down = 1.5       -- Drops
+    },
+    -- Individual G-Force Scale (Sensitivity)
+    gForcePosScale = {
+        forward = 0.01,
+        backward = 0.005,
+        left = 0.0025,
+        right = 0.0025,
+        up = 0.005,
+        down = 0.005
+    },
+    
+    -- Sim-Grade Atmospherics
+    enableFOV = true,           -- Dynamic field of view based on speed
+    baseFOV = 90,               -- Starting FOV
+    maxFOV = 120,                -- Absolute max FOV
+    fovScale = 0.18,            -- Added FOV per MPH above threshold (e.g. 0.08 = 8 FOV per 100mph)
+    fovSpeedThreshold = 20,     -- MPH where FOV starts expanding
+    fovSmoothing = 1.5,         -- How smoothly FOV transitions
+    
+    enableShake = true,         -- Fast head vibrations at high speeds
+    shakeAmount = 0.1,          -- Intensity of shake
+    shakeSpeedThreshold = 60,   -- MPH where shake begins
+    
+    enableGearKick = false,      -- Physical head movement when shifting gears
+    gearKickAmount = 1.0,       -- Intensity of the jolt
+    
+    -- Anti-Nausea / Smoothers
+    seatBumpSmoothing = 5,    -- The lower this is, the more shocks/bumps are filtered out!
+    physicsDamping = 1,       -- Heaviness of the head (lower = slower leaning/G-Forces)
+    returnSpeed = {
+        forward = 8,   -- Recovery from braking
+        backward = 4,  -- Recovery from acceleration
+        left = 5,      -- Recovery from sideways forces
+        right = 5,     -- Recovery from sideways forces
+        up = 7,       -- Recovery from bumps
+        down = 7,     -- Recovery from drops
+        apex = 8       -- Recovery from looking into corners (Yaw Rate)
+    },
+    headSpringSpeed = 15,     -- How fast the head snaps to track the apex via mouse/steering
+    minSpeedThreshold = 0,    -- Speed (MPH) where physics effects activate. 0 = Active even while parked.
+    
+    -- Standard overrides
+    pitchOffset = 5,
+    
+    -- Mouse settings
+    mouseSens = 0.05,
+    invertPitch = false,
+    mouseThreshold = 5,
+    idleTimeout = 2.0
+}
+
+--[[
+    =========================================================
+    DEBUG CONFIGURATION
+    =========================================================
+]]--
+local DEBUG_CFG = {
+    enable = true, -- Enable chip wide debug visualization
+    renderDistance = 1500 -- Max distance to render debug lines
+}
+
+-- =========================================================
+--  SERVER (Timer-based networking to prevent netburst)
+-- =========================================================
+if SERVER then
+    wire.adjustPorts({
+        Active = {type = "normal", description = "Activates the camera system. 0 = Off, 1 = 3rd Person, 2 = 1st Person."},
+        Base = {type = "entity", description = "The main entity to follow."},
+        Seat = {type = "entity", description = "The seat entity for 1st person camera. Defaults to Base if unlinked."},
+        Pod  = {type = "wirelink", description = "The pod controller to check for a driver."},
+        Throttle = {type = "normal", description = "Raw throttle value from your controller."},
+        Brake    = {type = "normal", description = "Raw brake value from your controller."},
+        Gear     = {type = "normal", description = "Current gear number. Any change triggers the kick."},
+        TrailerMode = {type = "normal", description = "Activates alternate camera settings for trailers."}
+    }, nil)
+
+    local wasActive = false
+    local lastDriver = nil
+    local lastSentData = {}
+    local needsUpdate = {}
+    local lastSendTime = {}
+
+    -- Think hook now only watches state and sets flags
+    hook.add("Think", "SFGlideCam_StateWatcher", function()
+        local activeVal = math.floor(wire.ports.Active or 0)
+        local active = activeVal >= 1
+        local pod = wire.ports.Pod
+        local driver = (pod and pod:isValid()) and pod.Driver or nil
+        
+        local driverChanged = driver ~= lastDriver
+        
+        if driverChanged then
+            if lastDriver and lastDriver:isValid() then
+                if not needsUpdate[lastDriver] then needsUpdate[lastDriver] = {} end
+                needsUpdate[lastDriver].stop = true
+                lastSentData[lastDriver] = nil
+            end
+            if driver and driver:isValid() then
+                if not needsUpdate[driver] then needsUpdate[driver] = {} end
+                if active then
+                    needsUpdate[driver].start = true
+                    needsUpdate[driver].base = wire.ports.Base
+                    needsUpdate[driver].seat = wire.ports.Seat
+                    lastSentData[driver] = nil
+                else
+                    needsUpdate[driver].stop = true
+                end
+            end
+            lastDriver = driver
+        end
+        
+        if active ~= wasActive then
+            wasActive = active
+            if driver and driver:isValid() then
+                if not needsUpdate[driver] then needsUpdate[driver] = {} end
+                if active then
+                    -- Flag the driver to be started
+                    needsUpdate[driver].start = true
+                    needsUpdate[driver].base = wire.ports.Base
+                    needsUpdate[driver].seat = wire.ports.Seat
+                else
+                    -- Flag the driver to be stopped
+                    needsUpdate[driver].stop = true
+                end
+                lastSentData[driver] = nil -- Force an initial update
+            end
+        end
+
+        if not active or not (driver and driver:isValid()) then return end
+
+        local currentData = {
+            throttle = math.clamp((wire.ports.Throttle or 0) / CFG.maxThrottleInput, 0, 1),
+            brake = math.clamp((wire.ports.Brake or 0) / CFG.maxBrakeInput, 0, 1),
+            gear = wire.ports.Gear or 0,
+            trailerActive = (wire.ports.TrailerMode or 0) > 0,
+            camMode = activeVal
+        }
+
+        local lastData = lastSentData[driver]
+
+        if not lastData or 
+           math.floor(currentData.throttle * 100) ~= math.floor(lastData.throttle * 100) or 
+           math.floor(currentData.brake * 100) ~= math.floor(lastData.brake * 100) or 
+           currentData.gear ~= lastData.gear or
+           currentData.trailerActive ~= lastData.trailerActive or
+           currentData.camMode ~= lastData.camMode then
+            
+            if not needsUpdate[driver] then needsUpdate[driver] = {} end
+            needsUpdate[driver].data = currentData
+        end
+    end)
+
+    -- This timer sends all updates at a controlled rate (20Hz)
+    timer.create("SFGlideCam_NetworkSender", 0.05, 0, function()
+        -- stream guard to prevent net burst abuse
+        if net.canWriteStream and not net.canWriteStream() then return end
+        local globalMsgSizeGuard = (net.getBytesLeft and net.getBytesLeft()) or math.huge
+        if globalMsgSizeGuard < 256 then return end
+
+        for driver, update in pairs(needsUpdate) do
+            if driver and driver:isValid() then
+                local now = timer.systime()
+                local minInterval = 0.05
+                if lastSendTime[driver] and (now - lastSendTime[driver]) < minInterval then
+                    -- Skip this driver this tick to avoid burst
+                else
+                    if update.start then
+                        net.start("SFGlideCam_Start")
+                        net.writeEntity(update.base)
+                        net.writeEntity(update.seat)
+                        net.send(driver)
+                    elseif update.stop then
+                        net.start("SFGlideCam_Stop")
+                        net.send(driver)
+                    end
+
+                    if update.data then
+                        net.start("SFGlideCam_FullUpdate")
+                        net.writeTable(update.data)
+                        net.send(driver)
+                        lastSentData[driver] = update.data
+                    end
+
+                    lastSendTime[driver] = now
+                end
+            end
+        end
+        needsUpdate = {} -- Clear the update queue
+    end)
+
+    hook.add("Remove", "SFGlideCam_Cleanup", function()
+        for driver, _ in pairs(lastSentData) do
+            if driver and driver:isValid() then
+                net.start("SFGlideCam_Stop")
+                net.send(driver)
+            end
+        end
+    end)
+
+    net.receive("SFGlideCam_ReqBase", function(len, ply)
+        local base = wire.ports.Base
+        if not (base and base:isValid()) then return end
+        
+        local seat = wire.ports.Seat
+        
+        net.start("SFGlideCam_SndBase")
+        net.writeEntity(base)
+        
+        if seat and seat:isValid() then
+            net.writeBool(true)
+            net.writeEntity(seat)
+        else
+            net.writeBool(false)
+        end
+        net.send(ply)
+    end)
+
+    return
+end
+
+-- =========================================================
+--  CLIENT
+-- =========================================================
+if CLIENT then
+    local originalCFG = {
+        maxDist = CFG.maxDist,
+        minDist = CFG.minDist,
+        heightOffset = CFG.heightOffset,
+        pitchOffset = CFG.pitchOffset
+    }
+
+    local state = {
+        active = false,
+        camMode = 0,
+        currentAng = Angle(0,0,0),
+        targetAng = Angle(0,0,0),
+        lastMouseTime = 0,
+        wasLocked = true,
+        targetDist = (CFG.minDist + CFG.maxDist) / 2,
+        currentDist = (CFG.minDist + CFG.maxDist) / 2,
+        distVel = 0,
+        holo = nil,
+        base = nil,
+        seat = nil,
+        inputs = { throttle = 0, brake = 0, gear = 0 },
+        -- FPV specific state
+        fpvGearKick = 0,
+        currentFOV = FPV_CFG.baseFOV
+    }
+
+    net.receive("SFGlideCam_Start", function()
+        local newBase = net.readEntity()
+        local newSeat = net.readEntity()
+        if not (newBase and newBase:isValid()) then return end
+        
+        state.active = true
+        state.base = newBase
+        state.seat = newSeat
+
+        if state.holo and state.holo:isValid() then state.holo:remove() end
+        
+        state.holo = hologram.create(newBase:getPos(), newBase:getAngles(), "models/sprops/cuboids/height06/size_1/cube_6x6x6.mdl")
+        if state.holo and state.holo:isValid() then
+            state.holo:setParent(newBase)
+            state.holo:setNoDraw(true)
+            state.currentAng = newBase:getAngles()
+            state.targetAng = newBase:getAngles()
+        end
+    end)
+
+    net.receive("SFGlideCam_FullUpdate", function()
+        if not state.active then return end
+        
+        local data = net.readTable()
+        
+        state.inputs.throttle = data.throttle
+        state.inputs.brake = data.brake
+        state.camMode = data.camMode
+        
+        if data.gear ~= state.inputs.gear then
+            local impulse = 0
+            if data.gear > state.inputs.gear then impulse = CFG.gearKick else impulse = -CFG.gearKick end
+            state.distVel = state.distVel + impulse
+            
+            -- Trigger FPV gear kick displacement
+            if FPV_CFG.enableGearKick then
+                state.fpvGearKick = state.fpvGearKick + (data.gear > state.inputs.gear and FPV_CFG.gearKickAmount or -FPV_CFG.gearKickAmount * 0.5)
+            end
+            
+            state.inputs.gear = data.gear
+        end
+        
+        if data.trailerActive then
+            CFG.maxDist, CFG.minDist, CFG.heightOffset, CFG.pitchOffset = TRAILER_CFG.maxDist, TRAILER_CFG.minDist, TRAILER_CFG.heightOffset, TRAILER_CFG.pitchOffset
+        else
+            CFG.maxDist, CFG.minDist, CFG.heightOffset, CFG.pitchOffset = originalCFG.maxDist, originalCFG.minDist, originalCFG.heightOffset, originalCFG.pitchOffset
+        end
+        
+        state.targetDist = (CFG.minDist + CFG.maxDist) / 2
+    end)
+
+    net.receive("SFGlideCam_Stop", function()
+        state.active = false
+        state.camMode = 0
+        if state.holo and state.holo:isValid() then
+            state.holo:remove()
+            state.holo = nil
+        end
+        state.inputs = { throttle = 0, brake = 0, gear = 0 }
+        
+        CFG.maxDist, CFG.minDist, CFG.heightOffset, CFG.pitchOffset = originalCFG.maxDist, originalCFG.minDist, originalCFG.heightOffset, originalCFG.pitchOffset
+    end)
+
+    hook.add("MouseMoved", "SFGlideCam_ClientMouse", function(x, y)
+        if not state.active or not (state.holo and state.holo:isValid()) then return end
+        
+        local sens = state.camMode == 2 and FPV_CFG.mouseSens or CFG.mouseSens
+        local thresh = state.camMode == 2 and FPV_CFG.mouseThreshold or CFG.mouseThreshold
+        local inv = state.camMode == 2 and FPV_CFG.invertPitch or CFG.invertPitch
+        
+        if math.abs(x) < thresh and math.abs(y) < thresh then return end
+
+        state.lastMouseTime = timer.curtime()
+        if state.wasLocked then state.targetAng = state.currentAng end
+
+        local lookX = x * sens
+        local lookY = y * sens * (inv and -1 or 1)
+        
+        state.targetAng.p = math.clamp(state.targetAng.p + lookY, -89, 89)
+        state.targetAng.y = state.targetAng.y - lookX
+    end)
+
+    hook.add("CalcView", "SFGlideCam_ClientView", function(view)
+        if not state.active or not (state.holo and state.holo:isValid() and state.base and state.base:isValid()) then return end
+
+        local dt = timer.frametime()
+        local holoPos = state.holo:getPos()
+        local holoAng = state.holo:getAngles()
+        local baseVel = state.base:getVelocity()
+
+        if state.camMode == 2 then
+            -- ==========================
+            --  FIRST PERSON MODE
+            -- ==========================
+            local isLocked = (timer.curtime() - state.lastMouseTime > FPV_CFG.idleTimeout)
+            state.wasLocked = isLocked
+
+            local dt = timer.frametime()
+            local curTime = timer.curtime()
+            
+            local fpvEnt = (state.seat and state.seat:isValid()) and state.seat or state.base
+            local entPos = fpvEnt:getPos()
+            
+            -- Axis Mapping (Native C++ matrix perfectly tracking Euler alignment)
+            local offsetAng = FPV_CFG.ForwardAxis:getAngle()
+            local rawTrueSeatAng = fpvEnt:localToWorldAngles(offsetAng)
+            
+            -- Filter out violent road bumps from the seat AFTER applying the base mapping
+            local lerpSeat = math.clamp(FPV_CFG.seatBumpSmoothing * dt, 0, 1)
+            state.smoothSeatAng = state.smoothSeatAng and math.lerpAngle(lerpSeat, state.smoothSeatAng, rawTrueSeatAng) or rawTrueSeatAng
+            
+            local trueSeatAng = state.smoothSeatAng
+            
+            local baseFwd = trueSeatAng:getForward()
+            local baseRight = trueSeatAng:getRight()
+            local baseUp = trueSeatAng:getUp()
+            
+            -- Extract rigid (un-smoothed) camera axes to correctly orient the manual offset
+            local rigidFwd = rawTrueSeatAng:getForward()
+            local rigidRight = rawTrueSeatAng:getRight()
+            local rigidUp = rawTrueSeatAng:getUp()
+            
+            -- Raw baseline seat position calculation WITHOUT any positional smoothing lag
+            -- Projects the XYZ offsets directly relative to the customized camera look angle
+            local viewOrigin = entPos + rigidFwd * FPV_CFG.offset.x + rigidRight * FPV_CFG.offset.y + rigidUp * FPV_CFG.offset.z
+            
+            -- Track Low-Pass Filter (Horizon mapping)
+            state.trackAng = state.trackAng and math.lerpAngle(math.clamp(1.5 * dt, 0, 1), state.trackAng, trueSeatAng) or trueSeatAng
+            
+            local speed = baseVel:getLength()
+            local mph = speed * 0.0568 -- Approximate MPH
+            local finalCamAng
+            local headX, headY, headZ = 0, 0, 0
+
+            if isLocked then
+                -- 1. Base Perspective (Horizon Lock + Calibration)
+                local idealPitch = math.lerp(FPV_CFG.horizonLockPitch, trueSeatAng.p, state.trackAng.p)
+                local idealRoll = math.lerp(FPV_CFG.horizonLockRoll, trueSeatAng.r, 0)
+                local idealYaw = trueSeatAng.y
+                
+                -- High-Speed Head Shake
+                if FPV_CFG.enableShake and mph > FPV_CFG.shakeSpeedThreshold then
+                    local shakeVal = math.clamp((mph - FPV_CFG.shakeSpeedThreshold) / 40, 0, 1) * FPV_CFG.shakeAmount
+                    idealPitch = idealPitch + (math.sin(curTime * 50) * shakeVal)
+                    idealRoll = idealRoll + (math.cos(curTime * 45) * shakeVal)
+                end
+                
+                if mph >= FPV_CFG.minSpeedThreshold then
+                    -- Buffered History Array to stabilize client-side network derivatives
+                    state.angHistory = state.angHistory or {}
+                    state.velHistory = state.velHistory or {}
+                    table.insert(state.angHistory, {a = trueSeatAng, t = curTime})
+                    table.insert(state.velHistory, {v = baseVel, t = curTime})
+                    
+                    while #state.angHistory > 0 and (curTime - state.angHistory[1].t) > 0.1 do table.remove(state.angHistory, 1) end
+                    while #state.velHistory > 0 and (curTime - state.velHistory[1].t) > 0.1 do table.remove(state.velHistory, 1) end
+                    
+                    local rawYawRate = 0
+                    local rawAccel = Vector(0,0,0)
+                    
+                    if #state.angHistory > 1 and #state.velHistory > 1 then
+                        local oldestAng, newestAng = state.angHistory[1], state.angHistory[#state.angHistory]
+                        local tDiffA = newestAng.t - oldestAng.t
+                        if tDiffA > 0.01 then rawYawRate = math.normalizeAngle(newestAng.a.y - oldestAng.a.y) / tDiffA end
+                        
+                        local oldestVel, newestVel = state.velHistory[1], state.velHistory[#state.velHistory]
+                        local tDiffV = newestVel.t - oldestVel.t
+                        if tDiffV > 0.01 then rawAccel = (newestVel.v - oldestVel.v) / tDiffV end
+                    end
+                    
+                    -- 2. Apex Look (Yaw Rate Tracking)
+                    local isRecoveringApex = math.abs(state.smoothYawRate or 0) > math.abs(rawYawRate) + 0.5
+                    local targetDampApex = isRecoveringApex and math.clamp(FPV_CFG.returnSpeed.apex * dt, 0, 1) or math.clamp(FPV_CFG.physicsDamping * dt, 0, 1)
+                    state.curDampApex = math.lerp(math.clamp(8 * dt, 0, 1), state.curDampApex or targetDampApex, targetDampApex)
+                    state.smoothYawRate = math.lerp(state.curDampApex, state.smoothYawRate or 0, rawYawRate)
+                    
+                    local yawOffset = 0
+                    if FPV_CFG.apexLookYaw then
+                        yawOffset = math.clamp(state.smoothYawRate * FPV_CFG.apexYawFactor, -FPV_CFG.apexMaxYaw, FPV_CFG.apexMaxYaw)
+                    end
+                    
+                    idealYaw = idealYaw + yawOffset
+                    
+                    -- 3. G-Force Angles & Asymmetrical Position Shifts
+                    if FPV_CFG.enableGForces then
+                        local fAccel = math.clamp(rawAccel:dot(baseFwd), -1500, 1500)
+                        local rAccel = math.clamp(rawAccel:dot(baseRight), -1500, 1500)
+                        local uAccel = math.clamp(rawAccel:dot(baseUp), -1500, 1500)
+                        
+                        -- Physics Damping with Fluid-Recovery smoothing
+                        local dampGlobal = math.clamp(FPV_CFG.physicsDamping * dt, 0, 1)
+                        local dampTransition = math.clamp(10 * dt, 0, 1)
+                        
+                        -- Forward/Back recovery
+                        local isRecoveringF = math.abs(state.smoothFA or 0) > math.abs(fAccel) + 1.5
+                        local fRecov = ((state.smoothFA or 0) < 0) and FPV_CFG.returnSpeed.forward or FPV_CFG.returnSpeed.backward
+                        local targetDampF = isRecoveringF and math.clamp(fRecov * dt, 0, 1) or dampGlobal
+                        state.curDampF = math.lerp(dampTransition, state.curDampF or targetDampF, targetDampF)
+                        state.smoothFA = math.lerp(state.curDampF, state.smoothFA or 0, fAccel)
+                        
+                        -- Left/Right recovery
+                        local isRecoveringR = math.abs(state.smoothRA or 0) > math.abs(rAccel) + 1.5
+                        local rRecov = ((state.smoothRA or 0) > 0) and FPV_CFG.returnSpeed.right or FPV_CFG.returnSpeed.left
+                        local targetDampR = isRecoveringR and math.clamp(rRecov * dt, 0, 1) or dampGlobal
+                        state.curDampR = math.lerp(dampTransition, state.curDampR or targetDampR, targetDampR)
+                        state.smoothRA = math.lerp(state.curDampR, state.smoothRA or 0, rAccel)
+                        
+                        -- Up/Down recovery
+                        local isRecoveringU = math.abs(state.smoothUA or 0) > math.abs(uAccel) + 1.5
+                        local uRecov = ((state.smoothUA or 0) > 0) and FPV_CFG.returnSpeed.down or FPV_CFG.returnSpeed.up
+                        local targetDampU = isRecoveringU and math.clamp(uRecov * dt, 0, 1) or dampGlobal
+                        state.curDampU = math.lerp(dampTransition, state.curDampU or targetDampU, targetDampU)
+                        state.smoothUA = math.lerp(state.curDampU, state.smoothUA or 0, uAccel)
+                        
+                        -- Leaning Physics
+                        local targetGPitch = -(state.smoothFA or 0) * FPV_CFG.gForcePitch
+                        local targetGRoll = -(state.smoothRA or 0) * FPV_CFG.gForceRoll
+                        if not FPV_CFG.rollIntoCorner then targetGRoll = targetGRoll end
+                        
+                        state.smoothGPitch = math.lerp(state.curDampF, state.smoothGPitch or 0, targetGPitch)
+                        state.smoothGRoll = math.lerp(state.curDampR, state.smoothGRoll or 0, targetGRoll)
+                        
+                        idealPitch = idealPitch + state.smoothGPitch
+                        idealRoll = idealRoll + state.smoothGRoll
+                        
+                        -- Shifting body using asymmetrical limits
+                        local fMag = -(state.smoothFA or 0)
+                        local curXScale = (fMag > 0) and FPV_CFG.gForcePosScale.forward or FPV_CFG.gForcePosScale.backward
+                        local curXMax = (fMag > 0) and FPV_CFG.gForcePosMax.forward or FPV_CFG.gForcePosMax.backward
+                        headX = math.clamp(fMag * curXScale, -curXMax, curXMax)
+                        
+                        local rMag = -(state.smoothRA or 0)
+                        local curYScale = (rMag > 0) and FPV_CFG.gForcePosScale.right or FPV_CFG.gForcePosScale.left
+                        local curYMax = (rMag > 0) and FPV_CFG.gForcePosMax.right or FPV_CFG.gForcePosMax.left
+                        headY = math.clamp(rMag * curYScale, -curYMax, curYMax)
+                        
+                        local uMag = -(state.smoothUA or 0)
+                        local curZScale = (uMag > 0) and FPV_CFG.gForcePosScale.down or FPV_CFG.gForcePosScale.up
+                        local curZMax = (uMag > 0) and FPV_CFG.gForcePosMax.down or FPV_CFG.gForcePosMax.up
+                        headZ = math.clamp(uMag * curZScale, -curZMax, curZMax)
+                    end
+                else
+                    state.angHistory = {}
+                    state.velHistory = {}
+                end
+                
+                -- Gear Shift Physicality (Decay)
+                if FPV_CFG.enableGearKick then
+                    state.fpvGearKick = math.lerp(math.clamp(5 * dt, 0, 1), state.fpvGearKick, 0)
+                    headX = headX + state.fpvGearKick
+                end
+                
+                -- Final Angle Assembly
+                local idealAng = Angle(idealPitch + FPV_CFG.pitchOffset, idealYaw, idealRoll)
+                local lerpFactor = math.clamp(FPV_CFG.headSpringSpeed * dt, 0, 1)
+                state.currentAng = math.lerpAngle(lerpFactor, state.currentAng or trueSeatAng, idealAng)
+                finalCamAng = state.currentAng
+                
+            else
+                -- Free-look rotation tracker
+                local seatYawDelta = math.normalizeAngle(trueSeatAng.y - (state.lastFrameSeatYaw or trueSeatAng.y))
+                state.targetAng.y = state.targetAng.y + seatYawDelta
+                
+                -- Gradually level the roll to the horizon when freelooking
+                local idealRoll = math.lerp(FPV_CFG.horizonLockRoll, trueSeatAng.r, 0)
+                state.targetAng.r = math.lerp(math.clamp(5 * dt, 0, 1), state.targetAng.r, idealRoll)
+                
+                finalCamAng = Angle(state.targetAng.p + FPV_CFG.pitchOffset, state.targetAng.y, state.targetAng.r)
+                state.currentAng = finalCamAng
+            end
+            
+            state.lastFrameSeatYaw = trueSeatAng.y
+            
+            -- Dynamic FOV
+            local targetFOV = FPV_CFG.baseFOV
+            if FPV_CFG.enableFOV and mph > FPV_CFG.fovSpeedThreshold then
+                local speedDiff = mph - FPV_CFG.fovSpeedThreshold
+                targetFOV = math.min(FPV_CFG.baseFOV + (speedDiff * FPV_CFG.fovScale), FPV_CFG.maxFOV)
+            end
+            state.currentFOV = math.lerp(math.clamp(FPV_CFG.fovSmoothing * dt, 0, 1), state.currentFOV or FPV_CFG.baseFOV, targetFOV)
+            view.fov = state.currentFOV
+            
+            state.lastFrameSeatYaw = trueSeatAng.y
+            
+            -- Apply head shifting vector at the very end
+            viewOrigin = viewOrigin + baseFwd * headX + baseRight * headY + baseUp * headZ
+            
+            state.debugData = {
+                origin = viewOrigin,
+                fwd = baseFwd,
+                right = baseRight,
+                up = baseUp,
+                velDir = baseVel:getNormalized(),
+                lookDir = finalCamAng:getForward(),
+                speed = speed,
+                driftDot = baseFwd:dot(baseVel:getNormalized())
+            }
+
+            view.origin = viewOrigin
+            view.angles = finalCamAng
+            
+            return view
+        end
+
+        -- ==========================
+        --  3RD PERSON MODE
+        -- ==========================
+        local isLocked = (timer.curtime() - state.lastMouseTime > CFG.idleTimeout)
+        state.wasLocked = isLocked
+
+        local target = holoPos + Vector(0, 0, CFG.heightOffset)
+        
+        local finalCamAng
+        if isLocked then
+            local fwd = CFG.ForwardAxis:getNormalized()
+            fwd:rotate(holoAng)
+            local lookTarget = target
+            if CFG.lookAhead and baseVel:getLengthSqr() > 2500 then
+                lookTarget = target + baseVel:getNormalized() * CFG.lookAheadDist
+            end
+            local idealAng = (lookTarget - (target - fwd)):getAngle()
+            idealAng.p = idealAng.p + CFG.pitchOffset
+            
+            local lerpFactor = math.clamp(CFG.angleResponsiveness * dt, 0, 1)
+            state.currentAng = math.lerpAngle(lerpFactor, state.currentAng, idealAng)
+            finalCamAng = state.currentAng
+        else
+            finalCamAng = state.targetAng
+            state.currentAng = finalCamAng
+        end
+
+        local impulse = 0
+        if baseVel:getLengthSqr() > 100 then
+            impulse = impulse + (state.inputs.throttle * CFG.accelLag)
+            impulse = impulse - (state.inputs.brake * CFG.brakeKick)
+        end
+
+        local springForce = (state.targetDist - state.currentDist) * CFG.centerForce
+        local dampingForce = -state.distVel * CFG.posDamping
+        local boundaryImpulse = 0
+        if state.currentDist > CFG.maxDist then
+            boundaryImpulse = (CFG.maxDist - state.currentDist) * CFG.boundaryForce
+        elseif state.currentDist < CFG.minDist then
+            boundaryImpulse = (CFG.minDist - state.currentDist) * CFG.boundaryForce
+        end
+        state.distVel = state.distVel + (springForce + dampingForce + boundaryImpulse) * dt + impulse
+        state.currentDist = state.currentDist + state.distVel * dt
+        
+        local desiredOrigin = target - (finalCamAng:getForward() * state.currentDist)
+        
+        if CFG.doCollision then
+            local tr = trace.line(target, desiredOrigin, player(), CFG.colMask)
+            if tr.Hit then
+                view.origin = tr.HitPos + tr.HitNormal * CFG.colExtra
+                state.distVel = 0
+                state.currentDist = (tr.HitPos - target):getLength()
+            else
+                view.origin = desiredOrigin
+            end
+        else
+            view.origin = desiredOrigin
+        end
+        
+        view.angles = finalCamAng
+        
+        state.debugData = {
+            origin = view.origin,
+            speed = baseVel:getLength()
+        }
+        
+        return view
+    end)
+
+-- =========================================================
+--  VISUAL DEBUG
+-- =========================================================
+    if player() == owner() and DEBUG_CFG.enable then
+        enableHud(owner(), true)
+        local font = render.createFont("Trebuchet24", 24, nil, false, nil, nil, true)
+        
+        local debugBase = nil
+        local debugSeat = nil
+        timer.create("SFGlideCam_ReqBase", 0.5, 0, function()
+            net.start("SFGlideCam_ReqBase")
+            net.send()
+        end)
+        net.receive("SFGlideCam_SndBase", function()
+            debugBase = net.readEntity()
+            if net.readBool() then
+                debugSeat = net.readEntity()
+            else
+                debugSeat = nil
+            end
+            
+            if debugBase and debugBase:isValid() then
+                timer.stop("SFGlideCam_ReqBase")
+            end
+        end)
+    
+        hook.add("drawHud", "SFGlideCam_GlobalDebug", function()
+            local base = debugBase
+            if not (base and base:isValid()) then return end
+            
+            local basePos = base:getPos()
+            local distSqr = owner():getPos():getDistanceSqr(basePos)
+        
+        local alpha = math.max(300 - distSqr / (DEBUG_CFG.renderDistance * 10), 0)
+        
+        if alpha > 0 then
+            -- Draw Base Entity Axes
+            local fwdAxis = CFG.ForwardAxis:getNormalized()
+            local rightAxis = Vector(fwdAxis.y, -fwdAxis.x, 0)
+            local upAxis = Vector(0, 0, 1)
+            
+            local right = base:localToWorld(Vector(0,0,0) - rightAxis * 50)
+            local up    = base:localToWorld(Vector(0,0,0) + upAxis * 50)
+            local fwd   = base:localToWorld(Vector(0,0,0) + fwdAxis * 50)
+            
+            local fpvEnt = (debugSeat and debugSeat:isValid()) and debugSeat or base
+            local entPos = fpvEnt:getPos()
+            local entAng = fpvEnt:getAngles()
+            
+            -- Head Baseline Angle (Seat + Calibration)
+            local headBaseFwd = FPV_CFG.ForwardAxis:getNormalized()
+            headBaseFwd:rotate(entAng)
+            
+            local headAng = headBaseFwd:getAngle()
+            headAng.p = headAng.p + FPV_CFG.pitchOffset
+            
+            local fpvFwd = headAng:getForward()
+            local fpvRight = fpvFwd:cross(entAng:getUp()):getNormalized()
+            local fpvUp = fpvRight:cross(fpvFwd):getNormalized()
+            
+            local viewOrigin = entPos + fpvFwd * FPV_CFG.offset.x + fpvRight * FPV_CFG.offset.y + fpvUp * FPV_CFG.offset.z
+            
+            render.pushViewMatrix({ type = "3D" })
+            
+            -- Blue = Forward
+            render.setColor(Color(0, 0, 255))
+            render.draw3DLine(basePos, fwd)
+            
+            -- Red = Right
+            render.setColor(Color(255, 0, 0))
+            render.draw3DLine(basePos, right)
+            
+            -- Green = Up
+            render.setColor(Color(0, 255, 0))
+            render.draw3DLine(basePos, up)
+            
+            -- FPV Origin (Yellow Cross)
+            render.setColor(Color(255, 255, 0))
+            render.draw3DLine(viewOrigin - fpvRight * 4, viewOrigin + fpvRight * 4)
+            render.draw3DLine(viewOrigin - fpvUp * 4, viewOrigin + fpvUp * 4)
+            
+            -- FPV Look Direction (Magenta)
+            render.setColor(Color(255, 0, 255))
+            render.draw3DLine(viewOrigin, viewOrigin + fpvFwd * 50)
+            
+            render.popViewMatrix()
+            
+            render.setFont(font)
+            local rightScr = right:toScreen()
+            local upScr    = up:toScreen()
+            local fwdScr   = fwd:toScreen()
+            local baseScr  = basePos:toScreen()
+            local fpvScr   = viewOrigin:toScreen()
+            
+            render.setColor(Color(0, 0, 255, alpha))
+            render.drawSimpleText(fwdScr.x, fwdScr.y, "F", 1, 1)
+            
+            render.setColor(Color(255, 0, 0, alpha))
+            render.drawSimpleText(rightScr.x, rightScr.y, "R", 1, 1)
+            
+            render.setColor(Color(0, 255, 0, alpha))
+            render.drawSimpleText(upScr.x, upScr.y, "U", 1, 1)
+            
+            -- Entity Names
+            render.setColor(Color(255, 255, 0, alpha))
+            render.drawSimpleText(baseScr.x, baseScr.y - 30, "Base Entity", 1, 1)
+            render.drawSimpleText(fpvScr.x, fpvScr.y - 30, "1st Person Cam", 1, 1)
+            
+            -- Output Camera Stats
+            render.setColor(Color(255, 255, 255, alpha))
+            local w, h = render.getResolution()
+            local textY = h - 150
+            render.drawSimpleText(10, textY, "--- SETUP DEBUG ---", 0, 0)
+            textY = textY + 20
+            render.drawSimpleText(10, textY, "Mode: " .. (state.camMode == 2 and "1st Person" or (state.camMode == 1 and "3rd Person" or "Off")), 0, 0)
+            textY = textY + 20
+            
+            local speed = base:getVelocity():getLength()
+            render.drawSimpleText(10, textY, "Speed: " .. math.round(speed), 0, 0)
+
+        end
+    end)
+    end
+end
