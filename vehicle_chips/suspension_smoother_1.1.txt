@@ -15,7 +15,7 @@ local base = wire.ports.Base
 
 
         local smoothingPitch = 5  -- Adjust the smoothing factor as needed
-        local smoothingRoll =18  -- Adjust the smoothing factor as needed
+        local smoothingRoll =10  -- Adjust the smoothing factor as needed
         local smoothingYaw = 0 -- Adjust the smoothing factor as needed
         
         local forceMultiplier = 100
@@ -23,7 +23,7 @@ local base = wire.ports.Base
         local MaxTurnInput = 45
         
         local UpdateRate = 45 -- Update rate in Hz (Lower = less CPU, but might be less smooth)
-        local FilterRefreshRate = 2.0 -- How often the Dynamic Filter array and Player list updates (Seconds)
+        local FilterRefreshRate = 10.0 -- How often the Dynamic Filter array and Player list updates (Seconds)
         local AllowPrintFilter = true -- Print to console when the Dynamic filter adds or removes entities
         
         local Alpha = 255
