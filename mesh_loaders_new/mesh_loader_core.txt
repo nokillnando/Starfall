@@ -2,7 +2,7 @@
 --@author [C17] Red Fox
 --@shared
 
-local Version = "2.13"
+local Version = "2.14"
 
 --Offset fix??
 
@@ -295,6 +295,7 @@ if CLIENT then
         
         return restingWorldAng
     end
+    local refreshFixAnglesRefs
     
     local function registerFixAnglesHolo(holo)
         local cfg = holo.MeshConfig
@@ -313,9 +314,12 @@ if CLIENT then
             invertAxis = cfg.FixAngles.invert,
         }
         table.insert(fixAnglesHolos, entry)
+        
+        -- Resolve references immediately in case networking arrived before the mesh finished downloading
+        refreshFixAnglesRefs()
     end
     
-    local function refreshFixAnglesRefs()
+    refreshFixAnglesRefs = function()
         for i = #fixAnglesHolos, 1, -1 do
             local e = fixAnglesHolos[i]
             if not isValid(e.holo) then
