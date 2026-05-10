@@ -508,7 +508,9 @@ else -- SERVER
 
             local massChanged = math.abs(TotalRealMass - lastReportedMass) > 0.1
             if massChanged then
-                print(Config.W, "[TireSim] Total Physical Mass detected: ", Config.G, formatMass(TotalRealMass) .. "kg", Config.W, " (Config Virtual: ", Config.G, formatMass(Config.TotalVehicleMass) .. "kg", Config.W, ")")
+                if Config.AllowPrintMassRefresh then
+                    print(Config.W, "[TireSim] Total Physical Mass detected: ", Config.G, formatMass(TotalRealMass) .. "kg", Config.W, " (Config Virtual: ", Config.G, formatMass(Config.TotalVehicleMass) .. "kg", Config.W, ")")
+                end
                 lastReportedMass = TotalRealMass
             end
 

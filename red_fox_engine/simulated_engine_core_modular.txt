@@ -3769,18 +3769,64 @@ if CLIENT then
             render.drawSimpleText(leftX, yPos, "Core: " .. Version, 0, 1)
             
             -- Status indicator for core
-            local statusMatch = Version == (config.ConfigVersion or "")
-            local statusText = statusMatch and "(up-to-date)" or "(outdated)"
-            local statusColor = statusMatch and Color(100, 255, 150) or Color(255, 150, 100)
-            render.setColor(statusColor)
-            render.drawSimpleText(leftX + 120, yPos, statusText, 0, 1)
+            -- Fetch remote versions once
+            if _G.FoxEngineCoreChecked == nil then
+                if http.canRequest() then
+                    _G.FoxEngineCoreChecked = true
+                    _G.FoxEngineCoreUpToDate = true
+                    _G.FoxEngineConfigUpToDate = true
+                    
+                    local function parseVersions(localVer, remoteVer)
+                        local rP = string.explode(".", remoteVer)
+                        local lP = string.explode(".", localVer)
+                        local rM = tonumber(rP[1]) or 0
+                        local rm = tonumber(rP[2]) or 0
+                        local lM = tonumber(lP[1]) or 0
+                        local lm = tonumber(lP[2]) or 0
+                        return (rM > lM) or (rM == lM and rm > lm)
+                    end
+                    
+                    http.get("https://raw.github.com/nokillnando/Starfall/main/red_fox_engine/simulated_engine_core_modular.txt", function(data)
+                        if data and data ~= "" then
+                            local startIdx = data:find('local Version = "')
+                            if startIdx then
+                                local endIdx = data:find('"', startIdx + 17)
+                                if endIdx then
+                                    if parseVersions(Version, data:sub(startIdx + 17, endIdx - 1)) then _G.FoxEngineCoreUpToDate = false end
+                                end
+                            end
+                        end
+                    end)
+                    http.get("https://raw.github.com/nokillnando/Starfall/main/red_fox_engine/red_fox_engine_config_modular.txt", function(data)
+                        if data and data ~= "" then
+                            local startIdx = data:find('ConfigVersion = "')
+                            if startIdx then
+                                local endIdx = data:find('"', startIdx + 17)
+                                if endIdx then
+                                    if parseVersions(config.ConfigVersion or "", data:sub(startIdx + 17, endIdx - 1)) then _G.FoxEngineConfigUpToDate = false end
+                                end
+                            end
+                        end
+                    end)
+                end
+            end
+            
+            local cUpToDate = _G.FoxEngineCoreUpToDate ~= false
+            local cfgUpToDate = _G.FoxEngineConfigUpToDate ~= false
+            
+            local coreStatusText = cUpToDate and "(up-to-date)" or "(outdated)"
+            local coreStatusColor = cUpToDate and Color(100, 255, 150) or Color(255, 150, 100)
+            render.setColor(coreStatusColor)
+            render.drawSimpleText(leftX + 120, yPos, coreStatusText, 0, 1)
             
             -- Config version and status on next line
             yPos = yPos + lineHeight - 5
             render.setColor(Color(180, 180, 180))
             render.drawSimpleText(leftX, yPos, "Config: " .. (config.ConfigVersion or "N/A"), 0, 1)
-            render.setColor(statusColor)
-            render.drawSimpleText(leftX + 120, yPos, statusText, 0, 1)
+            local cfgStatusText = cfgUpToDate and "(up-to-date)" or "(outdated)"
+            local cfgStatusColor = cfgUpToDate and Color(100, 255, 150) or Color(255, 150, 100)
+            render.setColor(cfgStatusColor)
+            render.drawSimpleText(leftX + 120, yPos, cfgStatusText, 0, 1)
 
             -- Reset RT selection
             render.selectRenderTarget(nil)
