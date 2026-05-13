@@ -3,7 +3,7 @@
 
 local Core = {}
 _G.RedFoxEngineCore = Core
-local Version = "3.04" -- v3 Alpha
+local Version = "3.05" -- v3 Alpha
 
 --[[
 Changelog:
@@ -238,23 +238,26 @@ if SERVER then
 
         local function calculateVehicleMass(chassis)
             if not isValid(chassis) then return nil end
+            
             local mass = 0
             local seen = {}
-            local function scan(ent)
-                if not (ent and ent:isValid()) or seen[ent] then return end
-                seen[ent] = true
-                local phys = getPhys(ent)
-                if isValid(phys) then
-                    mass = mass + phys:getMass()
-                end
-                local constrained = ent:getAllConstrained()
-                if constrained then
-                    for _, sub in ipairs(constrained) do
-                        scan(sub)
+            local allConstrained = chassis:getAllConstrained()
+            
+            -- Ensure we count the chassis itself
+            local ents = allConstrained or {}
+            table.insert(ents, chassis)
+            
+            for i = 1, #ents do
+                local ent = ents[i]
+                if isValid(ent) and not seen[ent] then
+                    seen[ent] = true
+                    local phys = getPhys(ent)
+                    if isValid(phys) then
+                        mass = mass + phys:getMass()
                     end
                 end
             end
-            scan(chassis)
+            
             return mass
         end
 
@@ -2049,7 +2052,7 @@ if SERVER then
             -- ============================================================================
             
             if s.Flywheel_Power and math.abs(s.Flywheel_Power) > 0.1 and s.Active then
-                local desiredMass = getEffectiveVehicleMass(s, c, Chassis)
+                local desiredMass = s.EffectiveVehicleMass or config.Engine_SimulatedVehicleMass or 1000
                 local actualMass = s.ActualVehicleMass or desiredMass
                 local massScale = actualMass / math.max(desiredMass, 1)
                 massScale = math.clamp(massScale, c.Engine_MinMassScale or 0.2, c.Engine_MaxMassScale or 2.5)
@@ -2058,13 +2061,14 @@ if SERVER then
                 local FrontPowerRatio = (c.PowerDistribution or 50) / 100
                 local RearPowerRatio = 1 - FrontPowerRatio
                 
+                local forceMult = (c.ForceMult or 1) * 39.37 * 2 * tickMult
+                local torqueDir = (c.TorqueInvert and -1 or 1)
+
                 -- Front wheels
                 if #FrontWheels > 0 and FrontPowerRatio > 0 then
                     local FrontPower = scaledPower * FrontPowerRatio
                     local PowerPerWheel = FrontPower / #FrontWheels
                     for i, w in pairs(FrontWheels) do
-                        local forceMult = (c.ForceMult or 1) * 39.37 * 2 * tickMult
-                        local torqueDir = (c.TorqueInvert and -1 or 1)
                         local wheelScale = 1
                         if s.FrontWheelPowerScale and s.FrontWheelPowerScale[i] then
                             wheelScale = s.FrontWheelPowerScale[i]

@@ -11,7 +11,7 @@ local Core = _G.RedFoxEngineCore
 
 -- Configuration Table
 local config = {
-    ConfigVersion = "3.01",
+    ConfigVersion = "3.02",
     
     -- Engine Specifications
     Engine_Bore = 87,

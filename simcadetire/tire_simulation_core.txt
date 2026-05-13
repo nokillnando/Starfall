@@ -435,86 +435,73 @@ else -- SERVER
             return added
         end
 
-        local function rebuildVehicleFilter(Base)
-            if not Base then return 0 end
+        local function performUnifiedVehicleScan(Base)
+            if not Base then return 0, 0, 0 end
 
+            local previousMass = TotalRealMass
+            
+            -- 1. Gather all constrained entities (The heavy part)
+            local tree = Base:getAllConstrained()
+            local fullTree = {Base}
+            for i=1, #tree do fullTree[#fullTree+1] = tree[i] end
+            
+            -- 2. Process Extra Filters (Static and Semi-Dynamic)
+            local extraStatic = wire.ports.ExtraFilterStatic
+            if extraStatic and #extraStatic > 0 then
+                for _, ent in ipairs(extraStatic) do
+                    if isValid(ent) then
+                        fullTree[#fullTree+1] = ent
+                        local sub = ent:getAllConstrained()
+                        for j=1, #sub do fullTree[#fullTree+1] = sub[j] end
+                    end
+                end
+            end
+            
+            local extraSemi = wire.ports.ExtraFilterSemiDynamic
+            if extraSemi and #extraSemi > 0 then
+                for _, ent in ipairs(extraSemi) do
+                    if isValid(ent) then
+                        fullTree[#fullTree+1] = ent
+                        local sub = ent:getAllConstrained()
+                        for j=1, #sub do fullTree[#fullTree+1] = sub[j] end
+                    end
+                end
+            end
+
+            -- 3. Rebuild Filter and Recalculate Mass from the unified list
             VehicleFilter = {}
             CheckedEntities = {}
-
-            addConstrainedTreeToFilter(Base)
-
-            local staticFilter = wire.ports.ExtraFilterStatic
-            if staticFilter and #staticFilter > 0 then
-                for _, ent in ipairs(staticFilter) do
-                    addConstrainedTreeToFilter(ent)
-                end
-            end
-
-            for _, name in ipairs(OrderedWheelNames) do
-                local wData = Wheels[name]
-                if wData and wData.Entity and wData.Entity:isValid() then
-                    addFilterEntity(wData.Entity)
-                end
-            end
-
-            local semiDynamicFilter = wire.ports.ExtraFilterSemiDynamic
-            if semiDynamicFilter and #semiDynamicFilter > 0 then
-                for _, ent in ipairs(semiDynamicFilter) do
-                    addConstrainedTreeToFilter(ent)
-                end
-            end
-
-            return #VehicleFilter
-        end
-
-        local function recalculateTotalRealMass(Base)
-            if not Base then return false, 0, 0 end
-
-            local totalMass = 0
+            local currentMass = 0
             local massChecked = {}
-            local function addMassTree(ent)
-                if not (ent and ent:isValid()) then return end
-
-                local tree = ent:getAllConstrained()
-                table.insert(tree, ent)
-                for _, part in pairs(tree) do
-                    if part and part:isValid() and not massChecked[part] then
-                        massChecked[part] = true
-                        local phys = part:getPhysicsObject()
-                        if phys and phys:isValid() then
-                            totalMass = totalMass + phys:getMass()
+            
+            for i=1, #fullTree do
+                local ent = fullTree[i]
+                if isValid(ent) then
+                    -- Update Filter
+                    if not CheckedEntities[ent] then
+                        CheckedEntities[ent] = true
+                        VehicleFilter[#VehicleFilter+1] = ent
+                    end
+                    -- Update Mass
+                    if not massChecked[ent] then
+                        massChecked[ent] = true
+                        local phys = ent:getPhysicsObject()
+                        if isValid(phys) then
+                            currentMass = currentMass + phys:getMass()
                         end
                     end
                 end
             end
 
-            addMassTree(Base)
-
-            local semiDynamicFilter = wire.ports.ExtraFilterSemiDynamic
-            if semiDynamicFilter and #semiDynamicFilter > 0 then
-                for _, ent in ipairs(semiDynamicFilter) do
-                    addMassTree(ent)
-                end
-            end
-
-            local previousMass = TotalRealMass
-            
             -- [SPIKE FILTER] Silently ignore impossible mass spikes caused by Physgun (often adds 50,000kg)
-            if totalMass > (previousMass > 0 and previousMass + 10000 or Config.TotalVehicleMass + 10000) then
-                totalMass = previousMass > 0 and previousMass or Config.TotalVehicleMass
+            if currentMass > ((previousMass and previousMass > 0) and previousMass + 10000 or Config.TotalVehicleMass + 10000) then
+                currentMass = (previousMass and previousMass > 0) and previousMass or Config.TotalVehicleMass
             end
             
-            TotalRealMass = totalMass
+            TotalRealMass = currentMass
+            local filterCount = #VehicleFilter
 
-            local massChanged = math.abs(TotalRealMass - lastReportedMass) > 0.1
-            if massChanged then
-                if Config.AllowPrintMassRefresh then
-                    print(Config.W, "[TireSim] Total Physical Mass detected: ", Config.G, formatMass(TotalRealMass) .. "kg", Config.W, " (Config Virtual: ", Config.G, formatMass(Config.TotalVehicleMass) .. "kg", Config.W, ")")
-                end
-                lastReportedMass = TotalRealMass
-            end
-
-            return massChanged, previousMass, TotalRealMass
+            return filterCount, currentMass, previousMass
         end
     
         local function updateSemiDynamicFilter()
@@ -607,8 +594,7 @@ else -- SERVER
                 TrackWidth = 0
             end
             
-            rebuildVehicleFilter(Base)
-            recalculateTotalRealMass(Base)
+            performUnifiedVehicleScan(Base)
             lastReportedFilterCount = #VehicleFilter
             
             print(Config.W, "[TireSim] Initialized with ", Config.G, NumWheels, Config.W, " wheels. Simcade Version " .. Version)
@@ -620,8 +606,9 @@ else -- SERVER
             if not Base then return end
 
             local previousFilterCount = lastReportedFilterCount
-            local filterCount = rebuildVehicleFilter(Base)
-            local massChanged, previousMass, currentMass = recalculateTotalRealMass(Base)
+            local filterCount, currentMass, previousMass = performUnifiedVehicleScan(Base)
+            
+            local massChanged = math.abs(currentMass - (previousMass or 0)) > 0.1
             local filterChanged = filterCount ~= previousFilterCount
 
             if Config.AllowPrintFilter and filterChanged then
@@ -657,9 +644,8 @@ else -- SERVER
             elseif changed.ExtraFilterSemiDynamic then
                 local Base = getValidBase()
                 if Base then
-                    rebuildVehicleFilter(Base)
-                    recalculateTotalRealMass(Base)
-                    lastReportedFilterCount = #VehicleFilter
+                    local filterCount = performUnifiedVehicleScan(Base)
+                    lastReportedFilterCount = filterCount
                 end
             end
         end

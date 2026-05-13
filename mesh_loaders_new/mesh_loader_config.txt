@@ -145,15 +145,50 @@ Now that this has been said, go scroll down
     FixAngles = { pitch=false, yaw=false, roll=false, invert=false } -- Set axes to lock to AngleFixTarget's world rotation. Use invert=true for mirrored wheels (like right-side calipers).
     AngleFixTarget = "Base"---------Entity input name whose angle is used for FixAngles (defaults to Base)
     
+    
+    Texture swap examples:
+    
     TextureSwaps = {
         ["Brake"] = { --Input name
             texture = "url here", --optional url or texture path
             highlight = false, -- disable lighting or not when activating the swap, and optionally change color/alpha
             color = Color(255,0,0,255), --optional
-            dynamic = true, -- If true, the input float maps to a color/alpha multiplier
-            dynamicMin = 0, -- Float value representing 0% multiplier (faint)
-            dynamicMax = 300 -- Float value representing 100% multiplier (full glow)
+            dynamic = true,
+            dynamicMin = 0,
+            dynamicMax = 300
         } 
+    }
+    
+    TextureSwaps = {
+        ["RunningLights"] = { 
+            input = "Lights", -- Optional: Use a specific Wire input name instead of the table key
+            priority = 1,     -- Low priority
+            highlight = true,
+            color = Color(150,0,0,255)
+        },
+        ["BrakeLight"] = { 
+            input = "Brakes",
+            priority = 2,     -- Higher priority: Overwrites "RunningLights" if both are on
+            highlight = true,
+            color = Color(255,0,0,255)
+        },
+        ["Skin_Red"] = {
+            input = "Skin",   -- Multiple swaps can share one input
+            condition = 1,    -- Only activates if the "Skin" input value is exactly 1
+            texture = "url_for_red_texture"
+        },
+        ["Skin_Blue"] = {
+            input = "Skin",
+            condition = 2,    -- Only activates if the "Skin" input value is exactly 2
+            texture = "url_for_blue_texture"
+        },
+        ["GlowEffect"] = {
+            input = "Turbo",
+            dynamic = true,   -- Scales color/alpha based on the input float value
+            dynamicMin = 0,
+            dynamicMax = 100,
+            color = Color(0,255,255,255)
+        }
     }
 
     
@@ -200,7 +235,7 @@ Now that this has been said, go scroll down
     ]]--
 --############################################################################################################################################
 --Actual things to change
-local ConfigVersion = "2.13"
+local ConfigVersion = "2.14"
 local meshName = "Body - Main" --Just the chip name when finished
 local globalScale = Vector(1) -- Scale all meshes added by this amount, or add a scale vector to individual meshes
 local offsetPos = Vector(0, 0, 0) -- Offsets are relative to chip/base

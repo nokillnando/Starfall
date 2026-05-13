@@ -10,8 +10,7 @@
     StaticFilter = "array",
     DynamicFilter = "array"
 },{SteerOut = "number", SpeedOut = "number"})
-local wheels = wire.ports.Wheels
-local base = wire.ports.Base
+-- Removed local wheels/base caching from here to ensure we always check the live ports
 
 
         local smoothingPitch = 5  -- Adjust the smoothing factor as needed
@@ -35,20 +34,79 @@ local base = wire.ports.Base
 
 
 
-   -- local E = prop.create(chip():localToWorld(Vector(0,0,10)), chip():localToWorldAngles(Angle(0,0,0)), "models/sprops/rectangles_thin/size_66/rect_66x120x1_5.mdl", 0) 
-    if isValid(base) then
-    E = base
-else
-    E = chip():isWeldedTo()
-end
-    chip():setParent(E)
+    local E = nil
+    local E_phys = nil
+    local E_inertia = Vector(0,0,0)
+    local baseFilter = {}
+    local traceFilter = {}
+    local Initialized = false
+    local lastFilterCount = 0
+    local Holos = {}
+
+    local function setupVehicle()
+        local base = wire.ports.Base
+        if isValid(base) then
+            E = base
+        else
+            E = chip():isWeldedTo()
+        end
+
+        if not isValid(E) then return false end
+        
+        E_phys = E:getPhysicsObject()
+        E_inertia = isValid(E_phys) and E_phys:getInertia() or Vector(0,0,0)
+
+        chip():setParent(E)
+        
+        -- Build the filter
+        local wheels = wire.ports.Wheels
+        baseFilter = {E, chip()}
+        if wheels then
+            for i=1, #wheels do
+                if isValid(wheels[i]) then baseFilter[#baseFilter+1] = wheels[i] end
+            end
+        end
+
+        local constraints = E:getAllConstrained()
+        for _, ent in ipairs(constraints) do
+            if isValid(ent) then baseFilter[#baseFilter+1] = ent end
+        end
+
+        local wiredStatic = wire.ports.StaticFilter
+        if type(wiredStatic) == "table" then
+            for _, ent in pairs(wiredStatic) do
+                if isValid(ent) then baseFilter[#baseFilter+1] = ent end
+            end
+        end
+
+        traceFilter = table.copy(baseFilter)
+        lastFilterCount = #traceFilter
+
+        -- Create Holograms only after E is valid
+        if not Holos[1] then
+            -- Wheel parents
+            holoCreate(Holos, 1, E:localToWorld(Vector(0)), Vector(1), E:localToWorldAngles(Angle(0)), Color(255,255,255,0), "models/sprops/misc/axis_plane.mdl", E, "", false)
+            holoCreate(Holos, 2, E:localToWorld(Vector(0)), Vector(1), E:localToWorldAngles(Angle(0)), Color(255,255,255,0), "models/sprops/misc/axis_plane.mdl", E, "", false)
+            holoCreate(Holos, 3, E:localToWorld(Vector(0)), Vector(1), E:localToWorldAngles(Angle(0)), Color(255,255,255,0), "models/sprops/misc/axis_plane.mdl", E, "", false)
+            holoCreate(Holos, 4, E:localToWorld(Vector(0)), Vector(1), E:localToWorldAngles(Angle(0)), Color(255,255,255,0), "models/sprops/misc/axis_plane.mdl", E, "", false)
+            
+            -- Actual wheel holos
+            holoCreate(Holos, 5, Holos[1]:localToWorld(Vector(0)), Vector(1,0.65,1), Angle(0), ColorFR, "models/sprops/trans/wheel_d/t_wheel25.mdl", Holos[1], "", false) Holos[5]:setBodygroup(1,9)
+            holoCreate(Holos, 6, Holos[2]:localToWorld(Vector(0)), Vector(1,0.65,1), Angle(0), ColorFL, "models/sprops/trans/wheel_d/t_wheel25.mdl", Holos[2], "", false) Holos[6]:setBodygroup(1,9)
+            holoCreate(Holos, 7, Holos[3]:localToWorld(Vector(0)), Vector(1,0.65,1), Angle(0), ColorRL, "models/sprops/trans/wheel_d/t_wheel25.mdl", Holos[3], "", false) Holos[7]:setBodygroup(1,9)
+            holoCreate(Holos, 8, Holos[4]:localToWorld(Vector(0)), Vector(1,0.65,1), Angle(0), ColorRR, "models/sprops/trans/wheel_d/t_wheel25.mdl", Holos[4], "", false) Holos[8]:setBodygroup(1,9)
+        end
+
+        Initialized = true
+        print(Color(0, 255, 0), "[Smoother] ", Color(255, 255, 255), "Vehicle initialized: ", E)
+        return true
+    end
     --E:setMass(150) E:setMaterial("sprops/sprops_grid_12x12")
    -- E:setColor(Color(255,255,255,255))
     
     local HeightF, HeightB = 15, 15
     local LengthF, LengthB, WidthF, WidthB = 55, 55, -30, -30
     
-    local Holos = {}
     
     function getSurfaceAngle(Base, FL, FR, BL, BR)
                 
@@ -119,31 +177,6 @@ end
         return Angle(rv1[2], rv1[3], rv1[1])
     end
     
-    -- Wheel parents
-    holoCreate(Holos, 1, E:localToWorld(Vector(0)), Vector(1), E:localToWorldAngles(Angle(0)), Color(255,255,255,0), "models/sprops/misc/axis_plane.mdl", E, "", false)
-    holoCreate(Holos, 2, E:localToWorld(Vector(0)), Vector(1), E:localToWorldAngles(Angle(0)), Color(255,255,255,0), "models/sprops/misc/axis_plane.mdl", E, "", false)
-    holoCreate(Holos, 3, E:localToWorld(Vector(0)), Vector(1), E:localToWorldAngles(Angle(0)), Color(255,255,255,0), "models/sprops/misc/axis_plane.mdl", E, "", false)
-    holoCreate(Holos, 4, E:localToWorld(Vector(0)), Vector(1), E:localToWorldAngles(Angle(0)), Color(255,255,255,0), "models/sprops/misc/axis_plane.mdl", E, "", false)
-    
-    -- Actual wheel holos
-    --fr
-    holoCreate(Holos, 5, Holos[1]:localToWorld(Vector(0)), Vector(1,0.65,1), Angle(0), ColorFR, "models/sprops/trans/wheel_d/t_wheel25.mdl", Holos[1], "", false)Holos[5]:setBodygroup(1,9)
-    --fl
-    holoCreate(Holos, 6, Holos[2]:localToWorld(Vector(0)), Vector(1,0.65,1), Angle(0), ColorFL, "models/sprops/trans/wheel_d/t_wheel25.mdl", Holos[2], "", false)Holos[6]:setBodygroup(1,9)
-    --rl
-    holoCreate(Holos, 7, Holos[3]:localToWorld(Vector(0)), Vector(1,0.65,1), Angle(0), ColorRL, "models/sprops/trans/wheel_d/t_wheel25.mdl", Holos[3], "", false)Holos[7]:setBodygroup(1,9)
-    --rr
-    holoCreate(Holos, 8, Holos[4]:localToWorld(Vector(0)), Vector(1,0.65,1), Angle(0), ColorRR, "models/sprops/trans/wheel_d/t_wheel25.mdl", Holos[4], "", false)Holos[8]:setBodygroup(1,9)
-    
-    -- Debug holo for surface angle
-   -- holoCreate(Holos, 9, E:localToWorld(Vector(-50,0,5)), Vector(0.5), Angle(0), Color(255), "models/sprops/misc/axis_plane.mdl", E, "", true)
-    
-
-    
-   
-    
-    -- spawn and initialize seat
-    
     WheelSpin = 0 oldv = Vector(0) Sp = 0
 
 function lerpNormalized(inputValue, maxInputValue)
@@ -164,32 +197,11 @@ function lerpNormalized(inputValue, maxInputValue)
     return lerpedValue
 end
 
-    local E_phys = E:getPhysicsObject()
-    local E_inertia = isValid(E_phys) and E_phys:getInertia() or Vector(0,0,0)
-    
-    local baseFilter = {E, chip()}
-    for i=1, 4 do if wheels and wheels[i] then baseFilter[#baseFilter+1] = wheels[i] end end
-    
-    -- Add all physical constraints (entire car body) to the static filter
-    local constraints = E:getAllConstrained()
-    for _, ent in ipairs(constraints) do
-        if isValid(ent) then baseFilter[#baseFilter+1] = ent end
-    end
-    
-    -- Add manually wired StaticFilter arrays
-    local wiredStatic = wire.ports.StaticFilter
-    if type(wiredStatic) == "table" then
-        for _, ent in pairs(wiredStatic) do
-            if isValid(ent) then baseFilter[#baseFilter+1] = ent end
-        end
-    end
-    
-    local traceFilter = table.copy(baseFilter)
-    
-    local lastFilterCount = #traceFilter
+    -- Note: Initial setup is now deferred to the first tick to ensure Wire is connected
     
     -- Update the trace filter periodically to include players and dynamic wired arrays
     timer.create("update_player_filter", FilterRefreshRate, 0, function()
+        if not Initialized then return end
         local plys = find.allPlayers()
         traceFilter = table.copy(baseFilter)
         for i=1, #plys do traceFilter[#traceFilter+1] = plys[i] end
@@ -214,6 +226,10 @@ end
     local tickMult = (1 / UpdateRate) / 0.02 -- Scale forces based on update rate relative to original 50Hz
 
     timer.create("interval", 1 / UpdateRate, 0, function()
+        if not Initialized then
+            if not setupVehicle() then return end
+        end
+
         -- Prevent trace crash by removing entities that were deleted between slow filter updates
         for i = #traceFilter, 1, -1 do
             if not isValid(traceFilter[i]) then

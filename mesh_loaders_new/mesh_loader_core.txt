@@ -2,7 +2,7 @@
 --@author [C17] Red Fox
 --@shared
 
-local Version = "2.14"
+local Version = "2.15"
 
 --Offset fix??
 
@@ -10,9 +10,18 @@ if CLIENT then
 
     local vtfDownloads = vtfDownloads or {}
 
+    local function hashString(str)
+        local h = 0
+        for i = 1, #str do
+            h = (h * 31 + string.byte(str, i)) % 1000000000
+        end
+        return tostring(h)
+    end
+
     local function vtfTempPath(url)
-        local name = url:match("([^/]+)%.vtf") or "unnamed.vtf"
-        return "../data/sf_filedatatemp/" .. owner():getSteamID64(false) .. "/" .. name
+        local cleanUrl = url:match("^([^?]+)") or url
+        local name = cleanUrl:match("([^/]+)%.vtf") or "unnamed"
+        return "../data/sf_filedatatemp/" .. owner():getSteamID64(false) .. "/" .. name .. "_" .. hashString(cleanUrl) .. ".vtf"
     end
 
     local function asyncDownloadVtf(url, callback)
@@ -21,7 +30,9 @@ if CLIENT then
             return
         end
 
-        local fileName = url:match("([^/]+%.vtf)") or "unnamed.vtf"
+        local cleanUrl = url:match("^([^?]+)") or url
+        local name = cleanUrl:match("([^/]+)%.vtf") or "unnamed"
+        local fileName = name .. "_" .. hashString(cleanUrl) .. ".vtf"
         local tempPath = vtfTempPath(url)
 
         -- Stagger VTF loads to prevent Source VFS from choking on simultaneous reads
@@ -148,12 +159,15 @@ if CLIENT then
     
     local function asyncDownloadImage(url, callback)
         local cleanUrl = url:match("^([^?]+)") or url
-        local fileName = cleanUrl:match("([^/]+%.png)$") or cleanUrl:match("([^/]+%.jpg)$") or cleanUrl:match("([^/]+%.jpeg)$")
+        local ext = cleanUrl:match("%.png$") and "png" or cleanUrl:match("%.jpg$") and "jpg" or cleanUrl:match("%.jpeg$") and "jpeg"
         
-        if not fileName then
+        if not ext then
             callback(nil)
             return
         end
+        
+        local name = cleanUrl:match("([^/]+)%." .. ext .. "$") or "unnamed"
+        local fileName = name .. "_" .. hashString(cleanUrl) .. "." .. ext
         
         local tempPath = "../data/sf_filedatatemp/" .. owner():getSteamID64(false) .. "/" .. fileName
 
@@ -369,9 +383,9 @@ if CLIENT then
         end
     end
     
-    -- Think (tickrate, cheap quota): compute the heavy vector math and cache the result
-    hook.add("Think", "MeshLoader_AngleCalc", function()
-        for i = #fixAnglesHolos, 1, -1 do
+    -- Render hook (framerate): Compute and apply for frame-perfect visual smoothness
+    hook.add("PreDrawOpaqueRenderables", "MeshLoader_AngleFix", function()
+        for i = 1, #fixAnglesHolos do
             local e = fixAnglesHolos[i]
             if not isValid(e.holo) then
                 table.remove(fixAnglesHolos, i)
@@ -381,30 +395,22 @@ if CLIENT then
                 local fix = e.fixTarget
                 if not isValid(fix) then fix = base end
                 
-                -- Re-sync position periodically to self-heal after void/teleport (throttled to avoid net burst)
-                local now = timer.curtime()
-                if not e.lastPosSync or now - e.lastPosSync > 1 then
-                    e.holo:setPos(parent:localToWorld(e.offsetPos))
-                    e.lastPosSync = now
+                -- Force parenting to the stable fixTarget (Chassis/Base) instead of the spinning wheel
+                if e.holo:getParent() ~= fix then
+                    e.holo:setParent(fix)
                 end
                 
+                -- Smoothly follow the wheel's interpolated position
+                e.holo:setPos(parent:localToWorld(e.offsetPos))
+                
+                -- Calculate the stable resting angle based on chassis orientation + wheel steer/camber
                 local ang = getRestingAngle(parent, fix, e.fixP, e.fixY, e.fixR, e.invertAxis)
                 
                 local m = Matrix()
                 m:setAngles(ang)
                 m:rotate(e.offsetAng)
                 
-                e.cachedWorldAng = m:getAngles()
-            end
-        end
-    end)
-    
-    -- Render hook (framerate): only a single setAngles per holo, no math
-    hook.add("PreDrawOpaqueRenderables", "MeshLoader_AngleFix", function()
-        for i = 1, #fixAnglesHolos do
-            local e = fixAnglesHolos[i]
-            if e.cachedWorldAng and isValid(e.holo) then
-                e.holo:setAngles(e.cachedWorldAng)
+                e.holo:setAngles(m:getAngles())
             end
         end
     end)
@@ -437,66 +443,73 @@ if CLIENT then
         if not isValid(holo) or not holo.MeshConfig then return end
         
         local swapConfig = holo.MeshConfig.TextureSwaps
-        local activeSwapName = nil
-        
-        if swapConfig and holo.ActiveSwaps then
-            for name, _ in pairs(swapConfig) do
-                if holo.ActiveSwaps[name] then
-                    activeSwapName = name
-                    break
-                end
-            end
-        end
-        
-        local mat = holo.MeshConfig.mat
-        local swapData = activeSwapName and swapConfig[activeSwapName]
-        
-        if holo.MeshConfig.OriginalTexture and mat and mat.setTexture then
-            if activeSwapName then
-                local t = holo.MeshConfig.preloadedSwaps and holo.MeshConfig.preloadedSwaps[activeSwapName]
-                if t then
-                    mat:setTexture("$basetexture", t)
-                else
-                    mat:setTexture("$basetexture", holo.MeshConfig.OriginalTexture)
-                end
-            else
-                mat:setTexture("$basetexture", holo.MeshConfig.OriginalTexture)
-            end
-        end
-        
-        local isHighlight = type(swapData) == "table" and swapData.highlight == true
-        local swapColor = type(swapData) == "table" and swapData.color
-        local isDynamic = type(swapData) == "table" and swapData.dynamic == true
-        local dynamicMin = type(swapData) == "table" and swapData.dynamicMin or 0
-        local dynamicMax = type(swapData) == "table" and swapData.dynamicMax or 1
-        local wireVal = activeSwapName and activeWireSwaps[activeSwapName] or 1
-        
-        if isHighlight then
-            holo:suppressEngineLighting(true)
-        else
-            holo:suppressEngineLighting(holo.MeshConfig.SuppressEngineLighting or false)
-        end
+        if not swapConfig or not holo.ActiveSwaps then return end
         
         local defaultColor = holo.MeshConfig.ColorAndAlpha or Color(255, 255, 255, 255)
-        local targetColor = swapColor or defaultColor
+        local finalR, finalG, finalB, finalA = defaultColor.r, defaultColor.g, defaultColor.b, defaultColor.a
+        local finalHighlight = holo.MeshConfig.SuppressEngineLighting or false
+        local textureToSet = nil
         
-        if isDynamic then
-            local mult = 1
-            if dynamicMax ~= dynamicMin then
-                mult = math.clamp((wireVal - dynamicMin) / (dynamicMax - dynamicMin), 0, 1)
-            end
-            local r = math.clamp(defaultColor.r + (targetColor.r - defaultColor.r) * mult, 0, 255)
-            local g = math.clamp(defaultColor.g + (targetColor.g - defaultColor.g) * mult, 0, 255)
-            local b = math.clamp(defaultColor.b + (targetColor.b - defaultColor.b) * mult, 0, 255)
-            local a = math.clamp(defaultColor.a + (targetColor.a - defaultColor.a) * mult, 0, 255)
-            holo:setColor(Color(r, g, b, a))
-        else
-            if activeSwapName then
-                holo:setColor(targetColor)
-            else
-                holo:setColor(defaultColor)
+        -- Priority System: Find the active swap with the highest priority
+        local bestPriority = -math.huge
+        local bestSwapName = nil
+        local bestSwapData = nil
+        
+        for name, swapData in pairs(swapConfig) do
+            if holo.ActiveSwaps[name] then
+                local priority = (type(swapData) == "table" and swapData.priority) or 0
+                if priority > bestPriority then
+                    bestPriority = priority
+                    bestSwapName = name
+                    bestSwapData = swapData
+                end
             end
         end
+        
+        if bestSwapName then
+            local data = bestSwapData
+            
+            -- Handle texture
+            local texture = type(data) == "table" and data.texture or (type(data) == "string" and data)
+            if texture then
+                textureToSet = holo.MeshConfig.preloadedSwaps and holo.MeshConfig.preloadedSwaps[bestSwapName]
+            end
+            
+            -- Handle highlight
+            if type(data) == "table" and data.highlight then
+                finalHighlight = true
+            end
+            
+            -- Handle color calculation
+            local targetColor = (type(data) == "table" and data.color) or defaultColor
+            finalR, finalG, finalB, finalA = targetColor.r, targetColor.g, targetColor.b, targetColor.a
+            
+            if type(data) == "table" and data.dynamic then
+                local dynamicMin = data.dynamicMin or 0
+                local dynamicMax = data.dynamicMax or 1
+                local wireVal = activeWireSwaps[bestSwapName] or activeWireSwaps[data.input] or 0
+                local mult = 1
+                if dynamicMax ~= dynamicMin then
+                    mult = math.clamp((wireVal - dynamicMin) / (dynamicMax - dynamicMin), 0, 1)
+                end
+                finalR = defaultColor.r + (targetColor.r - defaultColor.r) * mult
+                finalG = defaultColor.g + (targetColor.g - defaultColor.g) * mult
+                finalB = defaultColor.b + (targetColor.b - defaultColor.b) * mult
+                finalA = defaultColor.a + (targetColor.a - defaultColor.a) * mult
+            end
+        end
+        
+        -- Apply Texture
+        local mat = holo.MeshConfig.mat
+        if mat and mat.setTexture then
+            mat:setTexture("$basetexture", textureToSet or holo.MeshConfig.OriginalTexture or "models/debug/debugwhite")
+        end
+        
+        -- Apply Highlight
+        holo:suppressEngineLighting(finalHighlight)
+        
+        -- Apply Final Color
+        holo:setColor(Color(finalR, finalG, finalB, finalA))
     end
     
     local function triggerHoloSwapsForConfig(v)
@@ -514,23 +527,40 @@ if CLIENT then
         activeWireSwaps[inputName] = val
         
         for _, holo in ipairs(spawnedHolograms) do
-            if isValid(holo) and holo.MeshConfig and holo.MeshConfig.TextureSwaps and holo.MeshConfig.TextureSwaps[inputName] then
-                holo.ActiveSwaps = holo.ActiveSwaps or {}
-                if val > 0 then
-                    holo.ActiveSwaps[inputName] = true
-                else
-                    holo.ActiveSwaps[inputName] = nil
+            if isValid(holo) and holo.MeshConfig and holo.MeshConfig.TextureSwaps then
+                local configSwaps = holo.MeshConfig.TextureSwaps
+                local anyMatch = false
+                
+                for swapKey, swapData in pairs(configSwaps) do
+                    local targetInput = (type(swapData) == "table" and swapData.input) or swapKey
+                    
+                    if targetInput == inputName then
+                        holo.ActiveSwaps = holo.ActiveSwaps or {}
+                        
+                        local isActive = false
+                        if type(swapData) == "table" and swapData.condition ~= nil then
+                            isActive = (val == swapData.condition)
+                        else
+                            isActive = (val > 0)
+                        end
+                        
+                        holo.ActiveSwaps[swapKey] = isActive or nil
+                        anyMatch = true
+                    end
                 end
                 
-                applyHoloSwaps(holo)
+                if anyMatch then
+                    applyHoloSwaps(holo)
+                end
             end
         end
     end)
 
     local buildThread
-    local function doneBuilding(meshName, debugPrints, meshSpawnDelay, showMeshSpawnProgress, meshes, offsetPos, offsetAngle, globalScale, triangles, W, R, G, progressData)
+    local function doneBuilding(meshName, debugPrints, meshSpawnDelay, showMeshSpawnProgress, meshes, offsetPos, offsetAngle, globalScale, triangles, W, R, G, progressData, textureCount, materialCount)
         local triCount = triangles - mesh.trianglesLeft()
-        setName("Mesh Loader - " .. triCount .. " tris ".."- "..meshName)
+        local namePrefix = "Mesh Loader - " .. triCount .. " tris - " .. meshName
+        setName(namePrefix)
         if debugPrints then print(W, "Finished building, using ", G, triCount, W, " tris") end
         if debugPrints then print(W, "Starting to spawn meshes with ", G, meshSpawnDelay, W, " second delay between each...") end
         
@@ -565,7 +595,7 @@ if CLIENT then
             if #spawnQueue == 0 then
                 if debugPrints then print(G, "All meshes spawned successfully!") end
                 progressData.spawning = false
-                setName("Mesh Loader - " .. triCount .. " tris, "..meshName.." - Complete")
+                setName(namePrefix .. " [" .. totalToSpawn .. "M / " .. textureCount .. "T / " .. materialCount .. "Mat] - Complete")
                 return
             end
 
@@ -630,7 +660,7 @@ if CLIENT then
             else
                 if debugPrints then print(G, "All meshes spawned successfully!") end
                 progressData.spawning = false
-                setName("Mesh Loader - " .. triCount .. " tris, "..meshName.." - Complete")
+                setName(namePrefix .. " [" .. totalToSpawn .. "M / " .. textureCount .. "T / " .. materialCount .. "Mat] - Complete")
                 
                 -- Reconciliation timer: handles AdvDupe2 timing where wires connect AFTER the chip boots
                 -- Periodically re-requests server state AND directly re-parents any mismatched holograms
@@ -700,6 +730,13 @@ if CLIENT then
         buildThread = coroutine.wrap(function()
             local builtCount = 0
             local materialCache = {}
+            local textureCountCache = {}
+            local uniqueMaterials = 0
+
+            local function trackTexture(url)
+                if type(url) ~= "string" or url == "" or (url:sub(1,4) ~= "http" and not url:find("%.vtf")) then return end
+                textureCountCache[url] = true
+            end
             
             -- Generate a fingerprint key from all material-defining properties
             local function materialFingerprint(v)
@@ -747,6 +784,16 @@ if CLIENT then
             for k, v in ipairs(meshes) do
                 progressData.builtMeshes = builtCount
                 progressData.buildProgress = builtCount / #meshes
+
+                trackTexture(v.texture)
+                trackTexture(v.BumpMapLink)
+                trackTexture(v.EnvMapLink)
+                trackTexture(v.PhongExponentTexture)
+                if v.TextureSwaps then
+                    for _, sc in pairs(v.TextureSwaps) do
+                        trackTexture(type(sc) == "table" and sc.texture or sc)
+                    end
+                end
 
                 if v.UseModTexture then
                     -- Check material cache before creating a new one
@@ -1100,6 +1147,7 @@ if CLIENT then
                             preloadedSwaps = v.preloadedSwaps,
                         }
                     end
+                    uniqueMaterials = uniqueMaterials + 1
                     end -- end of else (cache miss)
                 else
                     v.mat = material.load(v.Material)
@@ -1136,15 +1184,20 @@ if CLIENT then
                     if debugPrints then print(W, "Built mesh " .. k, W, ": ", G, trianglesBefore - mesh.trianglesLeft(), W, " tris") end
                 end
             end
+            
+            local finalTextureCount = 0
+            for _ in pairs(textureCountCache) do finalTextureCount = finalTextureCount + 1 end
+            
             progressData.buildProgress = 1
             progressData.builtMeshes = #meshes
-            return true
+            return true, finalTextureCount, uniqueMaterials
         end)
 
         hook.add("think", "build", function()
             while chip():getQuotaAverage() < chip():getQuotaMax() / 8 do
-                if buildThread() then
-                    doneBuilding(meshName, debugPrints, meshSpawnDelay, showMeshSpawnProgress, meshes, offsetPos, offsetAngle, globalScale, triangles, W, R, G, progressData)
+                local ok, texCount, matCount = buildThread()
+                if ok then
+                    doneBuilding(meshName, debugPrints, meshSpawnDelay, showMeshSpawnProgress, meshes, offsetPos, offsetAngle, globalScale, triangles, W, R, G, progressData, texCount, matCount)
                     hook.remove("think", "build")
                     return
                 end
@@ -1364,6 +1417,11 @@ if CLIENT then
             end
         end
         
+        -- Clear tables to prevent accumulation on re-init
+        fixAnglesHolos = {}
+        spawnedHolograms = {}
+        networkedEntities = {}
+        
         sanitizeMeshURLs(config.meshes)
         
         -- Request base now that we are initialized
@@ -1503,7 +1561,8 @@ else -- SERVER
                 end
                 
                 if meshData.TextureSwaps then
-                    for inputName, url in pairs(meshData.TextureSwaps) do
+                    for key, data in pairs(meshData.TextureSwaps) do
+                        local inputName = (type(data) == "table" and data.input) or key
                         if not usedInputs[inputName] then
                             table.insert(inputNames, inputName)
                             table.insert(inputTypes, "normal")
