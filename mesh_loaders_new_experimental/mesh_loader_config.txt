@@ -247,7 +247,7 @@ Now that this has been said, go scroll down
     ]]--
 --############################################################################################################################################
 --Actual things to change
-local ConfigVersion = "2.14"
+local ConfigVersion = "2.15"
 local meshName = "Body - Main" --Just the chip name when finished
 local globalScale = Vector(1) -- Scale all meshes added by this amount, or add a scale vector to individual meshes
 local offsetPos = Vector(0, 0, 0) -- Offsets are relative to chip/base
