@@ -1600,10 +1600,10 @@ if CLIENT then
                                     if ve then remoteConfigVersion = configData:sub(vs, ve - 1) end
                                 end
                             end
-                            processResults(remoteCoreVersion, remoteConfigVersion, coreData)
+                            processResults(remoteCoreVersion, remoteConfigVersion, coreData, configData)
                         end, function(err)
                             print(R, "Mesh Loader Config version check HTTP error: ", err)
-                            processResults(remoteCoreVersion, nil, coreData)
+                            processResults(remoteCoreVersion, nil, coreData, nil)
                         end)
                     end
 
@@ -1615,7 +1615,7 @@ if CLIENT then
                 end)
             end
 
-            function processResults(remoteCore, remoteConfig, coreData)
+            function processResults(remoteCore, remoteConfig, coreData, configData)
                 local coreNum = tonumber(remoteCore)
                 local localCoreNum = tonumber(localVersion)
                 local configNum = tonumber(remoteConfig)
