@@ -1515,7 +1515,7 @@ if CLIENT then
                 return
             end
 
-            local githubCoreURL = "https://raw.githubusercontent.com/nokillnando/Starfall/main/mesh_loaders_new/mesh_loader_core.txt"
+            local githubCoreURL = "https://raw.githubusercontent.com/nokillnando/Starfall/main/mesh_loaders_new_experimental/mesh_loader_core.txt"
             local localVersion = Version
             local maxRetries = 10
             local W, G, R = cfg.W or Color(255,255,255), cfg.G or Color(0,255,0), cfg.R or Color(255,0,0)
@@ -1599,7 +1599,7 @@ if CLIENT then
         -- Allow checking version (just for config check or standard output)
         local function checkVersionOnSpawn(cfg)
             if not cfg.AllowCheckVersion then return end
-            local githubConfigURL = "https://raw.githubusercontent.com/nokillnando/Starfall/main/mesh_loaders_new/mesh_loader_config.txt"
+            local githubConfigURL = "https://raw.githubusercontent.com/nokillnando/Starfall/main/mesh_loaders_new_experimental/mesh_loader_config.txt"
             local localConfigVersion = cfg.ConfigVersion or "2.00"
             local maxRetries = 10
             local W, G, R = cfg.W or Color(255,255,255), cfg.G or Color(0,255,0), cfg.R or Color(255,0,0)
