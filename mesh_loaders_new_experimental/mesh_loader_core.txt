@@ -1708,14 +1708,50 @@ if CLIENT then
                             cfg = intercepted
                             print(G, "Mesh Loader: Config variables successfully dynamically merged.")
                             
-                            -- 3. Print the missing variables to the user
-                            if hasNewVars then
-                                print(W, "Mesh Loader: Your local config is missing these new settings:")
-                                for k, v in pairs(newVars) do
-                                    local valStr = type(v) == "string" and ('"' .. v .. '"') or tostring(v)
-                                    print(G, "    local ", k, " = ", valStr)
+                            -- 3. Generate a physical merged file for the Starfall Editor!
+                            if getScripts and file and file.write then
+                                local myCode = nil
+                                for path, code in pairs(getScripts(chip())) do
+                                    if path:find("mesh_loader_config") then
+                                        myCode = code
+                                        break
+                                    end
                                 end
-                                print(W, "(You can manually add these into your editor if you wish to tweak them)")
+                                
+                                if myCode then
+                                    local userLines = {}
+                                    for line in string.gmatch(myCode, "[^\r\n]+") do
+                                        local var = string.match(line, "^%s*local%s+([%w_]+)%s*=")
+                                        if var and var ~= "meshes" and var ~= "downloadStatus" and var ~= "progressData" then
+                                            userLines[var] = line
+                                        end
+                                    end
+                                    
+                                    local finalStr = ""
+                                    for line in string.gmatch(configData, "[^\r\n]+") do
+                                        local var = string.match(line, "^%s*local%s+([%w_]+)%s*=")
+                                        if var and userLines[var] and var ~= "ConfigVersion" and var ~= "meshes" and var ~= "downloadStatus" and var ~= "progressData" then
+                                            finalStr = finalStr .. userLines[var] .. "\n"
+                                        else
+                                            finalStr = finalStr .. line .. "\n"
+                                        end
+                                    end
+                                    
+                                    local s1 = myCode:find("local meshes%s*=%s*{")
+                                    local e1 = myCode:find("%-\%-Default config values", s1 or 1)
+                                    local remoteS = finalStr:find("local meshes%s*=%s*{")
+                                    local remoteE = finalStr:find("%-\%-Default config values", remoteS or 1)
+                                    
+                                    if s1 and e1 and remoteS and remoteE then
+                                        local userMeshes = myCode:sub(s1, e1 - 1)
+                                        finalStr = finalStr:sub(1, remoteS - 1) .. userMeshes .. finalStr:sub(remoteE)
+                                        
+                                        file.write("mesh_loader_config_updated.txt", finalStr)
+                                        print(W, "Mesh Loader: We automatically generated a physical file for you with the new template!")
+                                        print(G, "-> Open the Starfall Editor, go to the 'Data' or 'Shared' tab, and open 'mesh_loader_config_updated.txt'")
+                                        print(G, "-> You can view and edit the new variables there, and click 'Save As' to overwrite your original config!")
+                                    end
+                                end
                             end
                             
                             net.start("streamNewConfig")
