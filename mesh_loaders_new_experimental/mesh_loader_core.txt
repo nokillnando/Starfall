@@ -1675,6 +1675,9 @@ if CLIENT then
                     _G.MeshLoaderCore.initClient = function(c) intercepted = c end
                     _G.MeshLoaderCore.initServer = function(c) intercepted = c end
 
+                    -- Strip dofile since the core is already loaded
+                    configData = configData:gsub('dofile%s*%(.-%)', '')
+
                     local func, err = loadstring(configData, "mesh_loader_config_updated")
                     if func then
                         func()
