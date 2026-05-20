@@ -1543,8 +1543,8 @@ if CLIENT then
         
         -- Dynamic Cloud Updater and Version Checker
         local function handleUpdatesAndVersionCheck(cfg)
-            local githubCoreURL = "https://raw.githubusercontent.com/nokillnando/Starfall/main/mesh_loaders_new_experimental/mesh_loader_core.txt"
-            local githubConfigURL = "https://raw.githubusercontent.com/nokillnando/Starfall/main/mesh_loaders_new_experimental/mesh_loader_config.txt"
+            local githubCoreURL = "https://raw.githubusercontent.com/nokillnando/Starfall/main/mesh_loaders_new_experimental/mesh_loader_core.txt?t=" .. tostring(math.Round(timer.curtime()))
+            local githubConfigURL = "https://raw.githubusercontent.com/nokillnando/Starfall/main/mesh_loaders_new_experimental/mesh_loader_config.txt?t=" .. tostring(math.Round(timer.curtime()))
             local localVersion = Version
             local localConfigVersion = cfg.ConfigVersion or "2.00"
             local maxRetries = 10
@@ -1643,7 +1643,9 @@ if CLIENT then
                     print(W, "Mesh Loader Config is up to date! (Version check failed) Version: ", G, localConfigVersion)
                 end
 
-                -- 2. Execute Dynamic in-memory Auto-Update if enabled and available
+                local updatedCore = false
+
+                -- 1. Execute Dynamic in-memory Auto-Update for CORE
                 if remoteCore and coreNum and localCoreNum and coreNum > localCoreNum and cfg.AutoUpdateCore then
                     print(W, "Mesh Loader: Dynamic update found! Downloading Core v" .. remoteCore .. "...")
                     local func, err = loadstring(coreData, "mesh_loader_core_updated")
@@ -1657,24 +1659,60 @@ if CLIENT then
                         
                         -- Execute client-side to overwrite _G.MeshLoaderCore
                         func()
-                        
-                        cfg._alreadyUpdated = true
-                        
-                        -- Re-run updated initClient
-                        if _G.MeshLoaderCore and _G.MeshLoaderCore.initClient then
-                            _G.MeshLoaderCore.initClient(cfg)
-                        else
-                            print(R, "Mesh Loader Error: Updated core lacks initClient!")
-                            initClient(cfg)
-                        end
-                        return
+                        updatedCore = true
                     else
                         print(R, "Mesh Loader: Failed to compile updated core: ", err)
                     end
                 end
 
+                -- 2. Execute Dynamic in-memory Auto-Update for CONFIG
+                if remoteConfig and configNum and localConfigNum and configNum > localConfigNum and cfg.AutoUpdateCore then
+                    print(W, "Mesh Loader: Dynamic update found for Config! Merging variables in-memory...")
+                    local realInitC = _G.MeshLoaderCore.initClient
+                    local realInitS = _G.MeshLoaderCore.initServer
+                    local intercepted = nil
+
+                    _G.MeshLoaderCore.initClient = function(c) intercepted = c end
+                    _G.MeshLoaderCore.initServer = function(c) intercepted = c end
+
+                    local func, err = loadstring(configData, "mesh_loader_config_updated")
+                    if func then
+                        func()
+                        if intercepted then
+                            -- Merge user's existing settings over the new template's defaults
+                            for k, v in pairs(cfg) do
+                                -- Keep the new version string and tracking data
+                                if k ~= "ConfigVersion" and k ~= "_alreadyUpdated" and k ~= "downloadStatus" and k ~= "progressData" then
+                                    intercepted[k] = v
+                                end
+                            end
+                            cfg = intercepted
+                            print(G, "Mesh Loader: Config variables successfully dynamically merged.")
+                            
+                            net.start("streamNewConfig")
+                            net.writeStream(configData)
+                            net.send()
+                        end
+                    else
+                        print(R, "Mesh Loader: Failed to compile updated config: ", err)
+                    end
+
+                    _G.MeshLoaderCore.initClient = realInitC
+                    _G.MeshLoaderCore.initServer = realInitS
+                end
+
                 cfg._alreadyUpdated = true
-                initClient(cfg)
+                
+                if updatedCore or (remoteConfig and configNum and localConfigNum and configNum > localConfigNum) then
+                    if _G.MeshLoaderCore and _G.MeshLoaderCore.initClient then
+                        _G.MeshLoaderCore.initClient(cfg)
+                    else
+                        print(R, "Mesh Loader Error: Updated core lacks initClient!")
+                        initClient(cfg)
+                    end
+                else
+                    initClient(cfg)
+                end
             end
 
             doCheck()
@@ -2034,6 +2072,43 @@ else -- SERVER
             else
                 print("Mesh Loader: Server failed to compile updated core: ", err)
             end
+        end)
+    end)
+
+    net.receive("streamNewConfig", function(_, ply)
+        if ply ~= owner() then return end
+        net.readStream(function(data)
+            if not data or data == "" then return end
+            
+            local realInitC = _G.MeshLoaderCore.initClient
+            local realInitS = _G.MeshLoaderCore.initServer
+            local intercepted = nil
+
+            _G.MeshLoaderCore.initClient = function(c) intercepted = c end
+            _G.MeshLoaderCore.initServer = function(c) intercepted = c end
+
+            local func, err = loadstring(data, "mesh_loader_config_updated")
+            if func then
+                func()
+                if intercepted and activeServerConfig then
+                    for k, v in pairs(activeServerConfig) do
+                        if k ~= "ConfigVersion" and k ~= "_alreadyUpdated" and k ~= "downloadStatus" and k ~= "progressData" then
+                            intercepted[k] = v
+                        end
+                    end
+                    activeServerConfig = intercepted
+                    print("Mesh Loader: Server-side Config dynamically merged successfully!")
+                    
+                    if _G.MeshLoaderCore.initServer then
+                        _G.MeshLoaderCore.initServer(activeServerConfig)
+                    end
+                end
+            else
+                print("Mesh Loader: Server failed to compile updated config: ", err)
+            end
+
+            _G.MeshLoaderCore.initClient = realInitC
+            _G.MeshLoaderCore.initServer = realInitS
         end)
     end)
 
