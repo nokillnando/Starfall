@@ -262,6 +262,7 @@ local AutoUpdateCore = true     -- Set to true to automatically download and run
 local UpdateRate = 33           -- Network update frequency (Hz)
 local DownloadImages = true     -- Set to true to bypass texture limits by downloading png/jpg to temp
 local Dickhead = true
+printHud(owner(),"fuck you")
 -- scale parameters can be added optionally for individual meshes, can leave them out if they aren't used
 local meshes = {
                  
