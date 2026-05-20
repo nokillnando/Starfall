@@ -50,8 +50,42 @@ local function getDefaultConfigCore()
     }
 end
 
+local function getDefaultGlobalSettings()
+    return {
+        AllowCheckVersion = true,
+        AutoUpdateCore = true,
+        ConfigVersion = "2.00",
+        UpdateRate = 33,
+        DownloadImages = true,
+        meshName = "Mesh Loader",
+        globalScale = Vector(1),
+        offsetPos = Vector(0, 0, 0),
+        offsetAngle = Angle(0, 0, 0),
+        meshSpawnDelay = 0.1,
+        showMeshSpawnProgress = false,
+        debugPrints = false,
+        showProgressDisplay = true,
+        progressDisplayType = "bar",
+        progressDisplayHeight = 35
+    }
+end
+
 local function normalizeMeshes(config)
-    if not config or not config.meshes then return end
+    if not config then return end
+    
+    -- Normalize root-level global settings first
+    local defaultGlobals = getDefaultGlobalSettings()
+    for k, v in pairs(defaultGlobals) do
+        if config[k] == nil then
+            if type(v) == "table" then
+                config[k] = table.copy(v)
+            else
+                config[k] = v
+            end
+        end
+    end
+    
+    if not config.meshes then return end
     
     local defaultCore = getDefaultConfigCore()
     local W = config.W or Color(255, 255, 255)
@@ -1507,20 +1541,16 @@ if CLIENT then
         -- Normalization of meshes configuration
         normalizeMeshes(config)
         
-        -- Safe Cloud Auto-Updater logic (Client)
-        local function checkForCoreUpdates(cfg)
-            if not cfg.AllowCheckVersion then
-                cfg._alreadyUpdated = true
-                initClient(cfg)
-                return
-            end
-
+        -- Dynamic Cloud Updater and Version Checker
+        local function handleUpdatesAndVersionCheck(cfg)
             local githubCoreURL = "https://raw.githubusercontent.com/nokillnando/Starfall/main/mesh_loaders_new_experimental/mesh_loader_core.txt"
+            local githubConfigURL = "https://raw.githubusercontent.com/nokillnando/Starfall/main/mesh_loaders_new_experimental/mesh_loader_config.txt"
             local localVersion = Version
+            local localConfigVersion = cfg.ConfigVersion or "2.00"
             local maxRetries = 10
             local W, G, R = cfg.W or Color(255,255,255), cfg.G or Color(0,255,0), cfg.R or Color(255,0,0)
 
-            local function doVersionCheck()
+            local function doCheck()
                 if not http.canRequest() then
                     maxRetries = maxRetries - 1
                     if maxRetries <= 0 then
@@ -1529,120 +1559,119 @@ if CLIENT then
                         initClient(cfg)
                         return
                     end
-                    timer.simple(0.5, doVersionCheck)
+                    timer.simple(0.5, doCheck)
                     return
                 end
 
-                print(W, "Mesh Loader: Checking for Core updates...")
-                http.get(githubCoreURL, function(data)
-                    if data and data ~= "" then
-                        local versionStart = data:find('local Version = "')
-                        if versionStart then
-                            versionStart = versionStart + 17
-                            local versionEnd = data:find('"', versionStart)
-                            if versionEnd then
-                                local remoteVersion = data:sub(versionStart, versionEnd - 1)
-                                if tonumber(remoteVersion) and tonumber(localVersion) and tonumber(remoteVersion) > tonumber(localVersion) then
-                                    print(W, "Mesh Loader: Dynamic update found! Downloading Core v" .. remoteVersion .. "...")
-                                    
-                                    local func, err = loadstring(data, "mesh_loader_core_updated")
-                                    if func then
-                                        print(G, "Mesh Loader: Core compiled successfully. Stream-sharing with server...")
-                                        
-                                        -- Stream to server
-                                        net.start("streamNewCore")
-                                        net.writeStream(data)
-                                        net.send()
-                                        
-                                        -- Execute client-side to overwrite _G.MeshLoaderCore
-                                        func()
-                                        
-                                        -- Re-run updated initClient
-                                        cfg._alreadyUpdated = true
-                                        if _G.MeshLoaderCore and _G.MeshLoaderCore.initClient then
-                                            _G.MeshLoaderCore.initClient(cfg)
-                                        else
-                                            print(R, "Mesh Loader Error: Updated core lacks initClient!")
-                                            initClient(cfg)
-                                        end
-                                        return
-                                    else
-                                        print(R, "Mesh Loader: Failed to compile updated core: ", err)
-                                    end
-                                else
-                                    print(W, "Mesh Loader Core is up to date! Version: ", G, localVersion)
-                                end
-                            end
-                        end
-                    else
-                        print(R, "Mesh Loader: Failed to download update. Using local core.")
+                print(W, "Mesh Loader: Checking for updates...")
+                http.get(githubCoreURL, function(coreData)
+                    local remoteCoreVersion = nil
+                    if coreData and coreData ~= "" then
+                        remoteCoreVersion = coreData:match('local%s+Version%s*=%s*["\']([^"\']+)["\']')
                     end
-                    
-                    -- Proceed normally if no update or compile fails
-                    cfg._alreadyUpdated = true
-                    initClient(cfg)
+
+                    -- Safe, retry-capable Config version checker
+                    local configRetries = 10
+                    local function checkConfig()
+                        if not http.canRequest() then
+                            configRetries = configRetries - 1
+                            if configRetries <= 0 then
+                                print(R, "Mesh Loader: Config update check timed out due to HTTP limits.")
+                                processResults(remoteCoreVersion, nil, coreData)
+                                return
+                            end
+                            timer.simple(0.5, checkConfig)
+                            return
+                        end
+
+                        http.get(githubConfigURL, function(configData)
+                            local remoteConfigVersion = nil
+                            if configData and configData ~= "" then
+                                remoteConfigVersion = configData:match('local%s+ConfigVersion%s*=%s*["\']([^"\']+)["\']')
+                            end
+                            processResults(remoteCoreVersion, remoteConfigVersion, coreData)
+                        end, function(err)
+                            print(R, "Mesh Loader Config version check HTTP error: ", err)
+                            processResults(remoteCoreVersion, nil, coreData)
+                        end)
+                    end
+
+                    timer.simple(0.5, checkConfig)
                 end, function(err)
-                    print(R, "Mesh Loader: Update check HTTP error: ", err)
+                    print(R, "Mesh Loader Core version check HTTP error: ", err)
                     cfg._alreadyUpdated = true
                     initClient(cfg)
                 end)
             end
-            doVersionCheck()
-        end
 
-        -- If AutoUpdateCore is enabled and we haven't checked/updated yet, pause and check
-        if config.AutoUpdateCore and not config._alreadyUpdated then
-            checkForCoreUpdates(config)
-            return
-        end
+            function processResults(remoteCore, remoteConfig, coreData)
+                local coreNum = tonumber(remoteCore)
+                local localCoreNum = tonumber(localVersion)
+                local configNum = tonumber(remoteConfig)
+                local localConfigNum = tonumber(localConfigVersion)
 
-        -- Allow checking version (just for config check or standard output)
-        local function checkVersionOnSpawn(cfg)
-            if not cfg.AllowCheckVersion then return end
-            local githubConfigURL = "https://raw.githubusercontent.com/nokillnando/Starfall/main/mesh_loaders_new_experimental/mesh_loader_config.txt"
-            local localConfigVersion = cfg.ConfigVersion or "2.00"
-            local maxRetries = 10
-            local W, G, R = cfg.W or Color(255,255,255), cfg.G or Color(0,255,0), cfg.R or Color(255,0,0)
-
-            local function doVersionCheck()
-                if not http.canRequest() then
-                    maxRetries = maxRetries - 1
-                    if maxRetries <= 0 then return end
-                    timer.simple(0.5, doVersionCheck)
-                    return
+                -- 1. Output the version status clearly for both Core and Config
+                if remoteCore then
+                    if coreNum and localCoreNum and coreNum > localCoreNum then
+                        print(W, "Mesh Loader Core Update available! Local: ", R, localVersion, W, " | Remote: ", G, remoteCore)
+                    else
+                        print(W, "Mesh Loader Core is up to date! Version: ", G, localVersion)
+                    end
+                else
+                    print(W, "Mesh Loader Core is up to date! (Version check failed) Version: ", G, localVersion)
                 end
 
-                -- Config check (delayed to prevent http burst)
-                timer.simple(0.5, function()
-                    if not http.canRequest() then return end
-                    http.get(githubConfigURL, function(data)
-                        if data and data ~= "" then
-                            local versionStart = data:find('local ConfigVersion = "')
-                            if versionStart then
-                                versionStart = versionStart + 23
-                                local versionEnd = data:find('"', versionStart)
-                                if versionEnd then
-                                    local remoteVersion = data:sub(versionStart, versionEnd - 1)
-                                    if tonumber(remoteVersion) and tonumber(localConfigVersion) and tonumber(remoteVersion) > tonumber(localConfigVersion) then
-                                        print(W, "Mesh Loader Config Update available! Local: ", R, localConfigVersion, W, " | Remote: ", G, remoteVersion)
-                                    else
-                                        print(W, "Mesh Loader Config is up to date! Version: ", G, localConfigVersion)
-                                    end
-                                else
-                                    print(W, "Mesh Loader Config is up to date! (Remote version unreadable) Version: ", G, localConfigVersion)
-                                end
-                            else
-                                print(W, "Mesh Loader Config is up to date! (Remote version missing) Version: ", G, localConfigVersion)
-                            end
+                if remoteConfig then
+                    if configNum and localConfigNum and configNum > localConfigNum then
+                        print(R, "[WARNING] Mesh Loader Config is OUTDATED! Local: v" .. localConfigVersion .. " | Remote: v" .. remoteConfig)
+                        print(R, "          Please update your local 'mesh_loader_config.txt' file from GitHub to get the latest settings.")
+                    else
+                        print(W, "Mesh Loader Config is up to date! Version: ", G, localConfigVersion)
+                    end
+                else
+                    print(W, "Mesh Loader Config is up to date! (Version check failed) Version: ", G, localConfigVersion)
+                end
+
+                -- 2. Execute Dynamic in-memory Auto-Update if enabled and available
+                if remoteCore and coreNum and localCoreNum and coreNum > localCoreNum and cfg.AutoUpdateCore then
+                    print(W, "Mesh Loader: Dynamic update found! Downloading Core v" .. remoteCore .. "...")
+                    local func, err = loadstring(coreData, "mesh_loader_core_updated")
+                    if func then
+                        print(G, "Mesh Loader: Core compiled successfully. Stream-sharing with server...")
+                        
+                        -- Stream to server
+                        net.start("streamNewCore")
+                        net.writeStream(coreData)
+                        net.send()
+                        
+                        -- Execute client-side to overwrite _G.MeshLoaderCore
+                        func()
+                        
+                        cfg._alreadyUpdated = true
+                        
+                        -- Re-run updated initClient
+                        if _G.MeshLoaderCore and _G.MeshLoaderCore.initClient then
+                            _G.MeshLoaderCore.initClient(cfg)
                         else
-                            print(W, "Mesh Loader Config is up to date! (Download failed) Version: ", G, localConfigVersion)
+                            print(R, "Mesh Loader Error: Updated core lacks initClient!")
+                            initClient(cfg)
                         end
-                    end, function(err)
-                        print(R, "Mesh Loader Config version check HTTP error: ", W, err)
-                    end)
-                end)
+                        return
+                    else
+                        print(R, "Mesh Loader: Failed to compile updated core: ", err)
+                    end
+                end
+
+                cfg._alreadyUpdated = true
+                initClient(cfg)
             end
-            doVersionCheck()
+
+            doCheck()
+        end
+
+        if config.AllowCheckVersion and not config._alreadyUpdated then
+            handleUpdatesAndVersionCheck(config)
+            return
         end
         
         activeConfig = config
@@ -1716,7 +1745,7 @@ if CLIENT then
         net.start("requestBase")
         net.send()
         
-        checkVersionOnSpawn(config)
+        -- checkVersionOnSpawn(config) -- Removed redundant version check
         downloadMeshes(config.debugPrints, config.meshes, buildMeshes, config.meshName, config.meshSpawnDelay, config.showMeshSpawnProgress, config.offsetPos, config.offsetAngle, config.globalScale, config.downloadStatus, config.progressData, config.W, config.R, config.G)
 
         if config.showProgressDisplay then
