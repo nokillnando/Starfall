@@ -4,7 +4,67 @@
 
 local Version = "2.15"
 
---Offset fix??
+--[[
+
+    Changelog:
+V2.15
+    Detail texture support
+    
+V2.12
+    Some fixes
+    Angle locking, for things like brake calipers
+    Dynamic texture swap coloring and alpha
+    Using png/jpeg for downloading to temp files, as a way to bypass default textureurl limits(Afaik up to 60 materials now)      
+    
+V2.11
+    Minor bug fixes
+    
+V2.10
+    Fixing some stuff
+    New parenting stuff so everything can be done in a single chip
+    TextureSwapping, for things like brakes, lights etc
+    It already featured local scale,offsetpos and angling, so just making sure people know
+    This version youll have to update the config file as well
+    
+V2.06
+    What the fuck starfall, fixed some wierd behaviour..
+
+V2.05
+    Proper http request limit for vtf textures, makes it sure to load after it downloads  them
+    Make sure your client http max request is high for faster loading (default 3)
+    
+V2.00
+    HOLY MOTHER OF CHANGES, this thing is now core / config based, easier to maintain and update
+    Support for VTF files, bypasses rendertarget limits, supports alpha based
+    specular masks, but only for vtf files
+    Still on beta, so beware
+    Removed Mirrors, I dont think anyone really used these, if you did
+    contact me, ill try to re-implement it
+    Online Version checker(so you guys can keep it updated)
+    
+V1.98
+    Fixed Flags, finally, never noticied it not actually working as intended
+
+V1.97
+    Minor lil thing, nothing really worth mentioning
+    
+V1.96
+    Fixed a long standing bug where materials sometimes overlaped, example: bumpmap before basetexture, etc
+    It was so simple, yet so stupid to not be noticiable
+    
+V1.95
+    Better prints, progress bar for the owner
+    
+V1.9
+    Big changes, now everything is done in the client instead of the server, dramatically
+    upping the loading speed, might have issues, not fully tested
+    
+V1.83:
+    Initial public beta release
+    Changed a few things, added optional parameters and some explaining
+    
+ ######################################################################################   
+]]--
 
 if CLIENT then
 
@@ -778,6 +838,16 @@ if CLIENT then
                 if v.Flags then
                     for _, f in ipairs(v.Flags) do table.insert(parts, tostring(f)) end
                 end
+                
+                -- Detail parameters
+                table.insert(parts, v.DetailLink or "")
+                table.insert(parts, tostring(v.DetailBlendFactor or 1))
+                table.insert(parts, tostring(v.DetailBlendMode or 0))
+                table.insert(parts, tostring(v.DetailFrame or 0))
+                table.insert(parts, tostring(v.DetailScale or 4))
+                if v.DetailTextureTransform then table.insert(parts, tostring(v.DetailTextureTransform)) end
+                if v.DetailTint then table.insert(parts, tostring(v.DetailTint)) end
+                
                 return table.concat(parts, "|")
             end
             
@@ -789,6 +859,7 @@ if CLIENT then
                 trackTexture(v.BumpMapLink)
                 trackTexture(v.EnvMapLink)
                 trackTexture(v.PhongExponentTexture)
+                trackTexture(v.DetailLink)
                 if v.TextureSwaps then
                     for _, sc in pairs(v.TextureSwaps) do
                         trackTexture(type(sc) == "table" and sc.texture or sc)
@@ -812,6 +883,7 @@ if CLIENT then
                     mat:setUndefined("$bumpmap")
                     mat:setUndefined("$envmapmask")
                     mat:setUndefined("$phongexponenttexture")
+                    mat:setUndefined("$detail")
 
                     if v.EnableHalfLambert then
                         mat:setInt("$flags", 134217728)
@@ -848,6 +920,14 @@ if CLIENT then
                     mat:setVector("$phongtint",v.PhongTint)
                     mat:setFloat("$phongalbedotint",v.PhongAlbedoTint)
                     mat:setFloat("$phongboost", v.PhongBoost)
+                    
+                    -- Detail Parameters
+                    mat:setFloat("$detailblendfactor", v.DetailBlendFactor or 1)
+                    mat:setInt("$detailblendmode", v.DetailBlendMode or 0)
+                    mat:setInt("$detailframe", v.DetailFrame or 0)
+                    mat:setFloat("$detailscale", v.DetailScale or 4)
+                    mat:setMatrix("$detailtexturetransform", v.DetailTextureTransform or Matrix())
+                    mat:setVector("$detailtint", v.DetailTint or Vector(1, 1, 1))
                     mat:setFloat("$phongexponent", v.PhongExp)
                     mat:setVector("$phongfresnelranges", v.PhongFresnelRange)
                     mat:setFloat("$phongalbedoboost", v.PhongAlbedoBoost)
@@ -1009,6 +1089,57 @@ if CLIENT then
                         mat:setTexture("$bumpmap", bump:getTexture("$bumpmap"))
                     else
                         mat:setUndefined("$bumpmap")
+                    end
+                    
+                    -- DETAIL TEXTURE
+                    if v.DetailLink then
+                        if v.DetailLink:lower():find("%.vtf") then
+                            mat:setUndefined("$detail")
+                            queueVtfDownload(v.DetailLink, function(path)
+                                if path then
+                                    mat:setTexture("$detail", path)
+                                else
+                                    mat:setUndefined("$detail")
+                                end
+                            end)
+                        elseif v.DetailLink:sub(1, 4) == "http" then
+                            local isImage = v.DetailLink:lower():find("%.png") or v.DetailLink:lower():find("%.jpg") or v.DetailLink:lower():find("%.jpeg")
+                            if activeConfig.DownloadImages and isImage then
+                                queueImageDownload(v.DetailLink, function(path)
+                                    if path then
+                                        local dummy = material.createFromImage(path, "VertexLitGeneric")
+                                        if dummy then
+                                            mat:setTexture("$detail", dummy:getTexture("$basetexture"))
+                                        else
+                                            mat:setUndefined("$detail")
+                                        end
+                                    else
+                                        mat:setUndefined("$detail")
+                                    end
+                                end)
+                            elseif hasPermission("material.urlcreate", v.DetailLink) then
+                                mat:setTextureURL("$detail", v.DetailLink, function(_, _, w, h, layout)
+                                    if not (w and h) then
+                                        mat:setUndefined("$detail")
+                                        return
+                                    end
+                                    local sx, sy = 1024 / w, 1024 / h
+                                    layout(0, 0, w * sx, h * sy)
+                                end)
+                            else
+                                mat:setUndefined("$detail")
+                            end
+                        else
+                            -- In-game texture path
+                            local dMat = material.load(v.DetailLink)
+                            if dMat then
+                                mat:setTexture("$detail", dMat:getTexture("$basetexture"))
+                            else
+                                mat:setUndefined("$detail")
+                            end
+                        end
+                    else
+                        mat:setUndefined("$detail")
                     end
                     
                     -- BASE TEXTURE
@@ -1404,6 +1535,7 @@ if CLIENT then
                 if v.BumpMapLink then v.BumpMapLink = sanitizeURL(v.BumpMapLink) end
                 if v.EnvMapLink then v.EnvMapLink = sanitizeURL(v.EnvMapLink) end
                 if v.PhongExponentTexture then v.PhongExponentTexture = sanitizeURL(v.PhongExponentTexture) end
+                if v.DetailLink then v.DetailLink = sanitizeURL(v.DetailLink) end
                 
                 if v.TextureSwaps then
                     for swapName, swapData in pairs(v.TextureSwaps) do

@@ -8,6 +8,9 @@ dofile("mesh_loaders_new/mesh_loader_core.txt")
 
     Changelog:
     
+V2.14
+    Detail texture support variables
+    
 V2.12
     Some fixes
     Angle locking, for things like brake calipers
@@ -139,6 +142,13 @@ Now that this has been said, go scroll down
     LowPolyTexture------------------Linear texture filtering, PS1 style
     Color2--------------------------Vector, think of it as a extra color brightness if needed
     SuppressEngineLighting----------Make it fullbright
+    DetailLink----------------------URL or VTF path for the detail texture
+    DetailBlendFactor---------------Float (0-1), how much the detail texture blends in
+    DetailBlendMode-----------------Int (0-12), see valve wiki for blend modes
+    DetailFrame---------------------Int, for animated detail textures
+    DetailScale---------------------Float, tiling scale of the detail texture
+    DetailTextureTransform----------Matrix, for moving/rotating the detail texture
+    DetailTint----------------------Vector, color tint for the detail texture
     offsetPos = Vector(0, 0, 0)-----As name implies
     offsetAngle = Angle(0, 0, 0)----Same as above, both are local-able for each mesh entry    
     Parent = "Wheel_Front_Left"-----Now you can set wheels and more in a single chip, works as a custom parent for each mesh entry
