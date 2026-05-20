@@ -1734,9 +1734,24 @@ if CLIENT then
                                         return t
                                     end
 
+                                    local function parseLocalVar(line)
+                                        local s = line:find("local ", 1, true)
+                                        if s and s < 10 then -- Must be near the start of the line
+                                            local eq = line:find("=", s + 6, true)
+                                            if eq then
+                                                local var = line:sub(s + 6, eq - 1)
+                                                var = var:gsub(" ", ""):gsub("\t", "")
+                                                if var:match("^[%w_]+$") then
+                                                    return var
+                                                end
+                                            end
+                                        end
+                                        return nil
+                                    end
+
                                     local userLines = {}
                                     for _, line in ipairs(getLines(myCode)) do
-                                        local var = string.match(line, "^%s*local%s+([%w_]+)%s*=")
+                                        local var = parseLocalVar(line)
                                         if var and var ~= "meshes" and var ~= "downloadStatus" and var ~= "progressData" then
                                             userLines[var] = line
                                         end
@@ -1744,7 +1759,7 @@ if CLIENT then
                                     
                                     local finalStr = ""
                                     for _, line in ipairs(getLines(configData)) do
-                                        local var = string.match(line, "^%s*local%s+([%w_]+)%s*=")
+                                        local var = parseLocalVar(line)
                                         if var and userLines[var] and var ~= "ConfigVersion" and var ~= "meshes" and var ~= "downloadStatus" and var ~= "progressData" then
                                             finalStr = finalStr .. userLines[var] .. "\n"
                                         else
