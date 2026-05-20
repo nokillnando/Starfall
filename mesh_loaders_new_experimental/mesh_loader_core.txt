@@ -1567,7 +1567,8 @@ if CLIENT then
                 http.get(githubCoreURL, function(coreData)
                     local remoteCoreVersion = nil
                     if coreData and coreData ~= "" then
-                        remoteCoreVersion = coreData:match('local%s+Version%s*=%s*["\']([^"\']+)["\']')
+                        local header = coreData:sub(1, 500)
+                        remoteCoreVersion = header:match('local%s+Version%s*=%s*["\']([^"\']+)["\']')
                     end
 
                     -- Safe, retry-capable Config version checker
@@ -1587,7 +1588,8 @@ if CLIENT then
                         http.get(githubConfigURL, function(configData)
                             local remoteConfigVersion = nil
                             if configData and configData ~= "" then
-                                remoteConfigVersion = configData:match('local%s+ConfigVersion%s*=%s*["\']([^"\']+)["\']')
+                                local header = configData:sub(1, 500)
+                                remoteConfigVersion = header:match('local%s+ConfigVersion%s*=%s*["\']([^"\']+)["\']')
                             end
                             processResults(remoteCoreVersion, remoteConfigVersion, coreData)
                         end, function(err)
