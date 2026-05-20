@@ -1593,12 +1593,11 @@ if CLIENT then
                         http.get(githubConfigURL, function(configData)
                             local remoteConfigVersion = nil
                             if configData and configData ~= "" then
-                                local header = configData:sub(1, 500)
-                                local pos = header:find('ConfigVersion = "', 1, true)
+                                local pos = configData:find('ConfigVersion = "', 1, true)
                                 if pos then
                                     local vs = pos + 17
-                                    local ve = header:find('"', vs, true)
-                                    if ve then remoteConfigVersion = header:sub(vs, ve - 1) end
+                                    local ve = configData:find('"', vs, true)
+                                    if ve then remoteConfigVersion = configData:sub(vs, ve - 1) end
                                 end
                             end
                             processResults(remoteCoreVersion, remoteConfigVersion, coreData)
