@@ -1543,8 +1543,8 @@ if CLIENT then
         
         -- Dynamic Cloud Updater and Version Checker
         local function handleUpdatesAndVersionCheck(cfg)
-            local githubCoreURL = "https://raw.githubusercontent.com/nokillnando/Starfall/main/mesh_loaders_new_experimental/mesh_loader_core.txt?t=" .. tostring(math.Round(timer.curtime()))
-            local githubConfigURL = "https://raw.githubusercontent.com/nokillnando/Starfall/main/mesh_loaders_new_experimental/mesh_loader_config.txt?t=" .. tostring(math.Round(timer.curtime()))
+            local githubCoreURL = "https://raw.githubusercontent.com/nokillnando/Starfall/main/mesh_loaders_new_experimental/mesh_loader_core.txt?t=" .. tostring(math.round(timer.curtime()))
+            local githubConfigURL = "https://raw.githubusercontent.com/nokillnando/Starfall/main/mesh_loaders_new_experimental/mesh_loader_config.txt?t=" .. tostring(math.round(timer.curtime()))
             local localVersion = Version
             local localConfigVersion = cfg.ConfigVersion or "2.00"
             local maxRetries = 10
