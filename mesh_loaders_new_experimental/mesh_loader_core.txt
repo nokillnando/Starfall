@@ -1782,10 +1782,15 @@ if CLIENT then
                                         local userMeshes = myCode:sub(s1, e1 - 1)
                                         finalStr = finalStr:sub(1, remoteS - 1) .. userMeshes .. finalStr:sub(remoteE)
                                         
-                                        file.write("mesh_loader_config_updated.txt", finalStr)
-                                        print(W, "Mesh Loader: We automatically generated a physical file for you with the new template!")
-                                        print(G, "-> Open the Starfall Editor, go to the 'Data' or 'Shared' tab, and open 'mesh_loader_config_updated.txt'")
-                                        print(G, "-> You can view and edit the new variables there, and click 'Save As' to overwrite your original config!")
+                                        if setClipboardText then
+                                            setClipboardText(finalStr)
+                                            print(W, "Mesh Loader: Your config has been perfectly merged with the new template!")
+                                            print(G, "-> The fully updated code (with all your custom meshes and comments) is now on your CLIPBOARD.")
+                                            print(G, "-> Open your config in the Starfall Editor, press CTRL+A, then CTRL+V to paste it and save!")
+                                        else
+                                            file.write("mesh_loader_config_updated.txt", finalStr)
+                                            print(W, "Mesh Loader: Merged config saved to garrysmod/data/sf_filedata/mesh_loader_config_updated.txt")
+                                        end
                                     end
                                 end
                             end
