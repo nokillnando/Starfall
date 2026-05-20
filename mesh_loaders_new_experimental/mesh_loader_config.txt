@@ -7,7 +7,9 @@ dofile("mesh_loaders_new/mesh_loader_core.txt")
 --[[
 
     Changelog:
-    
+V2.15
+	Test    
+
 V2.14
     Detail texture support variables
     
@@ -261,6 +263,7 @@ local AllowCheckVersion = true  -- Set to false to disable online version checki
 local AutoUpdateCore = true     -- Set to true to automatically download and run the latest core from the cloud in-memory
 local UpdateRate = 33           -- Network update frequency (Hz)
 local DownloadImages = true     -- Set to true to bypass texture limits by downloading png/jpg to temp
+local TestShit = true
 
 -- scale parameters can be added optionally for individual meshes, can leave them out if they aren't used
 local meshes = {
