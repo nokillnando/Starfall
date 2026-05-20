@@ -1568,7 +1568,12 @@ if CLIENT then
                     local remoteCoreVersion = nil
                     if coreData and coreData ~= "" then
                         local header = coreData:sub(1, 200)
-                        remoteCoreVersion = header:match('Version%s*=%s*"([%d%.]+)"')
+                        local pos = header:find('Version = "', 1, true)
+                        if pos then
+                            local vs = pos + 11
+                            local ve = header:find('"', vs, true)
+                            if ve then remoteCoreVersion = header:sub(vs, ve - 1) end
+                        end
                     end
 
                     -- Safe, retry-capable Config version checker
@@ -1589,7 +1594,12 @@ if CLIENT then
                             local remoteConfigVersion = nil
                             if configData and configData ~= "" then
                                 local header = configData:sub(1, 500)
-                                remoteConfigVersion = header:match('ConfigVersion%s*=%s*"([%d%.]+)"')
+                                local pos = header:find('ConfigVersion = "', 1, true)
+                                if pos then
+                                    local vs = pos + 17
+                                    local ve = header:find('"', vs, true)
+                                    if ve then remoteConfigVersion = header:sub(vs, ve - 1) end
+                                end
                             end
                             processResults(remoteCoreVersion, remoteConfigVersion, coreData)
                         end, function(err)
