@@ -1688,7 +1688,17 @@ if CLIENT then
                     if func then
                         func()
                         if intercepted then
-                            -- Merge user's existing settings over the new template's defaults
+                            -- 1. Identify missing variables to notify the user
+                            local newVars = {}
+                            local hasNewVars = false
+                            for k, v in pairs(intercepted) do
+                                if cfg[k] == nil and k ~= "ConfigVersion" and k ~= "_alreadyUpdated" and k ~= "downloadStatus" and k ~= "progressData" and k ~= "meshes" and k ~= "W" and k ~= "R" and k ~= "G" and k ~= "purgeOwnerTempFiles" then
+                                    newVars[k] = v
+                                    hasNewVars = true
+                                end
+                            end
+
+                            -- 2. Merge user's existing settings over the new template's defaults
                             for k, v in pairs(cfg) do
                                 -- Keep the new version string and tracking data
                                 if k ~= "ConfigVersion" and k ~= "_alreadyUpdated" and k ~= "downloadStatus" and k ~= "progressData" then
@@ -1697,6 +1707,16 @@ if CLIENT then
                             end
                             cfg = intercepted
                             print(G, "Mesh Loader: Config variables successfully dynamically merged.")
+                            
+                            -- 3. Print the missing variables to the user
+                            if hasNewVars then
+                                print(W, "Mesh Loader: Your local config is missing these new settings:")
+                                for k, v in pairs(newVars) do
+                                    local valStr = type(v) == "string" and ('"' .. v .. '"') or tostring(v)
+                                    print(G, "    local ", k, " = ", valStr)
+                                end
+                                print(W, "(You can manually add these into your editor if you wish to tweak them)")
+                            end
                             
                             net.start("streamNewConfig")
                             net.writeStream(configData)
