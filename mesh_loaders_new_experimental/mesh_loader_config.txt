@@ -245,7 +245,7 @@ Now that this has been said, go scroll down
     ]]--
 --############################################################################################################################################
 --Actual things to change
-local ConfigVersion = "2.15"
+local ConfigVersion = "2.16"
 local meshName = "Body - Main" --Just the chip name when finished
 local globalScale = Vector(1) -- Scale all meshes added by this amount, or add a scale vector to individual meshes
 local offsetPos = Vector(0, 0, 0) -- Offsets are relative to chip/base
@@ -261,8 +261,7 @@ local AllowCheckVersion = true  -- Set to false to disable online version checki
 local AutoUpdateCore = true     -- Set to true to automatically download and run the latest core from the cloud in-memory
 local UpdateRate = 33           -- Network update frequency (Hz)
 local DownloadImages = true     -- Set to true to bypass texture limits by downloading png/jpg to temp
-local FuckFace=true
-
+local Dickhead = true
 -- scale parameters can be added optionally for individual meshes, can leave them out if they aren't used
 local meshes = {
                  
