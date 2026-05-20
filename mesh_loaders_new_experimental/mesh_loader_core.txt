@@ -1719,8 +1719,23 @@ if CLIENT then
                                 end
                                 
                                 if myCode then
+                                    local function getLines(str)
+                                        local t = {}
+                                        local pos = 1
+                                        while true do
+                                            local nl = str:find("\n", pos, true)
+                                            if not nl then
+                                                table.insert(t, str:sub(pos))
+                                                break
+                                            end
+                                            table.insert(t, str:sub(pos, nl - 1))
+                                            pos = nl + 1
+                                        end
+                                        return t
+                                    end
+
                                     local userLines = {}
-                                    for line in string.gmatch(myCode, "[^\r\n]+") do
+                                    for _, line in ipairs(getLines(myCode)) do
                                         local var = string.match(line, "^%s*local%s+([%w_]+)%s*=")
                                         if var and var ~= "meshes" and var ~= "downloadStatus" and var ~= "progressData" then
                                             userLines[var] = line
@@ -1728,7 +1743,7 @@ if CLIENT then
                                     end
                                     
                                     local finalStr = ""
-                                    for line in string.gmatch(configData, "[^\r\n]+") do
+                                    for _, line in ipairs(getLines(configData)) do
                                         local var = string.match(line, "^%s*local%s+([%w_]+)%s*=")
                                         if var and userLines[var] and var ~= "ConfigVersion" and var ~= "meshes" and var ~= "downloadStatus" and var ~= "progressData" then
                                             finalStr = finalStr .. userLines[var] .. "\n"
