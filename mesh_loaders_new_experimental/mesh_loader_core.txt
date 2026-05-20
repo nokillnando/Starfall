@@ -1767,10 +1767,16 @@ if CLIENT then
                                         end
                                     end
                                     
-                                    local s1 = myCode:find("local meshes%s*=%s*{")
-                                    local e1 = myCode:find("%-%-Default config values", s1 or 1)
-                                    local remoteS = finalStr:find("local meshes%s*=%s*{")
-                                    local remoteE = finalStr:find("%-%-Default config values", remoteS or 1)
+                                    local function findMeshesStart(codeStr)
+                                        local s = codeStr:find("local meshes", 1, true)
+                                        if s then return s end
+                                        return nil
+                                    end
+                                    
+                                    local s1 = findMeshesStart(myCode)
+                                    local e1 = myCode:find("--Default config values", s1 or 1, true)
+                                    local remoteS = findMeshesStart(finalStr)
+                                    local remoteE = finalStr:find("--Default config values", remoteS or 1, true)
                                     
                                     if s1 and e1 and remoteS and remoteE then
                                         local userMeshes = myCode:sub(s1, e1 - 1)
