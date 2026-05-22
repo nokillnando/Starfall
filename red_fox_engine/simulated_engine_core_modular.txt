@@ -3,10 +3,13 @@
 
 local Core = {}
 _G.RedFoxEngineCore = Core
-local Version = "3.05" -- v3 Alpha
+local Version = "3.06" -- v3 Alpha
 
 --[[
 Changelog:
+
+V3.06
+    Fix downshifting taking too long, among some other things
 
 V3.04
     Small fix regarding physgun mass for vehicle mass calculation
@@ -335,12 +338,13 @@ if SERVER then
         local function getDriverKeyState(ply)
             local st = s.DriverKeyState[ply]
             if not st then
-                st = { manual = false, sport = false, pressedKeys = {}, downKeys = {} }
+                st = { manual = false, sport = false, pressedKeys = {}, releaseDurations = {}, downKeys = {} }
                 s.DriverKeyState[ply] = st
-            elseif not st.pressedKeys then
-                st.pressedKeys = {}
+            else
+                if not st.pressedKeys then st.pressedKeys = {} end
+                if not st.releaseDurations then st.releaseDurations = {} end
+                if not st.downKeys then st.downKeys = {} end
             end
-            if not st.downKeys then st.downKeys = {} end
             return st
         end
 
@@ -383,9 +387,18 @@ if SERVER then
             local keyName = net.readString()
             if type(keyName) ~= "string" or keyName == "" then return end
 
+            local bytesLeft = (net.bytesLeft and net.bytesLeft()) or (net.getBytesLeft and net.getBytesLeft()) or (net.bitsLeft and math.floor(net.bitsLeft() / 8)) or 0
+            local pressDuration = (bytesLeft >= 4) and net.readFloat() or nil
+
             local st = getDriverKeyState(ply)
-            if st and st.downKeys then
-                st.downKeys[keyName] = false
+            if st then
+                if st.downKeys then
+                    st.downKeys[keyName] = false
+                end
+                if not st.releaseDurations then
+                    st.releaseDurations = {}
+                end
+                st.releaseDurations[keyName] = pressDuration
             end
         end)
 
@@ -1108,6 +1121,7 @@ if SERVER then
                         local reverseCount = math.max(1, #c.ReverseGearRatios)
 
                         if GearChange ~= 0 then
+                            s.LastShiftDirection = nil
                             if s.Gear > 0 then
                                 if s.Gear == 1 and GearChange < 0 and s.SpeedN <= (c.SpeedToReverse or 5) then
                                     s.Gear = -1
@@ -1356,10 +1370,15 @@ if SERVER then
                             local isDownshift = TargetGear < s.Gear
                             
                             -- Anti-Hunt Latch / Cooldown
+                            -- Only enforce DownshiftCooldown if shifting direction has changed.
+                            -- If shifting in the same direction consecutively, we don't need to wait for anti-hunt.
                             local timeSinceShift = timer.systime() - (s.LastShiftTime or 0)
                             local cooldown = c.DownshiftCooldown or 0.35
                             
-                            if timeSinceShift >= cooldown then
+                            local shiftDirection = isUpshift and "up" or "down"
+                            local directionChanged = s.LastShiftDirection and (s.LastShiftDirection ~= shiftDirection)
+                            
+                            if not directionChanged or timeSinceShift >= cooldown then
                                 -- REACTION DELAY LOGIC (Timestamp based for robustness at low tick rates)
                                 -- If we haven't started waiting yet, start now.
                                 if not s.ShiftReactionTime then
@@ -1388,6 +1407,7 @@ if SERVER then
                                     s.Throttle_Delay = 1
                                     s.Clutch_Delay = 1
                                     s.LastShiftTime = timer.systime()
+                                    s.LastShiftDirection = shiftDirection
                                     
                                     -- Post-shift hold time (optional, but good for stability)
                                     -- We reuse ShiftReactionTime to force a delay before *next* shift?
@@ -1543,6 +1563,7 @@ if SERVER then
                 local reverseCount = math.max(1, #c.ReverseGearRatios)
                 if Key_M1 and not s.LastM1 then
                     s.Gear = math.min(s.Gear + 1, #c.Gearbox_Ratios)
+                    s.LastShiftDirection = nil
                     s.Throttle_Delay = 1
                     s.Clutch_Delay = 1
                     timer.remove("Gear_Change")
@@ -1553,6 +1574,7 @@ if SERVER then
                 end
                 if Key_M2 and not s.LastM2 then
                     s.Gear = math.max(s.Gear - 1, -reverseCount)
+                    s.LastShiftDirection = nil
                     s.Throttle_Delay = 1
                     s.Clutch_Delay = 1
                     timer.remove("Gear_Change")
@@ -1567,6 +1589,7 @@ if SERVER then
                 -- Gear Reset (R key) - E2 Parity (line 476: Gearbox_Gear *= !(changed(Key_R) & Key_R))
                 if Key_R and not s.LastR then
                     s.Gear = 0  -- Reset to neutral
+                    s.LastShiftDirection = nil
                 end
                 s.LastR = Key_R
             end
@@ -2209,6 +2232,25 @@ if SERVER then
             end
             
             
+            -- Pre-calculate if any synced addon values have changed (delta check)
+            -- This must be declared and checked before deciding shouldSend to allow low-latency updates
+            local anySyncedChanged = false
+            if c.Addons then
+                for addonName, addon in pairs(c.Addons) do
+                    if addon.Enabled and addon.SyncedState then
+                        for _, fieldName in ipairs(addon.SyncedState) do
+                            local val = addon[fieldName]
+                            local key = addonName .. "." .. fieldName
+                            if val ~= nil and val ~= s.LastSyncedValues[key] then
+                                anySyncedChanged = true
+                                break
+                            end
+                        end
+                    end
+                    if anySyncedChanged then break end
+                end
+            end
+
             -- Networking (Rate Limited to 20ms for high responsiveness)
             -- Also send immediately if an addon requested a forced send (e.g., AddonDisplay set)
             -- OR if any synced addon state has changed (delta-based)
@@ -2236,7 +2278,7 @@ if SERVER then
                     return
                 end
 
-                local bytesLeft = (net.getBytesLeft and net.getBytesLeft()) or math.huge
+                local bytesLeft = (net.bytesLeft and net.bytesLeft()) or (net.getBytesLeft and net.getBytesLeft()) or (net.bitsLeft and math.floor(net.bitsLeft() / 8)) or math.huge
                 if bytesLeft < 1024 then
                     -- leave ample headroom and skip this frame to avoid burst drop with large string payloads
                     return
@@ -2250,7 +2292,6 @@ if SERVER then
                 -- ====== AUTO-SYNC: Addon SyncedState Fields ======
                 -- Automatically marshal addon state variables to clients (delta-based to save bandwidth)
                 -- Addons define: SyncedState = { "FieldName1", "FieldName2" }
-                local anySyncedChanged = false
                 if c.Addons then
                     for addonName, addon in pairs(c.Addons) do
                         if addon.Enabled and addon.SyncedState then
@@ -2258,7 +2299,6 @@ if SERVER then
                                 local val = addon[fieldName]
                                 local key = addonName .. "." .. fieldName
                                 if val ~= nil and val ~= s.LastSyncedValues[key] then
-                                    anySyncedChanged = true
                                     s.LastSyncedValues[key] = val  -- Update last sent value
                                     local fieldType = type(val)
                                     net.writeString(addonName)
@@ -2755,6 +2795,7 @@ if CLIENT then
             end
         end
 
+        local keyPressTimes = {}
         local manualToggled = false
         local sportToggled = false
 
@@ -2782,6 +2823,7 @@ if CLIENT then
 
             for keyName, code in pairs(trackedKeyCodes) do
                 if button == code then
+                    keyPressTimes[keyName] = timer.curtime()
                     net.start("EngineAddonKeyPress")
                     net.writeString(keyName)
                     net.send()
@@ -2798,7 +2840,11 @@ if CLIENT then
                 if button == code then
                     net.start("EngineAddonKeyRelease")
                     net.writeString(keyName)
+                    local pressTime = keyPressTimes[keyName]
+                    local duration = pressTime and (timer.curtime() - pressTime) or 0
+                    net.writeFloat(duration)
                     net.send()
+                    keyPressTimes[keyName] = nil
                     return
                 end
             end

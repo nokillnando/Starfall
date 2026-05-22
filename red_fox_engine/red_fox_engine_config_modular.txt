@@ -8,10 +8,17 @@ dofile("red_fox_engine/simulated_engine_core_modular.txt")
 local Core = _G.RedFoxEngineCore
 
 --Make sure to wire an hud component to see hints
+--[[
+Changelog
+    
+V3.03
+    Fixed key delay(for the most part)  for extrafeatures addon
+    
+]]--
 
 -- Configuration Table
 local config = {
-    ConfigVersion = "3.02",
+    ConfigVersion = "3.03",
     
     -- Engine Specifications
     Engine_Bore = 87,
@@ -111,7 +118,7 @@ local config = {
 
     -- Vehicle Mass Scaling
     Engine_SimulatedVehicleMass = 1000,       -- Virtual vehicle mass in KG used as the mass base
-    Engine_MassRefreshInterval = 1.0,        -- Seconds between mass recalculations
+    Engine_MassRefreshInterval = 20.0,        -- Seconds between mass recalculations
     Engine_MassChangePrintThreshold = 0.1,   -- Minimum mass delta to print mass changes
     Engine_PrintMassChanges = true,          -- Print mass update messages to console
     Engine_MinMassScale = 0.2,               -- Prevent overly low force for heavy vehicles
@@ -230,8 +237,8 @@ config.Addons = {
         
         -- Configuration Defaults
         HeadlightKey = "h",          -- Key to toggle headlights (F)
-        EnableCamera = false,         -- Enable/Disable Camera feature
-        CameraKey = "p",             -- Key to toggle camera (P)
+        EnableCamera = true,         -- Enable/Disable Camera feature
+        CameraKey = "g",             -- Key to toggle camera (P)
         EnableFirstPerson = true,    -- Enable 1st person on hold (false = tap only toggles 3rd person)
         CamThirdPersonValue = 1,     -- CamOn output value for 3rd person mode
         CamFirstPersonValue = 2,     -- CamOn output value for 1st person mode
@@ -345,7 +352,7 @@ config.Addons = {
                         addon.PrintHint(driver, "W/A/S/D to drive | Space for Handbrake")
                         addon.PrintHint(driver, string.upper(addon.HeadlightKey) .. " for headlights (Tap: Low/High | Hold: Off)")
                         if addon.EnableCamera then
-                            addon.PrintHint(driver, string.upper(addon.CameraKey) .. " for camera, tap for 3rd person or off, hold for 1st person")
+                            addon.PrintHint(driver, string.upper(addon.CameraKey) .. " for camera (Tap: 3rd | Hold: 1st)")
                         end
                     end
                 end)
@@ -356,48 +363,61 @@ config.Addons = {
             -- HEADLIGHT INPUT (Tap: Toggle On/Switch | Hold: Turn Off)
             -- ========================================================================
             if keyState then
+                -- Detect new press (either key currently down, or received a press event)
+                local isPressed = keyState.pressedKeys and keyState.pressedKeys[addon.HeadlightKey]
                 local isDown = keyState.downKeys and keyState.downKeys[addon.HeadlightKey]
+                local releaseDuration = keyState.releaseDurations and keyState.releaseDurations[addon.HeadlightKey]
                 
-                -- Detect new press
-                if isDown and not addon.HeadlightKey_IsDown then
+                -- Start press state machine (does NOT toggle instantly on press to prevent flash/mode change during hold)
+                if (isPressed or (isDown and not addon.HeadlightKey_IsDown)) then
                     addon.HeadlightKey_IsDown = true
                     addon.HeadlightKey_PressTime = timer.curtime()
                     addon.HeadlightKey_HoldHandled = false
-                    -- Do nothing on press (waits for release to avoid flash)
+                end
                 
-                -- Detect hold (while down)
-                elseif isDown and addon.HeadlightKey_IsDown then
-                    if not addon.HeadlightKey_HoldHandled and (timer.curtime() - (addon.HeadlightKey_PressTime or 0)) > 0.5 then
-                        -- Hold Action: Turn Off
-                        addon.HeadlightState = 0
-                        addon.PrintHint(driver, "Headlights: OFF (Hold)")
-                        addon.HeadlightKey_HoldHandled = true
-                    end
-                
-                -- Detect release
-                elseif not isDown and addon.HeadlightKey_IsDown then
-                    addon.HeadlightKey_IsDown = false
-                    
-                    -- Release Action: Toggle (if not handled by hold)
-                    if not addon.HeadlightKey_HoldHandled then
-                        if addon.HeadlightState == 0 then
-                            addon.HeadlightState = 1 -- Turn On (Low)
-                            addon.PrintHint(driver, "Headlights: Low Beam")
-                        else
-                            -- Switch High/Low (Off is excluded from toggle cycle)
-                            addon.HeadlightState = (addon.HeadlightState == 1) and 2 or 1
-                            if addon.HeadlightState == 1 then
+                if addon.HeadlightKey_IsDown then
+                    if isDown then
+                        -- Detect hold (while down - fallback / pre-release trigger)
+                        if not addon.HeadlightKey_HoldHandled and (timer.curtime() - (addon.HeadlightKey_PressTime or 0)) > 0.5 then
+                            -- Hold Action: Turn Off
+                            addon.HeadlightState = 0
+                            addon.PrintHint(driver, "Headlights: OFF (Hold)")
+                            addon.HeadlightKey_HoldHandled = true
+                            state.ForceNetNow = true
+                        end
+                    else
+                        -- Detect release (not down anymore)
+                        addon.HeadlightKey_IsDown = false
+                        
+                        -- Release Action: Calculate exact client duration
+                        local duration = releaseDuration or (timer.curtime() - (addon.HeadlightKey_PressTime or 0))
+                        if not addon.HeadlightKey_HoldHandled and duration > 0.5 then
+                            -- Late hold trigger on release
+                            addon.HeadlightState = 0
+                            addon.PrintHint(driver, "Headlights: OFF (Hold)")
+                            addon.HeadlightKey_HoldHandled = true
+                        elseif not addon.HeadlightKey_HoldHandled then
+                            -- Handled as tap: Toggle on release
+                            if addon.HeadlightState == 0 then
+                                addon.HeadlightState = 1 -- Turn On (Low)
                                 addon.PrintHint(driver, "Headlights: Low Beam")
                             else
-                                addon.PrintHint(driver, "Headlights: High Beam")
+                                -- Switch High/Low (Off is excluded from toggle cycle)
+                                addon.HeadlightState = (addon.HeadlightState == 1) and 2 or 1
+                                if addon.HeadlightState == 1 then
+                                    addon.PrintHint(driver, "Headlights: Low Beam")
+                                else
+                                    addon.PrintHint(driver, "Headlights: High Beam")
+                                end
                             end
                         end
-                        addon.HeadlightKey_HoldHandled = true
+                        state.ForceNetNow = true
                     end
                 end
                 
-                -- Clear legacy press state just in case
+                -- Clear legacy press/release states just in case
                 keyState.pressedKeys[addon.HeadlightKey] = nil
+                if keyState.releaseDurations then keyState.releaseDurations[addon.HeadlightKey] = nil end
             end
             
             -- Update Headlight Outputs based on State
@@ -422,45 +442,56 @@ config.Addons = {
             -- CamOn output: 0 = Off, CamThirdPersonValue = 3rd Person, CamFirstPersonValue = 1st Person
             -- ========================================================================
             if addon.EnableCamera and keyState then
+                local isPressed = keyState.pressedKeys and keyState.pressedKeys[addon.CameraKey]
                 local isDown = keyState.downKeys and keyState.downKeys[addon.CameraKey]
+                local releaseDuration = keyState.releaseDurations and keyState.releaseDurations[addon.CameraKey]
                 local val3rd = addon.CamThirdPersonValue or 1
                 local val1st = addon.CamFirstPersonValue or 2
                 
-                -- Detect new press
-                if isDown and not addon.CameraKey_IsDown then
+                -- Start press state machine (does NOT toggle instantly on press to prevent flash/mode change during hold)
+                if (isPressed or (isDown and not addon.CameraKey_IsDown)) then
                     addon.CameraKey_IsDown = true
                     addon.CameraKey_PressTime = timer.curtime()
                     addon.CameraKey_HoldHandled = false
-                
-                -- Detect hold (while held down) - only if 1st person is enabled
-                elseif isDown and addon.CameraKey_IsDown then
-                    if addon.EnableFirstPerson and not addon.CameraKey_HoldHandled and (timer.curtime() - (addon.CameraKey_PressTime or 0)) > 0.4 then
-                        addon.CamOn = val1st
-                        addon.PrintHint(driver, "Camera: 1st Person")
-                        addon.CameraKey_HoldHandled = true
-                        state.ForceNetNow = true
-                    end
-                
-                -- Detect release
-                elseif not isDown and addon.CameraKey_IsDown then
-                    addon.CameraKey_IsDown = false
-                    
-                    if not addon.CameraKey_HoldHandled then
-                        -- Tap Action: Toggle 3rd Person On/Off
-                        if addon.CamOn == 0 then
-                            addon.CamOn = val3rd
-                            addon.PrintHint(driver, "Camera: 3rd Person")
-                        else
-                            addon.CamOn = 0
-                            addon.PrintHint(driver, "Camera: Disabled")
-                        end
-                    end
-                    -- Hold release: 1st person stays active (tap again to turn off)
-                    state.ForceNetNow = true
                 end
                 
-                -- Clear legacy press state
+                if addon.CameraKey_IsDown then
+                    if isDown then
+                        -- Detect hold (while held down - pre-release trigger)
+                        if addon.EnableFirstPerson and not addon.CameraKey_HoldHandled and (timer.curtime() - (addon.CameraKey_PressTime or 0)) > 0.4 then
+                            addon.CamOn = val1st
+                            addon.PrintHint(driver, "Camera: 1st Person")
+                            addon.CameraKey_HoldHandled = true
+                            state.ForceNetNow = true
+                        end
+                    else
+                        -- Detect release (not down anymore)
+                        addon.CameraKey_IsDown = false
+                        
+                        -- Release Action: Calculate exact client duration
+                        local duration = releaseDuration or (timer.curtime() - (addon.CameraKey_PressTime or 0))
+                        if addon.EnableFirstPerson and not addon.CameraKey_HoldHandled and duration > 0.4 then
+                            -- Late hold trigger on release
+                            addon.CamOn = val1st
+                            addon.PrintHint(driver, "Camera: 1st Person")
+                            addon.CameraKey_HoldHandled = true
+                        elseif not addon.CameraKey_HoldHandled then
+                            -- Tap Action: Toggle 3rd Person On/Off on release
+                            if addon.CamOn == 0 then
+                                addon.CamOn = val3rd
+                                addon.PrintHint(driver, "Camera: 3rd Person")
+                            else
+                                addon.CamOn = 0
+                                addon.PrintHint(driver, "Camera: Disabled")
+                            end
+                        end
+                        state.ForceNetNow = true
+                    end
+                end
+                
+                -- Clear legacy press/release states
                 keyState.pressedKeys[addon.CameraKey] = nil
+                if keyState.releaseDurations then keyState.releaseDurations[addon.CameraKey] = nil end
             end
             
             -- Write to Cam wirelink if available (mimics E2 behavior)

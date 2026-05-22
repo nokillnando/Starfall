@@ -2,11 +2,15 @@
 --@author [C17] Red Fox
 --@shared
 
-local Version = "2.15"
+local Version = "2.16"
 
 --[[
 
     Changelog:
+V2.16
+    Fixed parenting bullshit loading not always working for some reason 
+    Fixed texture swap getting delayed as time went on   
+
 V2.15
     Detail texture support
     
@@ -315,6 +319,24 @@ if CLIENT then
     local activeConfig = {}
     local spawnedHolograms = {}
     local networkedEntities = {}
+    local function resolveParent(parentName)
+        if not parentName then return nil end
+        local val = networkedEntities[parentName]
+        if not val then return nil end
+        if type(val) == "table" then
+            if isValid(val.ent) then
+                return val.ent
+            elseif val.idx then
+                local e = entity(val.idx)
+                if isValid(e) then
+                    val.ent = e
+                    return e
+                end
+            end
+            return nil
+        end
+        return isValid(val) and val or nil
+    end
     local fixAnglesHolos = {}
 
     local function getRestingAngle(wheelEnt, fixEnt, fixP, fixY, fixR, invertAxis)
@@ -399,8 +421,8 @@ if CLIENT then
             if not isValid(e.holo) then
                 table.remove(fixAnglesHolos, i)
             else
-                e.parent = (e.parentName and networkedEntities[e.parentName] and isValid(networkedEntities[e.parentName])) and networkedEntities[e.parentName] or base
-                e.fixTarget = (e.fixTargetName ~= "Base" and networkedEntities[e.fixTargetName] and isValid(networkedEntities[e.fixTargetName])) and networkedEntities[e.fixTargetName] or base
+                e.parent = resolveParent(e.parentName) or base
+                e.fixTarget = (e.fixTargetName ~= "Base" and resolveParent(e.fixTargetName)) or base
             end
         end
     end
@@ -408,10 +430,7 @@ if CLIENT then
     local function updateHoloTransforms(holo)
         if not isValid(holo) then return end
         
-        local targetParent = base
-        if holo.MeshTargetParentName and networkedEntities[holo.MeshTargetParentName] and isValid(networkedEntities[holo.MeshTargetParentName]) then
-            targetParent = networkedEntities[holo.MeshTargetParentName]
-        end
+        local targetParent = resolveParent(holo.MeshTargetParentName) or base
         
         local meshOffsetPos = (holo.MeshConfig and holo.MeshConfig.offsetPos) or activeConfig.offsetPos or Vector(0, 0, 0)
         local meshOffsetAng = (holo.MeshConfig and holo.MeshConfig.offsetAngle) or activeConfig.offsetAngle or Angle(0, 0, 0)
@@ -424,10 +443,7 @@ if CLIENT then
             holo:setPos(targetParent:localToWorld(meshOffsetPos))
             
             local fixTargetName = holo.MeshConfig.AngleFixTarget or "Base"
-            local fixTarget = base
-            if fixTargetName ~= "Base" and networkedEntities[fixTargetName] and isValid(networkedEntities[fixTargetName]) then
-                fixTarget = networkedEntities[fixTargetName]
-            end
+            local fixTarget = (fixTargetName ~= "Base" and resolveParent(fixTargetName)) or base
             
             local restingWorldAng = getRestingAngle(targetParent, fixTarget, holo.MeshConfig.FixAngles.pitch, holo.MeshConfig.FixAngles.yaw, holo.MeshConfig.FixAngles.roll, holo.MeshConfig.FixAngles.invert)
             
@@ -488,7 +504,8 @@ if CLIENT then
     net.receive("sendMeshParent", function()
         local parentName = net.readString()
         local ent = net.readEntity()
-        networkedEntities[parentName] = ent
+        local entIdx = net.readUInt(16)
+        networkedEntities[parentName] = { ent = ent, idx = entIdx }
         
         for i, holo in ipairs(spawnedHolograms) do
             if isValid(holo) and holo.MeshTargetParentName == parentName then
@@ -737,7 +754,7 @@ if CLIENT then
                     local allResolved = true
                     for _, holo in ipairs(spawnedHolograms) do
                         if isValid(holo) and holo.MeshTargetParentName then
-                            local expectedParent = networkedEntities[holo.MeshTargetParentName]
+                            local expectedParent = resolveParent(holo.MeshTargetParentName)
                             if expectedParent and isValid(expectedParent) then
                                 local currentParent = holo:getParent()
                                 if currentParent ~= expectedParent then
@@ -755,6 +772,32 @@ if CLIENT then
                     
                     if allResolved and reconcileAttempts >= 5 then
                         timer.remove("meshParentReconcile")
+                    end
+                end)
+                
+                -- Continuous local parent checker to handle PVS / dormancy / late join issues
+                -- Runs indefinitely with zero network overhead
+                timer.create("meshLocalParentReconcile", 2, 0, function()
+                    if not isValid(chip()) then timer.remove("meshLocalParentReconcile") return end
+                    
+                    -- Refresh refs for any active FixAngles holograms
+                    refreshFixAnglesRefs()
+                    
+                    -- Reconcile normal holograms whose parents don't match the expected parent
+                    for _, holo in ipairs(spawnedHolograms) do
+                        if isValid(holo) and holo.MeshTargetParentName and not (holo.MeshConfig and holo.MeshConfig.FixAngles) then
+                            local expectedParent = resolveParent(holo.MeshTargetParentName)
+                            if expectedParent and isValid(expectedParent) then
+                                local currentParent = holo:getParent()
+                                if currentParent ~= expectedParent then
+                                    holo:setParent(expectedParent)
+                                    local meshOffsetPos = (holo.MeshConfig and holo.MeshConfig.offsetPos) or activeConfig.offsetPos or offsetPos
+                                    local meshOffsetAng = (holo.MeshConfig and holo.MeshConfig.offsetAngle) or activeConfig.offsetAngle or offsetAngle
+                                    holo:setPos(expectedParent:localToWorld(meshOffsetPos))
+                                    holo:setAngles(expectedParent:localToWorldAngles(meshOffsetAng))
+                                end
+                            end
+                        end
                     end
                 end)
             end
@@ -956,13 +999,14 @@ if CLIENT then
                                 isInitialSpawn = false
                             end
                         end
-                        timer.simple(1, setCubeMap)
+                        pcall(timer.simple, 1, setCubeMap)
                         local function updateCubemap()
                             if not isValid(chip()) then return end
+                            if not isValid(owner()) then return end
                             setCubeMap()
-                            timer.simple(cubemapUpdateInterval, updateCubemap)
+                            pcall(timer.simple, cubemapUpdateInterval, updateCubemap)
                         end
-                        timer.simple(cubemapUpdateInterval, updateCubemap)
+                        pcall(timer.simple, cubemapUpdateInterval, updateCubemap)
                     end
 
                                         -- ENV MAP MASK
@@ -1762,6 +1806,7 @@ else -- SERVER
                 net.start("sendMeshParent")
                 net.writeString(parentName)
                 net.writeEntity(parentEnt)
+                net.writeUInt(parentEnt:entIndex(), 16)
                 net.send(ply)
             end
         end
@@ -1783,7 +1828,7 @@ else -- SERVER
         
         nextMonitor = now + serverUpdateRate
 
-        if net.getBytesLeft() < 512 then return end
+        if net.getBytesLeft() < 64 then return end
 
         local currentBase = wire.ports.Base
         if currentBase ~= lastBase then
@@ -1794,22 +1839,38 @@ else -- SERVER
         end
         
         for _, parentName in ipairs(trackedParentEntities) do
-            if net.getBytesLeft() < 256 then break end
+            if net.getBytesLeft() < 64 then break end
             local currentEnt = wire.ports[parentName]
             if currentEnt ~= lastParentEntities[parentName] then
                 lastParentEntities[parentName] = currentEnt
                 
+                local entToSend = isValid(currentEnt) and currentEnt or chip()
                 net.start("sendMeshParent")
                 net.writeString(parentName)
-                net.writeEntity(isValid(currentEnt) and currentEnt or chip())
+                net.writeEntity(entToSend)
+                net.writeUInt(entToSend:entIndex(), 16)
                 net.send(find.allPlayers())
             end
         end
         
         for _, inputName in ipairs(trackedNormalInputs) do
-            if net.getBytesLeft() < 256 then break end
+            if net.getBytesLeft() < 64 then break end
             local currentVal = wire.ports[inputName] or 0
-            if currentVal ~= lastNormalInputs[inputName] then
+            local lastVal = lastNormalInputs[inputName] or 0
+            
+            local shouldUpdate = false
+            if currentVal ~= lastVal then
+                local currentIsInt = math.abs(currentVal - math.floor(currentVal + 0.5)) < 0.0001
+                local lastIsInt = math.abs(lastVal - math.floor(lastVal + 0.5)) < 0.0001
+                
+                if currentIsInt or lastIsInt then
+                    shouldUpdate = true
+                elseif math.abs(currentVal - lastVal) >= 0.01 then
+                    shouldUpdate = true
+                end
+            end
+            
+            if shouldUpdate then
                 lastNormalInputs[inputName] = currentVal
                 
                 net.start("sendMeshSwap")
