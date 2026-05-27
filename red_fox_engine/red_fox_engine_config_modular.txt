@@ -16,6 +16,8 @@ V3.03
     
 ]]--
 
+--Make sure to wire an hud component to see hints
+
 -- Configuration Table
 local config = {
     ConfigVersion = "3.03",

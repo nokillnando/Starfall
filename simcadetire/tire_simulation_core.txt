@@ -2,7 +2,15 @@
 --@author [C17] Red Fox
 --@shared
 
-local Version = "1.14"
+local Version = "1.15"
+
+--[[
+Changelog
+    
+V1.15
+    Fixed stupid constraint retrieval lag    
+
+]]--
 
 if CLIENT then
     
@@ -435,73 +443,227 @@ else -- SERVER
             return added
         end
 
-        local function performUnifiedVehicleScan(Base)
-            if not Base then return 0, 0, 0 end
+        -- Time-Sliced BFS Scanner State
+        local TireScan = {
+            Active = false,
+            Queue = {},
+            Seen = {},
+            Result = {}
+        }
+
+        local function performUnifiedVehicleScan(Base, isInitial)
+            if not isValid(Base) then return 0, 0, 0 end
 
             local previousMass = TotalRealMass
-            
-            -- 1. Gather all constrained entities (The heavy part)
-            local tree = Base:getAllConstrained()
-            local fullTree = {Base}
-            for i=1, #tree do fullTree[#fullTree+1] = tree[i] end
-            
-            -- 2. Process Extra Filters (Static and Semi-Dynamic)
-            local extraStatic = wire.ports.ExtraFilterStatic
-            if extraStatic and #extraStatic > 0 then
-                for _, ent in ipairs(extraStatic) do
-                    if isValid(ent) then
-                        fullTree[#fullTree+1] = ent
-                        local sub = ent:getAllConstrained()
-                        for j=1, #sub do fullTree[#fullTree+1] = sub[j] end
-                    end
-                end
-            end
-            
-            local extraSemi = wire.ports.ExtraFilterSemiDynamic
-            if extraSemi and #extraSemi > 0 then
-                for _, ent in ipairs(extraSemi) do
-                    if isValid(ent) then
-                        fullTree[#fullTree+1] = ent
-                        local sub = ent:getAllConstrained()
-                        for j=1, #sub do fullTree[#fullTree+1] = sub[j] end
-                    end
-                end
-            end
+            local previousFilterCount = lastReportedFilterCount or 0
 
-            -- 3. Rebuild Filter and Recalculate Mass from the unified list
-            VehicleFilter = {}
-            CheckedEntities = {}
-            local currentMass = 0
-            local massChecked = {}
-            
-            for i=1, #fullTree do
-                local ent = fullTree[i]
-                if isValid(ent) then
-                    -- Update Filter
-                    if not CheckedEntities[ent] then
-                        CheckedEntities[ent] = true
-                        VehicleFilter[#VehicleFilter+1] = ent
-                    end
-                    -- Update Mass
-                    if not massChecked[ent] then
-                        massChecked[ent] = true
-                        local phys = ent:getPhysicsObject()
-                        if isValid(phys) then
-                            currentMass = currentMass + phys:getMass()
+            if isInitial then
+                -- INITIAL SCAN: Synchronous, fast Lua BFS using constraint.getTable
+                -- This runs exactly once on startup to ensure instant filter setup.
+                local fullTree = { Base }
+                local seen = { [Base] = true }
+                local queue = { Base }
+
+                -- Seed extra filters
+                local extraStatic = wire.ports.ExtraFilterStatic
+                if extraStatic and #extraStatic > 0 then
+                    for _, ent in ipairs(extraStatic) do
+                        if isValid(ent) and not seen[ent] then
+                            seen[ent] = true
+                            fullTree[#fullTree+1] = ent
+                            queue[#queue+1] = ent
                         end
                     end
                 end
+
+                local extraSemi = wire.ports.ExtraFilterSemiDynamic
+                if extraSemi and #extraSemi > 0 then
+                    for _, ent in ipairs(extraSemi) do
+                        if isValid(ent) and not seen[ent] then
+                            seen[ent] = true
+                            fullTree[#fullTree+1] = ent
+                            queue[#queue+1] = ent
+                        end
+                    end
+                end
+
+                while #queue > 0 do
+                    local current = table.remove(queue, 1)
+                    if isValid(current) then
+                        local constraints = constraint.getTable(current)
+                        if constraints then
+                            for i = 1, #constraints do
+                                local c = constraints[i]
+                                local other = (c.Ent1 == current) and c.Ent2 or c.Ent1
+                                if isValid(other) and not seen[other] then
+                                    seen[other] = true
+                                    fullTree[#fullTree+1] = other
+                                    queue[#queue+1] = other
+                                end
+                            end
+                        end
+                    end
+                end
+
+                -- Rebuild filter and calculate mass
+                VehicleFilter = {}
+                CheckedEntities = {}
+                local currentMass = 0
+                local massChecked = {}
+
+                for i = 1, #fullTree do
+                    local ent = fullTree[i]
+                    if isValid(ent) then
+                        if not CheckedEntities[ent] then
+                            CheckedEntities[ent] = true
+                            VehicleFilter[#VehicleFilter+1] = ent
+                        end
+                        if not massChecked[ent] then
+                            massChecked[ent] = true
+                            local phys = ent:getPhysicsObject()
+                            if isValid(phys) then
+                                currentMass = currentMass + phys:getMass()
+                            end
+                        end
+                    end
+                end
+
+                -- Physgun spike protection
+                if currentMass > ((previousMass and previousMass > 0) and previousMass + 10000 or Config.TotalVehicleMass + 10000) then
+                    currentMass = (previousMass and previousMass > 0) and previousMass or Config.TotalVehicleMass
+                end
+                
+                TotalRealMass = currentMass
+                lastReportedFilterCount = #VehicleFilter
+
+                return #VehicleFilter, currentMass, previousMass
+            else
+                -- SUBSEQUENT SCANS: Asynchronous background BFS (Time-Sliced)
+                if TireScan.Active then return previousFilterCount, previousMass, previousMass end
+
+                TireScan.Active = true
+                TireScan.Queue = { Base }
+                TireScan.Seen = { [Base] = true }
+                TireScan.Result = {}
+
+                -- Seed extra filters
+                local extraStatic = wire.ports.ExtraFilterStatic
+                if extraStatic and #extraStatic > 0 then
+                    for _, ent in ipairs(extraStatic) do
+                        if isValid(ent) and not TireScan.Seen[ent] then
+                            TireScan.Seen[ent] = true
+                            table.insert(TireScan.Queue, ent)
+                        end
+                    end
+                end
+
+                local extraSemi = wire.ports.ExtraFilterSemiDynamic
+                if extraSemi and #extraSemi > 0 then
+                    for _, ent in ipairs(extraSemi) do
+                        if isValid(ent) and not TireScan.Seen[ent] then
+                            TireScan.Seen[ent] = true
+                            table.insert(TireScan.Queue, ent)
+                        end
+                    end
+                end
+
+                return previousFilterCount, previousMass, previousMass
+            end
+        end
+
+        local function tickTireScanner()
+            if not TireScan.Active then return end
+
+            local processed = 0
+            local queue = TireScan.Queue
+            local seen = TireScan.Seen
+            local result = TireScan.Result
+
+            while #queue > 0 and processed < 6 do
+                local current = table.remove(queue, 1)
+                if isValid(current) then
+                    table.insert(result, current)
+                    local constraints = constraint.getTable(current)
+                    if constraints then
+                        for i = 1, #constraints do
+                            local c = constraints[i]
+                            local other = (c.Ent1 == current) and c.Ent2 or c.Ent1
+                            if isValid(other) and not seen[other] then
+                                seen[other] = true
+                                table.insert(queue, other)
+                            end
+                        end
+                    end
+                end
+                processed = processed + 1
             end
 
-            -- [SPIKE FILTER] Silently ignore impossible mass spikes caused by Physgun (often adds 50,000kg)
-            if currentMass > ((previousMass and previousMass > 0) and previousMass + 10000 or Config.TotalVehicleMass + 10000) then
-                currentMass = (previousMass and previousMass > 0) and previousMass or Config.TotalVehicleMass
-            end
-            
-            TotalRealMass = currentMass
-            local filterCount = #VehicleFilter
+            -- Completed background scan!
+            if #queue == 0 then
+                TireScan.Active = false
 
-            return filterCount, currentMass, previousMass
+                local previousFilterCount = lastReportedFilterCount or 0
+                local previousMass = TotalRealMass
+
+                VehicleFilter = {}
+                CheckedEntities = {}
+                local currentMass = 0
+                local massChecked = {}
+
+                for i = 1, #result do
+                    local ent = result[i]
+                    if isValid(ent) then
+                        if not CheckedEntities[ent] then
+                            CheckedEntities[ent] = true
+                            VehicleFilter[#VehicleFilter+1] = ent
+                        end
+                        if not massChecked[ent] then
+                            massChecked[ent] = true
+                            local phys = ent:getPhysicsObject()
+                            if isValid(phys) then
+                                currentMass = currentMass + phys:getMass()
+                            end
+                        end
+                    end
+                end
+
+                -- Spike filter (Physgun protection)
+                if currentMass > ((previousMass and previousMass > 0) and previousMass + 10000 or Config.TotalVehicleMass + 10000) then
+                    currentMass = (previousMass and previousMass > 0) and previousMass or Config.TotalVehicleMass
+                end
+
+                TotalRealMass = currentMass
+                local filterCount = #VehicleFilter
+
+                local massChanged = math.abs(currentMass - (previousMass or 0)) > 0.1
+                local filterChanged = filterCount ~= previousFilterCount
+
+                if Config.AllowPrintFilter and filterChanged then
+                    print("[TireSim] Vehicle filter rebuilt with " .. filterCount .. " entities.")
+                end
+                if Config.AllowPrintMassRefresh and (massChanged or filterChanged) then
+                    local prevMassText = (previousMass and previousMass >= 0) and formatMass(previousMass) or "?"
+                    print(
+                        Config.W,
+                        "[TireSim] Refresh update: filter ",
+                        Config.G,
+                        tostring(previousFilterCount),
+                        Config.W,
+                        " -> ",
+                        Config.G,
+                        tostring(filterCount),
+                        Config.W,
+                        " | real mass ",
+                        Config.G,
+                        prevMassText .. "kg",
+                        Config.W,
+                        " -> ",
+                        Config.G,
+                        formatMass(currentMass) .. "kg"
+                    )
+                end
+                lastReportedFilterCount = filterCount
+            end
         end
     
         local function updateSemiDynamicFilter()
@@ -594,7 +756,7 @@ else -- SERVER
                 TrackWidth = 0
             end
             
-            performUnifiedVehicleScan(Base)
+            performUnifiedVehicleScan(Base, true)
             lastReportedFilterCount = #VehicleFilter
             
             print(Config.W, "[TireSim] Initialized with ", Config.G, NumWheels, Config.W, " wheels. Simcade Version " .. Version)
@@ -605,37 +767,7 @@ else -- SERVER
             local Base = getValidBase()
             if not Base then return end
 
-            local previousFilterCount = lastReportedFilterCount
-            local filterCount, currentMass, previousMass = performUnifiedVehicleScan(Base)
-            
-            local massChanged = math.abs(currentMass - (previousMass or 0)) > 0.1
-            local filterChanged = filterCount ~= previousFilterCount
-
-            if Config.AllowPrintFilter and filterChanged then
-                print("[TireSim] Vehicle filter rebuilt with " .. filterCount .. " entities.")
-            end
-            if Config.AllowPrintMassRefresh and (massChanged or filterChanged) then
-                local prevMassText = (previousMass and previousMass >= 0) and formatMass(previousMass) or "?"
-                print(
-                    Config.W,
-                    "[TireSim] Refresh update: filter ",
-                    Config.G,
-                    tostring(previousFilterCount),
-                    Config.W,
-                    " -> ",
-                    Config.G,
-                    tostring(filterCount),
-                    Config.W,
-                    " | real mass ",
-                    Config.G,
-                    prevMassText .. "kg",
-                    Config.W,
-                    " -> ",
-                    Config.G,
-                    formatMass(currentMass) .. "kg"
-                )
-            end
-            lastReportedFilterCount = filterCount
+            performUnifiedVehicleScan(Base, false)
         end)
         
         wire.onInputsChanged = function(changed)
@@ -644,8 +776,7 @@ else -- SERVER
             elseif changed.ExtraFilterSemiDynamic then
                 local Base = getValidBase()
                 if Base then
-                    local filterCount = performUnifiedVehicleScan(Base)
-                    lastReportedFilterCount = filterCount
+                    performUnifiedVehicleScan(Base, false)
                 end
             end
         end
@@ -681,6 +812,7 @@ else -- SERVER
             local basePhys = Base:getPhysicsObject()
             if not basePhys or not basePhys:isValid() then return end
             
+            tickTireScanner()
             thinkCounter = thinkCounter + 1
     
             -- [MONITORING] CPU Usage

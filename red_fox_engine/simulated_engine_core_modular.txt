@@ -3,10 +3,13 @@
 
 local Core = {}
 _G.RedFoxEngineCore = Core
-local Version = "3.06" -- v3 Alpha
+local Version = "3.07" -- v3 Alpha
 
 --[[
 Changelog:
+
+V3.07
+    Fixed stupid constraint retrieval lag
 
 V3.06
     Fix downshifting taking too long, among some other things
@@ -239,98 +242,134 @@ if SERVER then
             return nil
         end
 
-        local function calculateVehicleMass(chassis)
-            if not isValid(chassis) then return nil end
-            
-            local mass = 0
-            local seen = {}
-            local allConstrained = chassis:getAllConstrained()
-            
-            -- Ensure we count the chassis itself
-            local ents = allConstrained or {}
-            table.insert(ents, chassis)
-            
-            for i = 1, #ents do
-                local ent = ents[i]
-                if isValid(ent) and not seen[ent] then
-                    seen[ent] = true
-                    local phys = getPhys(ent)
-                    if isValid(phys) then
-                        mass = mass + phys:getMass()
-                    end
-                end
-            end
-            
-            return mass
-        end
-
         local function getEffectiveVehicleMass(state, config, chassis)
             if not isValid(chassis) then
                 return config.Engine_SimulatedVehicleMass or 1000
             end
+
+            -- Initialize state variables if not present
+            if state.MassScanActive == nil then
+                state.MassScanActive = false
+                state.MassScanQueue = {}
+                state.MassScanSeen = {}
+                state.MassScanResult = {}
+            end
+
+            -- Trigger next background scan if time has come or chassis changed
             local nextCheck = state.NextMassCheck or 0
-            if state.MassCacheChassis ~= chassis or timer.curtime() >= nextCheck then
-                local previousActual = state.ActualVehicleMass
-                local previousSimulated = state.SimulatedVehicleMass
-                local previousEffective = state.EffectiveVehicleMass
-                local actualMass = calculateVehicleMass(chassis) or config.Engine_SimulatedVehicleMass or 1000
-                
-                -- [SPIKE FILTER] Silently ignore impossible mass spikes caused by Physgun (often adds 50,000kg)
-                if actualMass > ((previousActual and previousActual > 0) and previousActual + 10000 or (config.Engine_SimulatedVehicleMass or 1000) + 10000) then
-                    actualMass = (previousActual and previousActual > 0) and previousActual or config.Engine_SimulatedVehicleMass or 1000
-                end
-                local simulatedMass = config.Engine_SimulatedVehicleMass or 1000
-                local effectiveMass = simulatedMass
-
+            if not state.MassScanActive and (state.MassCacheChassis ~= chassis or timer.curtime() >= nextCheck) then
                 state.MassCacheChassis = chassis
-                state.ActualVehicleMass = actualMass
-                state.SimulatedVehicleMass = simulatedMass
-                state.EffectiveVehicleMass = effectiveMass
-                state.NextMassCheck = timer.curtime() + (config.Engine_MassRefreshInterval or 1.0)
+                state.MassScanActive = true
+                state.MassScanQueue = { chassis }
+                state.MassScanSeen = { [chassis] = true }
+                state.MassScanResult = {}
+            end
 
-                if config.Engine_PrintMassChanges then
-                    local threshold = config.Engine_MassChangePrintThreshold or 0.1
-                    local actualDelta = previousActual and math.abs(actualMass - previousActual) or nil
-                    local simulatedDelta = previousSimulated and math.abs(simulatedMass - previousSimulated) or nil
-                    local effectiveDelta = previousEffective and math.abs(effectiveMass - previousEffective) or nil
-                    local shouldPrint = not previousEffective or
-                        (effectiveDelta and effectiveDelta > threshold) or
-                        (actualDelta and actualDelta > threshold) or
-                        (simulatedDelta and simulatedDelta > threshold)
-
-                    if shouldPrint then
-                        local ownerPlayer = owner()
-                        local function sendMessage(text)
-                            print(text)
-                            if SERVER and isValid(ownerPlayer) and ownerPlayer:isPlayer() then
-                                pcall(printHud, ownerPlayer, text)
-                            elseif player() == owner() then
-                                pcall(printHud, text)
+            -- Tick the background time-sliced scanner (process 5 entities per tick)
+            if state.MassScanActive then
+                local processed = 0
+                local queue = state.MassScanQueue
+                local seen = state.MassScanSeen
+                local result = state.MassScanResult
+                
+                while #queue > 0 and processed < 5 do
+                    local current = table.remove(queue, 1)
+                    if isValid(current) then
+                        table.insert(result, current)
+                        local constraints = constraint.getTable(current)
+                        if constraints then
+                            for i = 1, #constraints do
+                                local c = constraints[i]
+                                local other = (c.Ent1 == current) and c.Ent2 or c.Ent1
+                                if isValid(other) and not seen[other] then
+                                    seen[other] = true
+                                    table.insert(queue, other)
+                                end
                             end
                         end
+                    end
+                    processed = processed + 1
+                end
 
-                        local massMsg = string.format("[RedFoxEngine] Total Physical Mass detected: %.1fkg (Config Virtual: %.1fkg)", actualMass, simulatedMass)
-                        sendMessage(massMsg)
+                -- Scan completed!
+                if #queue == 0 then
+                    state.MassScanActive = false
+                    state.NextMassCheck = timer.curtime() + (config.Engine_MassRefreshInterval or 20.0)
 
-                        if previousEffective then
-                            local changes = {}
-                            if actualDelta and actualDelta > threshold then
-                                table.insert(changes, string.format("real mass %.1fkg -> %.1fkg", previousActual, actualMass))
+                    -- Recalculate mass from result
+                    local mass = 0
+                    for i = 1, #result do
+                        local ent = result[i]
+                        if isValid(ent) then
+                            local phys = getPhys(ent)
+                            if isValid(phys) then
+                                mass = mass + phys:getMass()
                             end
-                            if simulatedDelta and simulatedDelta > threshold then
-                                table.insert(changes, string.format("config virtual %.1fkg -> %.1fkg", previousSimulated, simulatedMass))
+                        end
+                    end
+
+                    local previousActual = state.ActualVehicleMass
+                    local previousSimulated = state.SimulatedVehicleMass
+                    local previousEffective = state.EffectiveVehicleMass
+                    local actualMass = mass
+
+                    -- Spike Filter ( Physgun protection )
+                    if actualMass > ((previousActual and previousActual > 0) and previousActual + 10000 or (config.Engine_SimulatedVehicleMass or 1000) + 10000) then
+                        actualMass = (previousActual and previousActual > 0) and previousActual or config.Engine_SimulatedVehicleMass or 1000
+                    end
+                    local simulatedMass = config.Engine_SimulatedVehicleMass or 1000
+                    local effectiveMass = simulatedMass
+
+                    state.ActualVehicleMass = actualMass
+                    state.SimulatedVehicleMass = simulatedMass
+                    state.EffectiveVehicleMass = effectiveMass
+
+                    -- Logging mass refreshes
+                    if config.Engine_PrintMassChanges then
+                        local threshold = config.Engine_MassChangePrintThreshold or 0.1
+                        local actualDelta = previousActual and math.abs(actualMass - previousActual) or nil
+                        local simulatedDelta = previousSimulated and math.abs(simulatedMass - previousSimulated) or nil
+                        local effectiveDelta = previousEffective and math.abs(effectiveMass - previousEffective) or nil
+                        local shouldPrint = not previousEffective or
+                            (effectiveDelta and effectiveDelta > threshold) or
+                            (actualDelta and actualDelta > threshold) or
+                            (simulatedDelta and simulatedDelta > threshold)
+
+                        if shouldPrint then
+                            local ownerPlayer = owner()
+                            local function sendMessage(text)
+                                print(text)
+                                if SERVER and isValid(ownerPlayer) and ownerPlayer:isPlayer() then
+                                    pcall(printHud, ownerPlayer, text)
+                                elseif player() == owner() then
+                                    pcall(printHud, text)
+                                end
                             end
-                            if effectiveDelta and effectiveDelta > threshold then
-                                table.insert(changes, string.format("effective mass %.1fkg -> %.1fkg", previousEffective, effectiveMass))
-                            end
-                            if #changes > 0 then
-                                sendMessage("[RedFoxEngine] Refresh update: " .. table.concat(changes, " | "))
+
+                            local massMsg = string.format("[RedFoxEngine] Total Physical Mass detected: %.1fkg (Config Virtual: %.1fkg)", actualMass, simulatedMass)
+                            sendMessage(massMsg)
+
+                            if previousEffective then
+                                local changes = {}
+                                if actualDelta and actualDelta > threshold then
+                                    table.insert(changes, string.format("real mass %.1fkg -> %.1fkg", previousActual, actualMass))
+                                end
+                                if simulatedDelta and simulatedDelta > threshold then
+                                    table.insert(changes, string.format("config virtual %.1fkg -> %.1fkg", previousSimulated, simulatedMass))
+                                end
+                                if effectiveDelta and effectiveDelta > threshold then
+                                    table.insert(changes, string.format("effective mass %.1fkg -> %.1fkg", previousEffective, effectiveMass))
+                                end
+                                if #changes > 0 then
+                                    sendMessage("[RedFoxEngine] Refresh update: " .. table.concat(changes, " | "))
+                                end
                             end
                         end
                     end
                 end
             end
-            return state.EffectiveVehicleMass or config.Engine_SimulatedVehicleMass
+
+            return state.EffectiveVehicleMass or config.Engine_SimulatedVehicleMass or 1000
         end
 
         -- Driver key state tracking (networked from client)
