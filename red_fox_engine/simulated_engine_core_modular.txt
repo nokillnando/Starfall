@@ -3,10 +3,12 @@
 
 local Core = {}
 _G.RedFoxEngineCore = Core
-local Version = "3.07" -- v3 Alpha
+local Version = "3.08" -- v3 Alpha
 
 --[[
 Changelog:
+V3.08
+    Fixed minor issue with gear when using handbrake
 
 V3.07
     Fixed stupid constraint retrieval lag
@@ -1342,7 +1344,14 @@ if SERVER then
                         
                         -- 2. Calculate Current State (Wheel Based)
                         local WheelRPM = s.Flywheel_RPM or 0
-                        local TransmissionShaftRPM = WheelRPM * c.Gearbox_FinalDrive
+                        local GroundSpeed = math.abs(s.SpeedN or 0)
+                        local SpeedScale = c.SpeedScale or 1
+                        local UnscaledGroundSpeed = GroundSpeed / SpeedScale
+                        local RPMToSpeed = c.WheelRPMToSpeed or (c.ABS and c.ABS.WheelRPMToSpeed) or 0.15
+                        
+                        -- Floor WheelRPM using unscaled ground speed to prevent money-shifting/downshifting to 1st when wheels lock up (handbrake/braking)
+                        local EffectiveWheelRPM = math.max(math.abs(WheelRPM), UnscaledGroundSpeed / RPMToSpeed)
+                        local TransmissionShaftRPM = EffectiveWheelRPM * c.Gearbox_FinalDrive
                         
                         -- Current Projected Engine RPM
                         local CurrentGearRatio = c.Gearbox_Ratios[CurrentGearIndex] or 1
