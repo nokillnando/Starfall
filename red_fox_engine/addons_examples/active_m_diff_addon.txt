@@ -1,0 +1,346 @@
+-- Red Fox Engine Addon: Active M Differential Control
+-- Implements BMW-style Active/Variable M Differential locks independently on Front and Rear axles.
+-- Dynamically adjusts locking stiffness and locking torque capacity in real-time
+-- based on throttle, wheel slip, steering angle, and vehicle speed.
+-- Provides independent per-axle tuning configs and real-time wire outputs.
+
+return {
+    ActiveMDiff = {
+        Enabled = true, -- Set to true to enable this addon (overridden by config)
+
+        -- Active Diff Lock Types (1 = Viscous LSD, 2 = Hard Welded Lock)
+        FrontActiveType = 1,
+        RearActiveType = 1,
+
+        -- Target Axle Enable Toggles
+        TargetFrontAxle = false,   -- Apply active locking to front axle differential
+        TargetRearAxle = true,     -- Apply active locking to rear axle differential (BMW M style)
+        TargetFrontCenter = false, -- Apply active locking to front-center differential coupling
+        TargetRearCenter = false,  -- Apply active locking to rear-center differential coupling
+
+        -- Front Axle Active Parameters (Tuning)
+        FrontMinStiffness = 1.0,     -- Lock stiffness when open/cruising (1.0 = open/very soft)
+        FrontMaxStiffness = 30.0,    -- Max locking stiffness under load (30.0 = hard welded lock)
+        FrontMinLockRatio = 10,      -- Minimum locking capacity percentage (0 to 100)
+        FrontMaxLockRatio = 95,      -- Maximum locking capacity percentage (0 to 100)
+
+        -- Rear Axle Active Parameters (Tuning)
+        RearMinStiffness = 1.0,      -- Lock stiffness when open/cruising (1.0 = open/very soft)
+        RearMaxStiffness = 30.0,     -- Max locking stiffness under load (30.0 = hard welded lock)
+        RearMinLockRatio = 10,       -- Minimum locking capacity percentage (0 to 100)
+        RearMaxLockRatio = 98,       -- Maximum locking capacity percentage (0 to 100)
+
+        -- Front-Center Coupling Active Parameters (Tuning)
+        CenterFrontMinStiffness = 1.0,  -- Front-Center stiffness when open/cruising
+        CenterFrontMaxStiffness = 30.0, -- Front-Center max stiffness under load
+        CenterFrontMinLockRatio = 10,   -- Front-Center min lock percentage (0 to 100)
+        CenterFrontMaxLockRatio = 90,   -- Front-Center max lock percentage (0 to 100)
+
+        -- Rear-Center Coupling Active Parameters (Tuning)
+        CenterRearMinStiffness = 1.0,   -- Rear-Center stiffness when open/cruising
+        CenterRearMaxStiffness = 30.0,  -- Rear-Center max stiffness under load
+        CenterRearMinLockRatio = 10,    -- Rear-Center min lock percentage (0 to 100)
+        CenterRearMaxLockRatio = 90,    -- Rear-Center max lock percentage (0 to 100)
+        
+        -- Tuning Scales
+        ThrottleScale = 15.0,      -- How aggressively throttle locks the differential
+        SlipScale = 0.5,           -- How aggressively wheel speed difference (RPM) locks the diff
+        SlipThreshold = 12.0,      -- Wheel speed difference (RPM) to trigger slip detection (higher = ignores normal cornering)
+        BypassCapsOnSlip = true,   -- If true, slips automatically bypass throttle caps to capture traction
+        SteerDeclineSpeed = 40,    -- Speed (KPH) under which steering declines locking stiffness (prevents low speed binding)
+
+        -- Wire Outputs
+        WireOutputs = {
+            { name = "FrontActiveLockPct", source = "FrontActiveLockPctOut", type = "normal" },
+            { name = "FrontActiveStiffness", source = "FrontActiveStiffnessOut", type = "normal" },
+            { name = "RearActiveLockPct", source = "RearActiveLockPctOut", type = "normal" },
+            { name = "RearActiveStiffness", source = "RearActiveStiffnessOut", type = "normal" },
+            { name = "FCActiveLockPct", source = "FCActiveLockPctOut", type = "normal" },
+            { name = "FCActiveStiffness", source = "FCActiveStiffnessOut", type = "normal" },
+            { name = "RCActiveLockPct", source = "RCActiveLockPctOut", type = "normal" },
+            { name = "RCActiveStiffness", source = "RCActiveStiffnessOut", type = "normal" }
+        },
+
+        -- Synced state variables
+        SyncedState = { 
+            "FrontActiveLockPctOut", "FrontActiveStiffnessOut",
+            "RearActiveLockPctOut", "RearActiveStiffnessOut",
+            "FCActiveLockPctOut", "FCActiveStiffnessOut",
+            "RCActiveLockPctOut", "RCActiveStiffnessOut"
+        },
+
+        -- Internal Output States
+        FrontActiveLockPctOut = 0,
+        FrontActiveStiffnessOut = 0,
+        RearActiveLockPctOut = 0,
+        RearActiveStiffnessOut = 0,
+        FCActiveLockPctOut = 0,
+        FCActiveStiffnessOut = 0,
+        RCActiveLockPctOut = 0,
+        RCActiveStiffnessOut = 0,
+
+        OnInit = function(state, config)
+            local addon = config.Addons.ActiveMDiff
+            addon.FrontActiveLockPctOut = 0
+            addon.FrontActiveStiffnessOut = 0
+            addon.RearActiveLockPctOut = 0
+            addon.RearActiveStiffnessOut = 0
+            addon.FCActiveLockPctOut = 0
+            addon.FCActiveStiffnessOut = 0
+            addon.RCActiveLockPctOut = 0
+            addon.RCActiveStiffnessOut = 0
+        end,
+
+        OnEngineUpdate = function(state, config)
+            local addon = config.Addons.ActiveMDiff
+            
+            -- Read current inputs
+            local throttle = state.Throttle or 0
+            local speed = math.abs(state.Speed or 0)
+            local steering = 0
+
+            -- Read steering input from keyboard controls if driver is active
+            local driver = state.Driver
+            if isValid(driver) and state.DriverKeyState and state.DriverKeyState[driver] then
+                local keys = state.DriverKeyState[driver].heldKeys or {}
+                if keys["a"] or keys["A"] then
+                    steering = -1
+                elseif keys["d"] or keys["D"] then
+                    steering = 1
+                end
+            end
+
+            -- Read steering from wire steering port if wired and it exists
+            if wire and wire.ports then
+                local wl = wire.getWirelink and wire.getWirelink(chip())
+                if wl and wl.isWired and wl:isWired("Steer") then
+                    pcall(function() steering = wire.ports.Steer or 0 end)
+                end
+            end
+
+            local steerAmt = math.clamp(math.abs(steering), 0, 1)
+            local speedReductionFactor = math.clamp((addon.SteerDeclineSpeed - speed) / addon.SteerDeclineSpeed, 0, 1)
+            local lockReduction = 1 - (steerAmt * speedReductionFactor * 0.85) -- Up to 85% lock reduction during tight turns
+
+            -- Calculate axle wheel speed differences
+            local frontSlipRPM = 0
+            local rearSlipRPM = 0
+            if state.FrontRPMs and #state.FrontRPMs >= 2 then
+                frontSlipRPM = math.abs((state.FrontRPMs[1] or 0) - (state.FrontRPMs[2] or 0))
+            end
+            if state.RearRPMs and #state.RearRPMs >= 2 then
+                rearSlipRPM = math.abs((state.RearRPMs[1] or 0) - (state.RearRPMs[2] or 0))
+            end
+
+            -- ========================================================================
+            -- FRONT AXLE PROCESSING
+            -- ========================================================================
+            if addon.TargetFrontAxle then
+                local lockRange = math.max(addon.FrontMaxLockRatio - addon.FrontMinLockRatio, 1)
+                local throttleLock = throttle * lockRange
+                local slipLock = frontSlipRPM * (lockRange * 0.1)
+                local lockPct = addon.FrontMinLockRatio + throttleLock + slipLock
+                
+                -- Apply steering reduction
+                lockPct = lockPct * lockReduction
+
+                -- Apply throttle caps if wheels are not slipping
+                local shouldCap = true
+                local dynamicSlipThreshold = (addon.SlipThreshold or 12.0) * (1 + steerAmt * 2.0)
+                if addon.BypassCapsOnSlip and frontSlipRPM >= dynamicSlipThreshold then
+                    shouldCap = false
+                end
+
+                if shouldCap then
+                    local throttleCap = 0
+                    if throttle > 0 then
+                        if throttle < 0.2 then
+                            throttleCap = (throttle / 0.2) * 25
+                        elseif throttle < 0.6 then
+                            throttleCap = 25 + ((throttle - 0.2) / 0.4) * (40 - 25)
+                        else
+                            throttleCap = 40 + ((throttle - 0.6) / 0.4) * (addon.FrontMaxLockRatio - 40)
+                        end
+                    end
+                    lockPct = math.min(lockPct, throttleCap)
+                end
+
+                lockPct = math.clamp(lockPct, addon.FrontMinLockRatio, addon.FrontMaxLockRatio)
+
+                local ratioRange = math.max(addon.FrontMaxLockRatio - addon.FrontMinLockRatio, 1)
+                local ratioFactor = (lockPct - addon.FrontMinLockRatio) / ratioRange
+                local stiffness = addon.FrontMinStiffness + ratioFactor * (addon.FrontMaxStiffness - addon.FrontMinStiffness)
+
+                addon.FrontActiveStiffnessOut = math.round(stiffness, 2)
+                addon.FrontActiveLockPctOut = math.round(lockPct, 1)
+
+                state.FrontDiffType = addon.FrontActiveType or 1
+                state.FrontLSDStiffness = stiffness
+                state.FrontLSDLockRatio = lockPct / 100
+            else
+                -- Fallback to global config settings
+                state.FrontDiffType = config.FrontDiffType or 1
+                state.FrontLSDStiffness = config.FrontLSDStiffness or 3.0
+                state.FrontLSDLockRatio = (config.FrontLSDLockRatio or 90) / 100
+                state.FrontLSDPreload = config.FrontLSDPreload or 15.0
+                addon.FrontActiveStiffnessOut = 0
+                addon.FrontActiveLockPctOut = 0
+            end
+
+            -- ========================================================================
+            -- REAR AXLE PROCESSING
+            -- ========================================================================
+            if addon.TargetRearAxle then
+                local lockRange = math.max(addon.RearMaxLockRatio - addon.RearMinLockRatio, 1)
+                local throttleLock = throttle * lockRange
+                local slipLock = rearSlipRPM * (lockRange * 0.1)
+                local lockPct = addon.RearMinLockRatio + throttleLock + slipLock
+                
+                -- Apply steering reduction
+                lockPct = lockPct * lockReduction
+
+                -- Apply throttle caps if wheels are not slipping
+                local shouldCap = true
+                local dynamicSlipThreshold = (addon.SlipThreshold or 12.0) * (1 + steerAmt * 2.0)
+                if addon.BypassCapsOnSlip and rearSlipRPM >= dynamicSlipThreshold then
+                    shouldCap = false
+                end
+
+                if shouldCap then
+                    local throttleCap = 0
+                    if throttle > 0 then
+                        if throttle < 0.2 then
+                            throttleCap = (throttle / 0.2) * 25
+                        elseif throttle < 0.6 then
+                            throttleCap = 25 + ((throttle - 0.2) / 0.4) * (40 - 25)
+                        else
+                            throttleCap = 40 + ((throttle - 0.6) / 0.4) * (addon.RearMaxLockRatio - 40)
+                        end
+                    end
+                    lockPct = math.min(lockPct, throttleCap)
+                end
+
+                lockPct = math.clamp(lockPct, addon.RearMinLockRatio, addon.RearMaxLockRatio)
+
+                local ratioRange = math.max(addon.RearMaxLockRatio - addon.RearMinLockRatio, 1)
+                local ratioFactor = (lockPct - addon.RearMinLockRatio) / ratioRange
+                local stiffness = addon.RearMinStiffness + ratioFactor * (addon.RearMaxStiffness - addon.RearMinStiffness)
+
+                addon.RearActiveStiffnessOut = math.round(stiffness, 2)
+                addon.RearActiveLockPctOut = math.round(lockPct, 1)
+
+                state.RearDiffType = addon.RearActiveType or 1
+                state.RearLSDStiffness = stiffness
+                state.RearLSDLockRatio = lockPct / 100
+            else
+                -- Fallback to global config settings
+                state.RearDiffType = config.RearDiffType or 1
+                state.RearLSDStiffness = config.RearLSDStiffness or 3.0
+                state.RearLSDLockRatio = (config.RearLSDLockRatio or 90) / 100
+                state.RearLSDPreload = config.RearLSDPreload or 15.0
+                addon.RearActiveStiffnessOut = 0
+                addon.RearActiveLockPctOut = 0
+            end
+
+            -- ========================================================================
+            -- FRONT-CENTER COUPLING PROCESSING
+            -- ========================================================================
+            if addon.TargetFrontCenter then
+                local lockRange = math.max(addon.CenterFrontMaxLockRatio - addon.CenterFrontMinLockRatio, 1)
+                local throttleLock = throttle * lockRange
+                local slipLock = frontSlipRPM * (lockRange * 0.1) -- locks on axle wheel differences
+                local lockPct = addon.CenterFrontMinLockRatio + throttleLock + slipLock
+                
+                lockPct = lockPct * lockReduction
+
+                local shouldCap = true
+                local dynamicSlipThreshold = (addon.SlipThreshold or 12.0) * (1 + steerAmt * 2.0)
+                if addon.BypassCapsOnSlip and frontSlipRPM >= dynamicSlipThreshold then
+                    shouldCap = false
+                end
+
+                if shouldCap then
+                    local throttleCap = 0
+                    if throttle > 0 then
+                        if throttle < 0.2 then
+                            throttleCap = (throttle / 0.2) * 25
+                        elseif throttle < 0.6 then
+                            throttleCap = 25 + ((throttle - 0.2) / 0.4) * (40 - 25)
+                        else
+                            throttleCap = 40 + ((throttle - 0.6) / 0.4) * (addon.CenterFrontMaxLockRatio - 40)
+                        end
+                    end
+                    lockPct = math.min(lockPct, throttleCap)
+                end
+
+                lockPct = math.clamp(lockPct, addon.CenterFrontMinLockRatio, addon.CenterFrontMaxLockRatio)
+
+                local ratioRange = math.max(addon.CenterFrontMaxLockRatio - addon.CenterFrontMinLockRatio, 1)
+                local ratioFactor = (lockPct - addon.CenterFrontMinLockRatio) / ratioRange
+                local stiffness = addon.CenterFrontMinStiffness + ratioFactor * (addon.CenterFrontMaxStiffness - addon.CenterFrontMinStiffness)
+
+                addon.FCActiveStiffnessOut = math.round(stiffness, 2)
+                addon.FCActiveLockPctOut = math.round(lockPct, 1)
+
+                state.CenterDiffType = 1 -- viscd LSD center mode
+                state.CenterFrontLSDStiffness = stiffness
+                state.CenterFrontLSDLockRatio = lockPct / 100
+            else
+                state.CenterFrontLSDStiffness = config.CenterFrontLSDStiffness or 3.0
+                state.CenterFrontLSDLockRatio = (config.CenterFrontLSDLockRatio or 90) / 100
+                addon.FCActiveStiffnessOut = 0
+                addon.FCActiveLockPctOut = 0
+            end
+
+            -- ========================================================================
+            -- REAR-CENTER COUPLING PROCESSING
+            -- ========================================================================
+            if addon.TargetRearCenter then
+                local lockRange = math.max(addon.CenterRearMaxLockRatio - addon.CenterRearMinLockRatio, 1)
+                local throttleLock = throttle * lockRange
+                local slipLock = rearSlipRPM * (lockRange * 0.1)
+                local lockPct = addon.CenterRearMinLockRatio + throttleLock + slipLock
+                
+                lockPct = lockPct * lockReduction
+
+                local shouldCap = true
+                local dynamicSlipThreshold = (addon.SlipThreshold or 12.0) * (1 + steerAmt * 2.0)
+                if addon.BypassCapsOnSlip and rearSlipRPM >= dynamicSlipThreshold then
+                    shouldCap = false
+                end
+
+                if shouldCap then
+                    local throttleCap = 0
+                    if throttle > 0 then
+                        if throttle < 0.2 then
+                            throttleCap = (throttle / 0.2) * 25
+                        elseif throttle < 0.6 then
+                            throttleCap = 25 + ((throttle - 0.2) / 0.4) * (40 - 25)
+                        else
+                            throttleCap = 40 + ((throttle - 0.6) / 0.4) * (addon.CenterRearMaxLockRatio - 40)
+                        end
+                    end
+                    lockPct = math.min(lockPct, throttleCap)
+                end
+
+                lockPct = math.clamp(lockPct, addon.CenterRearMinLockRatio, addon.CenterRearMaxLockRatio)
+
+                local ratioRange = math.max(addon.CenterRearMaxLockRatio - addon.CenterRearMinLockRatio, 1)
+                local ratioFactor = (lockPct - addon.CenterRearMinLockRatio) / ratioRange
+                local stiffness = addon.CenterRearMinStiffness + ratioFactor * (addon.CenterRearMaxStiffness - addon.CenterRearMinStiffness)
+
+                addon.RCActiveStiffnessOut = math.round(stiffness, 2)
+                addon.RCActiveLockPctOut = math.round(lockPct, 1)
+
+                state.CenterDiffType = 1 -- viscd LSD center mode
+                state.CenterRearLSDStiffness = stiffness
+                state.CenterRearLSDLockRatio = lockPct / 100
+            else
+                state.CenterRearLSDStiffness = config.CenterRearLSDStiffness or 3.0
+                state.CenterRearLSDLockRatio = (config.CenterRearLSDLockRatio or 90) / 100
+                addon.RCActiveStiffnessOut = 0
+                addon.RCActiveLockPctOut = 0
+            end
+        end
+    }
+}

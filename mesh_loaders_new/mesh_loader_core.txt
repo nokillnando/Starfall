@@ -2,11 +2,15 @@
 --@author [C17] Red Fox
 --@shared
 
-local Version = "2.16"
+local Version = "2.17"
 
 --[[
 
     Changelog:
+V2.17
+    New status display for loading stuff
+    Custom on the go color changing command support    
+
 V2.16
     Fixed parenting bullshit loading not always working for some reason 
     Fixed texture swap getting delayed as time went on   
@@ -72,6 +76,111 @@ V1.83:
 
 if CLIENT then
 
+    local currentCommandColors = currentCommandColors or {}
+    local registeredColorCommands = {}
+    local spawnedHolograms = {}
+    local networkedEntities = {}
+    local fixAnglesHolos = {}
+    
+    local activeConfig = {}
+    local loadedTexturesSet = {}
+    local totalDownloads = 0
+    local completedDownloads = 0
+    local downloadedUrlsSet = {}
+    local downloadsNeededSet = {}
+    
+    local function markTextureLoaded(url)
+        if type(url) ~= "string" or url == "" or (url:sub(1,4) ~= "http" and not url:find("%.vtf")) then return end
+        if not loadedTexturesSet[url] then
+            loadedTexturesSet[url] = true
+            local count = 0
+            for _ in pairs(loadedTexturesSet) do count = count + 1 end
+            if activeConfig and activeConfig.progressData then
+                activeConfig.progressData.loadedTextures = count
+            end
+        end
+    end
+
+    local function markDownloadCompleted(url)
+        if type(url) ~= "string" or url == "" or (url:sub(1,4) ~= "http" and not url:find("%.vtf")) then return end
+        if downloadsNeededSet[url] and not downloadedUrlsSet[url] then
+            downloadedUrlsSet[url] = true
+            local count = 0
+            for _ in pairs(downloadedUrlsSet) do count = count + 1 end
+            if activeConfig and activeConfig.progressData then
+                activeConfig.progressData.completedDownloads = count
+            end
+        end
+    end
+    
+    local function applyColorCommandUpdate(v, newColor, phongTint, envMapTint, phongMult, envMapMult)
+        if not v.ColorCommand then return end
+        
+        local r = newColor.r
+        local g = newColor.g
+        local b = newColor.b
+        local a = newColor.a or (v.OriginalColor and v.OriginalColor.a) or 255
+        local finalColor = Color(r, g, b, a)
+        
+        v.ColorAndAlpha = finalColor
+        v.ActivePhongTint = phongTint
+        v.ActiveEnvMapTint = envMapTint
+        v.ActivePhongMult = phongMult
+        v.ActiveEnvMapMult = envMapMult
+        
+        for _, holo in ipairs(spawnedHolograms) do
+            if isValid(holo) and holo.MeshConfig == v then
+                holo:setColor(finalColor)
+            end
+        end
+        
+        local function scaleVector(origVec, origColor, targetColor)
+            if not origVec then return nil end
+            local newVec = Vector(0, 0, 0)
+            newVec[1] = origColor.r > 0 and (origVec[1] * (targetColor.r / origColor.r)) or (origVec[1] * (targetColor.r / 255))
+            newVec[2] = origColor.g > 0 and (origVec[2] * (targetColor.g / origColor.g)) or (origVec[2] * (targetColor.g / 255))
+            newVec[3] = origColor.b > 0 and (origVec[3] * (targetColor.b / origColor.b)) or (origVec[3] * (targetColor.b / 255))
+            return newVec
+        end
+        
+        local pM = phongMult or 1
+        local eM = envMapMult or 1
+        
+        if v.OriginalPhong and v.mat then
+            local newPhong
+            if phongTint then
+                newPhong = Vector(phongTint.r / 255, phongTint.g / 255, phongTint.b / 255)
+            else
+                newPhong = scaleVector(v.OriginalPhong, v.OriginalColor, finalColor)
+            end
+            
+            if newPhong then
+                newPhong = newPhong * pM
+                v.PhongTint = newPhong
+                if v.mat.setVector then
+                    v.mat:setVector("$phongtint", newPhong)
+                end
+            end
+        end
+        
+        if v.OriginalEnvMap and v.mat then
+            local newEnvMap
+            if envMapTint then
+                newEnvMap = Vector(envMapTint.r / 255, envMapTint.g / 255, envMapTint.b / 255)
+            else
+                newEnvMap = scaleVector(v.OriginalEnvMap, v.OriginalColor, finalColor)
+            end
+            
+            if newEnvMap then
+                newEnvMap = newEnvMap * eM
+                v.EnvMapShinyness = newEnvMap
+                if v.mat.setVector then
+                    v.mat:setVector("$envmaptint", newEnvMap)
+                end
+            end
+        end
+    end
+
     local vtfDownloads = vtfDownloads or {}
 
     local function hashString(str)
@@ -80,6 +189,24 @@ if CLIENT then
             h = (h * 31 + string.byte(str, i)) % 1000000000
         end
         return tostring(h)
+    end
+
+    local function isTextureDownloaded(url)
+        if type(url) ~= "string" or url == "" then return true end
+        local cleanUrl = url:match("^([^?]+)") or url
+        if url:lower():find("%.vtf") then
+            local name = cleanUrl:match("([^/]+)%.vtf") or "unnamed"
+            local fileName = name .. "_" .. hashString(cleanUrl) .. ".vtf"
+            return file.existsTemp(fileName)
+        elseif url:sub(1, 4) == "http" then
+            local ext = cleanUrl:match("%.png$") and "png" or cleanUrl:match("%.jpg$") and "jpg" or cleanUrl:match("%.jpeg$") and "jpeg"
+            if ext then
+                local name = cleanUrl:match("([^/]+)%." .. ext .. "$") or "unnamed"
+                local fileName = name .. "_" .. hashString(cleanUrl) .. "." .. ext
+                return file.existsTemp(fileName)
+            end
+        end
+        return true
     end
 
     local function vtfTempPath(url)
@@ -161,6 +288,7 @@ if CLIENT then
                     vtfDownloads[url] = nil
                     if data and #data > 0 then
                         file.writeTemp(fileName, data)
+                        markDownloadCompleted(url)
                         -- Delay before telling material to use the file
                         timer.simple(0.3, function()
                             safeCallback(tempPath)
@@ -215,7 +343,10 @@ if CLIENT then
 
     -- drop-in replacement for every place that used queueVtfDownload
     local function queueVtfDownload(url, callback)
-        table.insert(vtfQueue, { url = url, callback = callback })
+        table.insert(vtfQueue, { url = url, callback = function(path)
+            markTextureLoaded(url)
+            if callback then callback(path) end
+        end })
         pumpVtfQueue()
     end
     
@@ -276,6 +407,7 @@ if CLIENT then
                     imageDownloads[url] = nil
                     if data and #data > 0 then
                         file.writeTemp(fileName, data)
+                        markDownloadCompleted(url)
                         timer.simple(0.3, function() safeCallback(tempPath) end)
                     else
                         callback(nil)
@@ -307,7 +439,10 @@ if CLIENT then
     end
 
     local function queueImageDownload(url, callback)
-        table.insert(imageQueue, { url = url, callback = callback })
+        table.insert(imageQueue, { url = url, callback = function(path)
+            markTextureLoaded(url)
+            if callback then callback(path) end
+        end })
         pumpImageQueue()
     end
 
@@ -316,9 +451,9 @@ if CLIENT then
 
 
     local base = chip()
-    local activeConfig = {}
-    local spawnedHolograms = {}
-    local networkedEntities = {}
+    activeConfig = {}
+    spawnedHolograms = {}
+    networkedEntities = {}
     local function resolveParent(parentName)
         if not parentName then return nil end
         local val = networkedEntities[parentName]
@@ -337,7 +472,7 @@ if CLIENT then
         end
         return isValid(val) and val or nil
     end
-    local fixAnglesHolos = {}
+    fixAnglesHolos = {}
 
     local function getRestingAngle(wheelEnt, fixEnt, fixP, fixY, fixR, invertAxis)
         local restingWorldAng = fixEnt:getAngles()
@@ -684,6 +819,10 @@ if CLIENT then
 
             progressData.spawnedMeshes = spawned
             progressData.spawnProgress = spawned / totalToSpawn
+            -- Track current mesh name for display
+            local spawnMeshName = v.mdl:match("[^/]+$") or ("Mesh " .. item.meshIndex)
+            spawnMeshName = spawnMeshName:gsub("%%20", " "):gsub("%.obj$", "")
+            progressData.currentMeshName = spawnMeshName
 
             if showMeshSpawnProgress and debugPrints then
                 print(W, "Spawning mesh ", G, item.meshIndex, W, " (submesh ", G, item.submeshIndex, W, ") - ",
@@ -841,6 +980,37 @@ if CLIENT then
                 textureCountCache[url] = true
             end
             
+            -- Pre-scan to count total textures and downloads
+            for _, v in ipairs(meshes) do
+                trackTexture(v.texture)
+                trackTexture(v.BumpMapLink)
+                trackTexture(v.EnvMapLink)
+                trackTexture(v.PhongExponentTexture)
+                trackTexture(v.DetailLink)
+                if v.TextureSwaps then
+                    for _, sc in pairs(v.TextureSwaps) do
+                        trackTexture(type(sc) == "table" and sc.texture or sc)
+                    end
+                end
+            end
+            
+            local totalTex = 0
+            for _ in pairs(textureCountCache) do totalTex = totalTex + 1 end
+            progressData.totalTextures = totalTex
+            
+            totalDownloads = 0
+            completedDownloads = 0
+            downloadedUrlsSet = {}
+            downloadsNeededSet = {}
+            for url in pairs(textureCountCache) do
+                if not isTextureDownloaded(url) then
+                    totalDownloads = totalDownloads + 1
+                    downloadsNeededSet[url] = true
+                end
+            end
+            progressData.totalDownloads = totalDownloads
+            progressData.completedDownloads = 0
+            
             -- Generate a fingerprint key from all material-defining properties
             local function materialFingerprint(v)
                 local parts = {
@@ -871,6 +1041,7 @@ if CLIENT then
                     v.Material or "",
                     tostring(v.UseModTexture or false),
                     v.UseIngameBumpMapp and v.BumpMapTexture or "",
+                    v.ColorCommand or "",
                 }
                 -- Vectors
                 if v.EnvMapShinyness then table.insert(parts, tostring(v.EnvMapShinyness)) end
@@ -898,16 +1069,18 @@ if CLIENT then
                 progressData.builtMeshes = builtCount
                 progressData.buildProgress = builtCount / #meshes
 
-                trackTexture(v.texture)
-                trackTexture(v.BumpMapLink)
-                trackTexture(v.EnvMapLink)
-                trackTexture(v.PhongExponentTexture)
-                trackTexture(v.DetailLink)
-                if v.TextureSwaps then
-                    for _, sc in pairs(v.TextureSwaps) do
-                        trackTexture(type(sc) == "table" and sc.texture or sc)
-                    end
+                -- Track current mesh name for display
+                local meshFileName = v.mdl:match("[^/]+$") or ("Mesh " .. k)
+                meshFileName = meshFileName:gsub("%%20", " "):gsub("%.obj$", "")
+                progressData.currentMeshName = meshFileName
+
+                -- Track current texture name for display
+                local texName = v.texture or ""
+                if texName:sub(1, 4) == "http" then
+                    texName = texName:match("[^/]+$") or texName
+                    texName = texName:gsub("%%20", " ")
                 end
+                progressData.currentTextureName = texName
 
                 if v.UseModTexture then
                     -- Check material cache before creating a new one
@@ -920,6 +1093,18 @@ if CLIENT then
                         v.OriginalTexture = cachedEntry.originalTexture
                         v.preloadedSwaps = cachedEntry.preloadedSwaps
                         if debugPrints then print(W, "Reusing material for mesh ", G, k) end
+                        
+                        -- Immediately mark its texture URLs as loaded
+                        markTextureLoaded(v.texture)
+                        markTextureLoaded(v.BumpMapLink)
+                        markTextureLoaded(v.EnvMapLink)
+                        markTextureLoaded(v.PhongExponentTexture)
+                        markTextureLoaded(v.DetailLink)
+                        if v.TextureSwaps then
+                            for _, sc in pairs(v.TextureSwaps) do
+                                markTextureLoaded(type(sc) == "table" and sc.texture or sc)
+                            end
+                        end
                     else
                     local mat = material.create("VertexLitGeneric")
                     mat:setUndefined("$basetexture")
@@ -1036,6 +1221,8 @@ if CLIENT then
                             end)
                         elseif hasPermission("material.urlcreate", v.EnvMapLink) then
                             mat:setTextureURL("$envmapmask", v.EnvMapLink, function(_, _, w, h, layout)
+                                markDownloadCompleted(v.EnvMapLink)
+                                markTextureLoaded(v.EnvMapLink)
                                 if not (w and h) then
                                     mat:setUndefined("$envmapmask")
                                     return
@@ -1077,6 +1264,8 @@ if CLIENT then
                             end)
                         elseif hasPermission("material.urlcreate", v.PhongExponentTexture) then
                             mat:setTextureURL("$phongexponenttexture", v.PhongExponentTexture, function(_, _, w, h, layout)
+                                markDownloadCompleted(v.PhongExponentTexture)
+                                markTextureLoaded(v.PhongExponentTexture)
                                 if not (w and h) then
                                     mat:setUndefined("$phongexponenttexture")
                                     return
@@ -1118,6 +1307,8 @@ if CLIENT then
                             end)
                         elseif hasPermission("material.urlcreate", v.BumpMapLink) then
                             mat:setTextureURL("$bumpmap", v.BumpMapLink, function(_, _, w, h, layout)
+                                markDownloadCompleted(v.BumpMapLink)
+                                markTextureLoaded(v.BumpMapLink)
                                 if not (w and h) then
                                     mat:setUndefined("$bumpmap")
                                     return
@@ -1163,6 +1354,8 @@ if CLIENT then
                                 end)
                             elseif hasPermission("material.urlcreate", v.DetailLink) then
                                 mat:setTextureURL("$detail", v.DetailLink, function(_, _, w, h, layout)
+                                    markDownloadCompleted(v.DetailLink)
+                                    markTextureLoaded(v.DetailLink)
                                     if not (w and h) then
                                         mat:setUndefined("$detail")
                                         return
@@ -1232,6 +1425,8 @@ if CLIENT then
                             end)
                         elseif hasPermission("material.urlcreate", v.texture) then
                             mat:setTextureURL("$basetexture", v.texture, function(_, _, w, h, layout)
+                                markDownloadCompleted(v.texture)
+                                markTextureLoaded(v.texture)
                                 if not (w and h) then
                                     mat:setTexture("$basetexture", "hunter/myplastic")
                                     v.OriginalTexture = "hunter/myplastic"
@@ -1290,6 +1485,8 @@ if CLIENT then
                                     else
                                         local dummy = material.create("VertexLitGeneric")
                                         dummy:setTextureURL("$basetexture", url, function(_, _, w, h, layout)
+                                            markDownloadCompleted(url)
+                                            markTextureLoaded(url)
                                             if w and h then
                                                 layout(0,0, w * (1024/w), h * (1024/h))
                                                 timer.simple(0.2, function()
@@ -1326,6 +1523,11 @@ if CLIENT then
                     end -- end of else (cache miss)
                 else
                     v.mat = material.load(v.Material)
+                end
+                
+                if v.ColorCommand and currentCommandColors[v.ColorCommand:lower()] then
+                    local state = currentCommandColors[v.ColorCommand:lower()]
+                    applyColorCommandUpdate(v, state.color, state.phongTint, state.envMapTint, state.phongMult, state.envMapMult)
                 end
 
                 local success = false
@@ -1405,6 +1607,10 @@ if CLIENT then
 
             while activeRequests < maxRequests and #requestQueue > 0 do
                 local k, v = unpack(table.remove(requestQueue, 1))
+                -- Extract filename from URL for display
+                local meshFileName = v.mdl:match("[^/]+$") or ("Mesh " .. k)
+                meshFileName = meshFileName:gsub("%%20", " "):gsub("%.obj$", "")
+                progressData.currentMeshName = meshFileName
                 if debugPrints then print(W, "Downloading mesh ", G, k, W, " from URL") end
 
                 http.get(v.mdl, function(data)
@@ -1597,6 +1803,80 @@ if CLIENT then
         fixAnglesHolos = {}
         spawnedHolograms = {}
         networkedEntities = {}
+        loadedTexturesSet = {}
+        totalDownloads = 0
+        completedDownloads = 0
+        downloadedUrlsSet = {}
+        downloadsNeededSet = {}
+        
+        -- Initialize color command originals and active colors
+        registeredColorCommands = {}
+        for _, v in ipairs(config.meshes) do
+            if v.ColorCommand and type(v.ColorCommand) == "string" then
+                v.OriginalColor = v.ColorAndAlpha or Color(255, 255, 255, 255)
+                v.OriginalPhong = v.PhongTint or Vector(1, 1, 1)
+                v.OriginalEnvMap = v.EnvMapShinyness or Vector(1, 1, 1)
+                
+                local cmdLower = v.ColorCommand:lower()
+                registeredColorCommands[cmdLower] = v.ColorCommand
+                
+                -- If we already have a color from a previous sync (e.g. late join), apply it to config pre-emptively
+                if currentCommandColors[cmdLower] then
+                    local state = currentCommandColors[cmdLower]
+                    local newCol = state.color
+                    v.ColorAndAlpha = Color(newCol.r, newCol.g, newCol.b, newCol.a or v.OriginalColor.a or 255)
+                    v.ActivePhongTint = state.phongTint
+                    v.ActiveEnvMapTint = state.envMapTint
+                    v.ActivePhongMult = state.phongMult
+                    v.ActiveEnvMapMult = state.envMapMult
+                end
+            end
+        end
+        
+        net.receive("syncMeshColor", function()
+            local cmd = net.readString()
+            local r = net.readUInt(8)
+            local g = net.readUInt(8)
+            local b = net.readUInt(8)
+            local a = net.readUInt(8)
+            
+            local hasPhongTint = net.readBool()
+            local phongTint = nil
+            if hasPhongTint then
+                local pr = net.readUInt(8)
+                local pg = net.readUInt(8)
+                local pb = net.readUInt(8)
+                phongTint = Color(pr, pg, pb)
+            end
+            
+            local hasEnvMapTint = net.readBool()
+            local envMapTint = nil
+            if hasEnvMapTint then
+                local er = net.readUInt(8)
+                local eg = net.readUInt(8)
+                local eb = net.readUInt(8)
+                envMapTint = Color(er, eg, eb)
+            end
+            
+            local phongMult = net.readFloat()
+            local envMapMult = net.readFloat()
+            
+            local newColor = Color(r, g, b, a)
+            local cmdLower = cmd:lower()
+            currentCommandColors[cmdLower] = {
+                color = newColor,
+                phongTint = phongTint,
+                envMapTint = envMapTint,
+                phongMult = phongMult,
+                envMapMult = envMapMult
+            }
+            
+            for _, v in ipairs(config.meshes) do
+                if v.ColorCommand and v.ColorCommand:lower() == cmdLower then
+                    applyColorCommandUpdate(v, newColor, phongTint, envMapTint, phongMult, envMapMult)
+                end
+            end
+        end)
         
         sanitizeMeshURLs(config.meshes)
         
@@ -1612,14 +1892,301 @@ if CLIENT then
             local smallFont = render.createFont("Roboto", 32, 400, true)
             local scale = 0.1
 
+            if config.progressDisplayType == "hologram" then
+                local rtName = "MeshLoaderProgressRT_" .. chip():entIndex()
+                local rtSize = 1024
+                local rt = render.createRenderTarget(rtName)
+                local rtMat = material.create("UnlitGeneric")
+                rtMat:setTextureRenderTarget("$basetexture", rtName)
+                rtMat:setInt("$flags", 32768) -- MATERIAL_VAR_NO_DECAL only (matches engine chip)
+                rtMat:setFloat("$alpha", 1)
+
+                if isValid(chip().ProgressHolo) then
+                    chip().ProgressHolo:remove()
+                end
+
+                local entity = isValid(base) and base or chip()
+                local offset = config.progressDisplayPos or Vector(0, 0, config.progressDisplayHeight or 35)
+                local holoPos = entity:localToWorld(offset)
+                local holoAng = entity:localToWorldAngles(Angle(0, 0, 0))
+
+                local holo = hologram.create(holoPos, holoAng, "models/holograms/plane.mdl")
+                if isValid(holo) then
+                    chip().ProgressHolo = holo
+                    holo:setParent(entity)
+                    holo:suppressEngineLighting(true)
+                    
+                    if RENDERMODE and RENDERMODE.WORLDGLOW then
+                        holo:setRenderMode(2)
+                    else
+                        holo:setRenderMode(9)
+                    end
+
+                    holo:setMaterial("!" .. rtMat:getName())
+                    local scaleVal = config.progressDisplayScale or 5.5
+                    local scaleVec = type(scaleVal) == "Vector" and scaleVal or Vector(scaleVal, scaleVal, 1)
+                    holo:setScale(scaleVec)
+
+                    hook.add("renderoffscreen", "meshLoaderProgressRTUpdate_" .. chip():entIndex(), function()
+                        if not isValid(holo) then return end
+                        if not config.progressData.downloading and not config.progressData.building and not config.progressData.spawning then
+                            return
+                        end
+
+                        render.selectRenderTarget(rtName)
+                        render.clear(Color(0, 0, 0, 0))
+
+                        local progress = 0
+                        local stage = config.progressData.currentStage
+                        local subInfo = ""
+                        local meshName = config.progressData.currentMeshName or ""
+                        local textureName = config.progressData.currentTextureName or ""
+                        local texProgress = 0
+
+                        if config.progressData.downloading then
+                            progress = config.progressData.downloadProgress
+                            subInfo = config.progressData.downloadedMeshes .. " / " .. config.progressData.totalMeshes
+                            texProgress = 0
+                        elseif config.progressData.building then
+                            progress = config.progressData.buildProgress
+                            subInfo = config.progressData.builtMeshes .. " / " .. config.progressData.totalMeshes
+                            local totalTex = config.progressData.totalTextures or 0
+                            local loadedTex = config.progressData.loadedTextures or 0
+                            texProgress = totalTex > 0 and (loadedTex / totalTex) or progress
+                        elseif config.progressData.spawning then
+                            progress = config.progressData.spawnProgress
+                            subInfo = config.progressData.spawnedMeshes .. " / " .. config.progressData.totalSpawnItems
+                            texProgress = progress
+                        end
+
+                        -- Define color theme helpers based on custom config options
+                        local primaryCol = config.progressDisplayColor or Color(20, 140, 250)
+                        if type(primaryCol) == "Vector" then
+                            primaryCol = Color(primaryCol[1] or primaryCol.x or 0, primaryCol[2] or primaryCol.y or 0, primaryCol[3] or primaryCol.z or 0)
+                        end
+                        local secondaryCol = config.progressDisplayColor2 or Color(130, 60, 220)
+                        if type(secondaryCol) == "Vector" then
+                            secondaryCol = Color(secondaryCol[1] or secondaryCol.x or 0, secondaryCol[2] or secondaryCol.y or 0, secondaryCol[3] or secondaryCol.z or 0)
+                        end
+                        local function lightColor(col, alpha)
+                            return Color(math.min(255, col.r + (255 - col.r) * 0.4), math.min(255, col.g + (255 - col.g) * 0.4), math.min(255, col.b + (255 - col.b) * 0.4), alpha)
+                        end
+
+                        -- Panel dimensions (centered on 1024x1024)
+                        local cx, cy = rtSize / 2, rtSize / 2
+                        local w, h = 820, 580
+                        local x, y = cx - w/2, cy - h/2
+
+                        local time = timer.curtime()
+                        local glowIntensity = math.sin(time * 3) * 0.5 + 0.5
+
+                        -- Outer glow border
+                        local borderCol = Color(primaryCol.r, primaryCol.g, primaryCol.b, 50 + glowIntensity * 40)
+                        render.setColor(borderCol)
+                        render.drawRect(x - 6, y - 6, w + 12, h + 12)
+                        render.setColor(Color(primaryCol.r, primaryCol.g, primaryCol.b, 30 + glowIntensity * 20))
+                        render.drawRect(x - 3, y - 3, w + 6, h + 6)
+
+                        -- Dark glass panel
+                        local bgCol = config.progressDisplayBgColor or Color(10, 14, 24, 240)
+                        if type(bgCol) == "Vector" then
+                            bgCol = Color(bgCol[1] or bgCol.x or 0, bgCol[2] or bgCol.y or 0, bgCol[3] or bgCol.z or 0, 240)
+                        end
+                        render.setColor(bgCol)
+                        render.drawRect(x, y, w, h)
+
+                        -- Top accent line (animated gradient feel)
+                        local pulseMult = 0.8 + glowIntensity * 0.2
+                        render.setColor(Color(math.min(255, primaryCol.r * pulseMult), math.min(255, primaryCol.g * pulseMult), math.min(255, primaryCol.b * pulseMult), 255))
+                        render.drawRect(x, y, w, 10)
+
+                        -- Rotating spinner dots
+                        local spinR = 16
+                        local sx, sy = x + 55, y + 65
+                        for i = 1, 8 do
+                            local angle = (i / 8) * math.pi * 2 + time * 4
+                            local dx = math.cos(angle) * spinR
+                            local dy = math.sin(angle) * spinR
+                            local dotGlow = math.sin(time * 5 - (i / 8) * math.pi * 2) * 0.5 + 0.5
+                            render.setColor(Color(primaryCol.r, primaryCol.g, primaryCol.b, 30 + dotGlow * 225))
+                            render.drawRect(sx + dx - 4, sy + dy - 4, 8, 8)
+                        end
+
+                        -- Stage title
+                        render.setFont(font)
+                        render.setColor(Color(255, 255, 255))
+                        render.drawSimpleText(x + 90, y + 65, stage, 0, 1)
+
+                        -- === MESH PROGRESS BAR ===
+                        local barW, barH = 610, 30
+                        local bx = x + 50
+
+                        -- Mesh label
+                        render.setFont(smallFont)
+                        render.setColor(lightColor(primaryCol, 220))
+                        render.drawSimpleText(bx, y + 140, "Mesh", 0, 1)
+
+                        -- Mesh bar counts on right
+                        render.setColor(Color(170, 190, 210))
+                        render.drawSimpleText(bx + barW + 80, y + 140, subInfo, 2, 1)
+
+                        -- Mesh bar background
+                        local meshBarY = y + 175
+                        render.setColor(Color(30, 35, 48, 255))
+                        render.drawRect(bx, meshBarY, barW, barH)
+
+                        -- Mesh bar fill
+                        render.setColor(Color(primaryCol.r, primaryCol.g, primaryCol.b, 255))
+                        render.drawRect(bx, meshBarY, barW * progress, barH)
+
+                        -- Mesh bar shiny overlay
+                        render.setColor(lightColor(primaryCol, 80))
+                        render.drawRect(bx, meshBarY, barW * progress, barH / 2)
+
+                        -- Mesh percentage
+                        render.setFont(smallFont)
+                        render.setColor(Color(255, 255, 255))
+                        render.drawSimpleText(bx + barW + 15, meshBarY + barH/2, math.floor(progress * 100) .. "%", 0, 1)
+
+                        -- Current mesh name (truncated if too long)
+                        local displayMeshName = meshName
+                        if #displayMeshName > 40 then
+                            displayMeshName = displayMeshName:sub(1, 37) .. "..."
+                        end
+                        render.setFont(smallFont)
+                        render.setColor(Color(130, 150, 175, 200))
+                        render.drawSimpleText(bx, meshBarY + barH + 18, displayMeshName, 0, 1)
+
+                        -- === TEXTURE/DOWNLOAD PROGRESS BAR ===
+                        local totalTex = config.progressData.totalTextures or 0
+                        local loadedTex = config.progressData.loadedTextures or 0
+                        
+                        local totalDl = config.progressData.totalDownloads or 0
+                        local completedDl = config.progressData.completedDownloads or 0
+                        
+                        local isDownloading = totalDl > 0 and completedDl < totalDl
+                        
+                        local labelText = isDownloading and "Downloads" or "Textures"
+                        local countText = ""
+                        local barProgress = 0
+                        
+                        if config.progressData.downloading then
+                            labelText = "Textures"
+                            countText = "Pending..."
+                            barProgress = 0
+                        elseif isDownloading then
+                            countText = completedDl .. " / " .. totalDl
+                            barProgress = totalDl > 0 and (completedDl / totalDl) or 0
+                        else
+                            countText = loadedTex .. " / " .. totalTex
+                            barProgress = totalTex > 0 and (loadedTex / totalTex) or 0
+                        end
+                        
+                        -- Texture label
+                        render.setColor(lightColor(secondaryCol, 220))
+                        render.drawSimpleText(bx, y + 310, labelText, 0, 1)
+
+                        -- Counts
+                        render.setColor(Color(170, 190, 210))
+                        render.drawSimpleText(bx + barW + 80, y + 310, countText, 2, 1)
+
+                        -- Texture bar background
+                        local texBarY = y + 345
+                        render.setColor(Color(30, 35, 48, 255))
+                        render.drawRect(bx, texBarY, barW, barH)
+
+                        -- Texture bar fill
+                        render.setColor(Color(secondaryCol.r, secondaryCol.g, secondaryCol.b, 255))
+                        render.drawRect(bx, texBarY, barW * barProgress, barH)
+
+                        -- Texture bar shiny overlay
+                        render.setColor(lightColor(secondaryCol, 70))
+                        render.drawRect(bx, texBarY, barW * barProgress, barH / 2)
+
+                        -- Texture percentage
+                        render.setFont(smallFont)
+                        render.setColor(Color(255, 255, 255))
+                        render.drawSimpleText(bx + barW + 15, texBarY + barH/2, math.floor(barProgress * 100) .. "%", 0, 1)
+
+                        -- Current texture name (truncated)
+                        local displayTexName = textureName
+                        if #displayTexName > 40 then
+                            displayTexName = displayTexName:sub(1, 37) .. "..."
+                        end
+                        
+                        local prefix = config.progressData.downloading and "" or (isDownloading and "Downloading: " or "Loading: ")
+                        if displayTexName ~= "" then
+                            displayTexName = prefix .. displayTexName
+                        end
+                        
+                        render.setFont(smallFont)
+                        render.setColor(Color(130, 150, 175, 200))
+                        render.drawSimpleText(bx, texBarY + barH + 18, displayTexName, 0, 1)
+
+                        -- Bottom separator line
+                        render.setColor(Color(40, 60, 90, 120))
+                        render.drawRect(x + 30, y + h - 55, w - 60, 1)
+
+                        -- Bottom status text
+                        render.setFont(smallFont)
+                        render.setColor(Color(80, 100, 130, 180))
+                        local statusText = config.progressData.downloading and "Downloading from remote..." or (config.progressData.building and "Building geometry & materials..." or "Spawning holograms...")
+                        render.drawSimpleText(cx, y + h - 30, statusText, 1, 1)
+
+                        render.selectRenderTarget(nil)
+                    end)
+
+                    hook.add("think", "meshLoaderProgressHoloThink_" .. chip():entIndex(), function()
+                        if not isValid(holo) then
+                            hook.remove("think", "meshLoaderProgressHoloThink_" .. chip():entIndex())
+                            hook.remove("renderoffscreen", "meshLoaderProgressRTUpdate_" .. chip():entIndex())
+                            return
+                        end
+
+                        if not config.progressData.downloading and not config.progressData.building and not config.progressData.spawning then
+                            holo:remove()
+                            hook.remove("think", "meshLoaderProgressHoloThink_" .. chip():entIndex())
+                            hook.remove("renderoffscreen", "meshLoaderProgressRTUpdate_" .. chip():entIndex())
+                            return
+                        end
+
+                        local ply = player()
+                        local plyEye = ply:getEyePos()
+                        local holoPos = holo:getPos()
+
+                        -- Hide if too far away
+                        local distance = ply:getPos():getDistance(entity:getPos())
+                        if distance > 1500 then
+                            holo:setColor(Color(0, 0, 0, 0))
+                        else
+                            holo:setColor(Color(255, 255, 255, 254)) -- Alpha 254 prevents overlap/z-sort issues (matches engine chip)
+                            
+                            -- Follow height offset dynamically in case parent moves
+                            local offset = config.progressDisplayPos or Vector(0, 0, config.progressDisplayHeight or 35)
+                            local expectedPos = entity:localToWorld(offset)
+                            holo:setPos(expectedPos)
+
+                            -- Billboard effect: Face Player Eyes
+                            local padAng = (plyEye - holoPos):getAngle()
+                            padAng.p = padAng.p + 90
+                            padAng:rotateAroundAxis(padAng:getUp(), 90)
+                            holo:setAngles(padAng)
+                        end
+                    end)
+                end
+            end
+
+
             hook.add("PostDrawTranslucentRenderables", "meshLoaderProgress", function()
+                if config.progressDisplayType == "hologram" then return end
                 if not config.progressData.downloading and not config.progressData.building and not config.progressData.spawning then
                     return
                 end
 
+                local offset = config.progressDisplayPos or Vector(0, 0, config.progressDisplayHeight or 35)
                 local entity = isValid(base) and base or chip()
                 local m = entity:getMatrix()
-                m:translate(Vector(0, 0, config.progressDisplayHeight))
+                m:translate(offset)
                 m:setAngles((eyePos() - m:getTranslation()):getAngle() + Angle(90, 0, 0))
                 m:rotate(Angle(0, 90, 0))
                 m:setScale(Vector(0.1, -0.1))
@@ -1627,7 +2194,11 @@ if CLIENT then
                 render.pushMatrix(m)
 
                 render.depthRange(0, 0.9)
-                render.setColor(Color(0, 0, 0, 200))
+                local bgCol = config.progressDisplayBgColor or Color(0, 0, 0, 200)
+                if type(bgCol) == "Vector" then
+                    bgCol = Color(bgCol[1] or bgCol.x or 0, bgCol[2] or bgCol.y or 0, bgCol[3] or bgCol.z or 0, 200)
+                end
+                render.setColor(bgCol)
                 render.drawRect(-300, -90, 600, 120)
 
                 local stage = config.progressData.currentStage
@@ -1652,8 +2223,12 @@ if CLIENT then
                     render.setColor(Color(100, 100, 100))
                     render.drawRect(-200, 0, 400, 25)
 
+                    local primaryCol = config.progressDisplayColor or Color(20, 150, 250)
+                    if type(primaryCol) == "Vector" then
+                        primaryCol = Color(primaryCol[1] or primaryCol.x or 0, primaryCol[2] or primaryCol.y or 0, primaryCol[3] or primaryCol.z or 0)
+                    end
                     render.depthRange(0, 0.7)
-                    render.setColor(Color(20, 150, 250))
+                    render.setColor(Color(primaryCol.r, primaryCol.g, primaryCol.b))
                     render.drawRect(-200, 0, 400 * progress, 25)
 
                     render.depthRange(0, 0.6)
@@ -1695,12 +2270,242 @@ if CLIENT then
 else -- SERVER
     local clientMeshes = {}
     local lastBase = nil
-    
+    local serverStoredColors = serverStoredColors or {}
+    local registeredCommands = {}
     local trackedParentEntities = {}
     local trackedNormalInputs = {}
     local lastParentEntities = {}
     local lastNormalInputs = {}
     local serverUpdateRate = 0.1
+    
+    local function isLookingAtVehicle(ply)
+        local currentBase = wire.ports.Base
+        if not isValid(currentBase) then
+            currentBase = chip()
+        end
+        
+        -- Helper to get root parent
+        local function getRootEntity(ent)
+            if not isValid(ent) then return nil end
+            local p = ent
+            while isValid(p:getParent()) do
+                p = p:getParent()
+            end
+            return p
+        end
+        
+        -- Collect all vehicle-associated entities
+        local vehicleSet = {}
+        local function addAssociated(ent)
+            if not isValid(ent) then return end
+            vehicleSet[ent] = true
+            local root = getRootEntity(ent)
+            if root then
+                vehicleSet[root] = true
+            end
+        end
+        
+        addAssociated(currentBase)
+        for _, parentName in ipairs(trackedParentEntities) do
+            addAssociated(wire.ports[parentName])
+        end
+        
+        -- Override: Pass if player is sitting in a vehicle parented/welded/constrained to Base/associated
+        if ply:inVehicle() then
+            local seat = ply:getVehicle()
+            if isValid(seat) then
+                if vehicleSet[seat] or vehicleSet[getRootEntity(seat)] then
+                    return true
+                end
+                
+                -- Check if seat is constrained to any vehicle entity
+                if seat.getAllConstrained then
+                    local constrained = seat:getAllConstrained()
+                    if type(constrained) == "table" then
+                        for _, ent in ipairs(constrained) do
+                            if vehicleSet[ent] or (isValid(ent) and vehicleSet[getRootEntity(ent)]) then
+                                return true
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        
+        -- Trace check
+        local trace = ply:getEyeTrace()
+        local hitEnt = trace.Entity
+        if not isValid(hitEnt) then return false end
+        
+        -- Proximity limit: 600 units
+        if trace.StartPos:getDistance(trace.HitPos) > 600 then return false end
+        
+        -- 1. Direct match
+        if vehicleSet[hitEnt] then return true end
+        
+        -- 2. Root parent match
+        local hitRoot = getRootEntity(hitEnt)
+        if hitRoot and vehicleSet[hitRoot] then return true end
+        
+        -- 3. Constraints on hitEnt
+        if hitEnt.getAllConstrained then
+            local constrained = hitEnt:getAllConstrained()
+            if type(constrained) == "table" then
+                for _, ent in ipairs(constrained) do
+                    if vehicleSet[ent] or (isValid(ent) and vehicleSet[getRootEntity(ent)]) then
+                        return true
+                    end
+                end
+            end
+        end
+        
+        -- 4. Constraints on hitRoot
+        if hitRoot and hitRoot ~= hitEnt and hitRoot.getAllConstrained then
+            local constrained = hitRoot:getAllConstrained()
+            if type(constrained) == "table" then
+                for _, ent in ipairs(constrained) do
+                    if vehicleSet[ent] or (isValid(ent) and vehicleSet[getRootEntity(ent)]) then
+                        return true
+                    end
+                end
+            end
+        end
+        
+        -- 5. Constraints on vehicle entities pointing to hitEnt or hitRoot
+        for ent, _ in pairs(vehicleSet) do
+            if isValid(ent) and ent.getAllConstrained then
+                local constrained = ent:getAllConstrained()
+                if type(constrained) == "table" then
+                    for _, cent in ipairs(constrained) do
+                        if cent == hitEnt or cent == hitRoot then
+                            return true
+                        end
+                    end
+                end
+            end
+        end
+        
+        return false
+    end
+    
+    local function parseColorArgs(text, cmd)
+        local rest = text:sub(#cmd + 1)
+        
+        -- Split by "|"
+        local segments = {}
+        local start = 1
+        while true do
+            local pos = rest:find("|", start)
+            if not pos then
+                table.insert(segments, rest:sub(start))
+                break
+            end
+            table.insert(segments, rest:sub(start, pos - 1))
+            start = pos + 1
+        end
+        
+        -- Helper to parse a color from a string segment
+        local function parseColor(str)
+            local clean = str:gsub(",", " ")
+            local parts = {}
+            for word in clean:gmatch("%S+") do
+                table.insert(parts, word)
+            end
+            
+            local r, g, b, a
+            if #parts >= 3 then
+                r = tonumber(parts[1])
+                g = tonumber(parts[2])
+                b = tonumber(parts[3])
+                a = tonumber(parts[4])
+            elseif #parts == 1 then
+                local hex = parts[1]:gsub("#", "")
+                if #hex == 6 or #hex == 8 then
+                    r = tonumber(hex:sub(1, 2), 16)
+                    g = tonumber(hex:sub(3, 4), 16)
+                    b = tonumber(hex:sub(5, 6), 16)
+                    if #hex == 8 then
+                        a = tonumber(hex:sub(7, 8), 16)
+                    end
+                end
+            end
+            
+            if r and g and b then
+                local maxVal = math.max(r, g, b)
+                if maxVal > 0 and maxVal <= 1 then
+                    r = r * 255
+                    g = g * 255
+                    b = b * 255
+                    if a and a <= 1 then
+                        a = a * 255
+                    end
+                end
+                return Color(math.clamp(r, 0, 255), math.clamp(g, 0, 255), math.clamp(b, 0, 255), a and math.clamp(a, 0, 255) or 255)
+            end
+            return nil
+        end
+        
+        -- Helper to parse a number (percentage or multiplier) from a string segment
+        local function parsePercent(str)
+            local clean = str:gsub("%%", ""):match("%S+")
+            if clean then
+                local num = tonumber(clean)
+                if num then
+                    if str:find("%%") or num > 2 then
+                        return num / 100
+                    else
+                        return num
+                    end
+                end
+            end
+            return nil
+        end
+        
+        local baseColor = parseColor(segments[1] or "")
+        if not baseColor then return nil end
+        
+        local parsedColors = {}
+        local parsedMults = {}
+        
+        for i = 2, #segments do
+            local seg = segments[i]
+            local col = parseColor(seg)
+            if col then
+                table.insert(parsedColors, col)
+            else
+                local pct = parsePercent(seg)
+                if pct then
+                    table.insert(parsedMults, pct)
+                end
+            end
+        end
+        
+        -- Resolve tints
+        local phongTint = nil
+        local envMapTint = nil
+        if #parsedColors == 1 then
+            phongTint = parsedColors[1]
+            envMapTint = parsedColors[1]
+        elseif #parsedColors >= 2 then
+            phongTint = parsedColors[1]
+            envMapTint = parsedColors[2]
+        end
+        
+        -- Resolve multipliers
+        local phongMult = 1
+        local envMapMult = 1
+        if #parsedMults == 1 then
+            phongMult = parsedMults[1]
+            envMapMult = parsedMults[1]
+        elseif #parsedMults >= 2 then
+            phongMult = parsedMults[1]
+            envMapMult = parsedMults[2]
+        end
+        
+        return baseColor, phongTint, envMapTint, phongMult, envMapMult
+    end
+    
+    
 
     local function initServer(config)
         trackedParentEntities = {}
@@ -1766,6 +2571,81 @@ else -- SERVER
         timer.simple(3, forceRebroadcast)
         timer.simple(7, forceRebroadcast)
         timer.simple(12, forceRebroadcast)
+
+        -- Dynamically collect ColorCommand inputs
+        registeredCommands = {}
+        if config and config.meshes then
+            for _, meshData in ipairs(config.meshes) do
+                if meshData.ColorCommand and type(meshData.ColorCommand) == "string" then
+                    registeredCommands[meshData.ColorCommand:lower()] = meshData.ColorCommand
+                end
+            end
+        end
+
+        -- Add chat listener for color commands
+        hook.add("PlayerSay", "MeshLoaderColorCommands", function(ply, text, team)
+            -- Trim leading whitespace using plain Lua bytes check
+            local start_idx = 1
+            while start_idx <= #text and string.byte(text, start_idx) <= 32 do
+                start_idx = start_idx + 1
+            end
+            if start_idx > #text then return end
+            
+            -- Extract first word without backtracking regex
+            local space_idx = text:find("%s", start_idx)
+            local cmd = space_idx and text:sub(start_idx, space_idx - 1) or text:sub(start_idx)
+            local cmdLower = cmd:lower()
+            
+            if registeredCommands[cmdLower] then
+                if ply ~= owner() then return end
+                local actualCmd = registeredCommands[cmdLower]
+                if isLookingAtVehicle(ply) then
+                    local cleanText = text:sub(start_idx)
+                    local baseColor, phongTint, envMapTint, phongMult, envMapMult = parseColorArgs(cleanText, actualCmd)
+                    if baseColor then
+                        serverStoredColors[cmdLower] = {
+                            color = baseColor,
+                            phongTint = phongTint,
+                            envMapTint = envMapTint,
+                            phongMult = phongMult,
+                            envMapMult = envMapMult
+                        }
+                        
+                        -- Broadcast update to everyone
+                        net.start("syncMeshColor")
+                        net.writeString(actualCmd)
+                        net.writeUInt(baseColor.r, 8)
+                        net.writeUInt(baseColor.g, 8)
+                        net.writeUInt(baseColor.b, 8)
+                        net.writeUInt(baseColor.a, 8)
+                        
+                        if phongTint then
+                            net.writeBool(true)
+                            net.writeUInt(phongTint.r, 8)
+                            net.writeUInt(phongTint.g, 8)
+                            net.writeUInt(phongTint.b, 8)
+                        else
+                            net.writeBool(false)
+                        end
+                        
+                        if envMapTint then
+                            net.writeBool(true)
+                            net.writeUInt(envMapTint.r, 8)
+                            net.writeUInt(envMapTint.g, 8)
+                            net.writeUInt(envMapTint.b, 8)
+                        else
+                            net.writeBool(false)
+                        end
+                        
+                        net.writeFloat(phongMult)
+                        net.writeFloat(envMapMult)
+                        net.send(find.allPlayers())
+                        
+                        return ""
+                    end
+                end
+            end
+        end)
     end
 
     net.receive("reportMeshStatus", function(_, ply)
@@ -1819,6 +2699,37 @@ else -- SERVER
                 net.writeFloat(currentVal)
                 net.send(ply)
             end
+        end
+        
+        for cmd, state in pairs(serverStoredColors) do
+            net.start("syncMeshColor")
+            net.writeString(cmd)
+            net.writeUInt(state.color.r, 8)
+            net.writeUInt(state.color.g, 8)
+            net.writeUInt(state.color.b, 8)
+            net.writeUInt(state.color.a, 8)
+            
+            if state.phongTint then
+                net.writeBool(true)
+                net.writeUInt(state.phongTint.r, 8)
+                net.writeUInt(state.phongTint.g, 8)
+                net.writeUInt(state.phongTint.b, 8)
+            else
+                net.writeBool(false)
+            end
+            
+            if state.envMapTint then
+                net.writeBool(true)
+                net.writeUInt(state.envMapTint.r, 8)
+                net.writeUInt(state.envMapTint.g, 8)
+                net.writeUInt(state.envMapTint.b, 8)
+            else
+                net.writeBool(false)
+            end
+            
+            net.writeFloat(state.phongMult)
+            net.writeFloat(state.envMapMult)
+            net.send(ply)
         end
     end)
     local nextMonitor = 0
@@ -1888,6 +2799,11 @@ else -- SERVER
     }
 end
 hook.add("removed", "stopStreams", function()
+    if CLIENT then
+        if isValid(chip().ProgressHolo) then
+            chip().ProgressHolo:remove()
+        end
+    end
     if net.isStreaming() then
         net.cancelStream()
     end

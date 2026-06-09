@@ -1,0 +1,313 @@
+--@name Setang + Drift Assist v3.2 (Refined Accumulator)
+--@author [C17] Red Fox & Manus
+--@shared
+--@model models/sprops/rectangles/size_2/rect_12x12x3.mdl
+
+--[[
+    v3.2 - Refinements built ON TOP of v2.87's core accumulator feel.
+    The accumulator is what made v2.87 feel realistic:
+      AngleT += input (small amount per tick, natural rate-limiting)
+      AngleT *= speedDecay (speed-driven self-centering, no snap)
+
+    What this version adds on top of that WITHOUT changing the paradigm:
+      1. Explicit ReturnSpeed — fast return to center when input is released,
+         mimicking the caster / pneumatic trail snap of real steering geometry.
+         Scales with speed: faster return at higher speed.
+      2. dt-scaled input  — steering speed is consistent across tick rates.
+      3. Low-pass lateral filter — removes tick noise from drift corrections.
+      4. Smoothstep correction ramp — drift assist eases in/out (no hard snap-on).
+      5. Stability factor on assist — damps assist when chassis is already stable,
+         preventing the oscillation hunting / tank-slapper feedback loop.
+
+    NOTE: LinearBlend (cubic input curve) only makes a difference with ANALOG
+    input (controller thumbstick). With keyboard (0 or 1), 1^3 = 1, so it has
+    no effect. Leave it at 0.3 for gamepad, or ignore it for keyboard.
+]]--
+
+if SERVER then
+    wire.adjustInputs({"Pod","Base"},{"wirelink","entity"})
+    wire.adjustOutputs({
+        "Angle","SpeedL","SpeedDir","IsSlipping","IsDrifting","SlipAmount","YawDampAmt"
+    },{"number","number","number","number","number","number","number"})
+
+    ---------------------------------------------------------------------------
+    --## USER CONFIGURATION ##
+    ---------------------------------------------------------------------------
+
+    -- [Steering Limits & Accumulator]
+    -- Maximum steering angle (degrees). Same as v2.87 Lock.
+    local Lock                    = 40
+    -- How fast the steering rack moves in degrees per SECOND.
+    -- At 66 tick, 89 deg/s ≈ the original SteeringSpeed=1.35 feel.
+    -- Higher = snappier/faster rack. Lower = heavier.
+    local SteeringSpeed           = 89
+    -- How much speed erodes the current wheel angle each tick.
+    -- 950 = original v2.87 value (mild, natural feel). Lower = more aggressive.
+    local SpeedEffect             = 950
+    -- Explicit return-to-center speed (degrees/second) when input is released.
+    -- Applied separately from speed decay — works at ALL speeds including low speed.
+    -- Higher = faster snap back to center (more caster feel). 200 is a strong return.
+    -- This does NOT apply during active drifting (drift assist handles that instead).
+    local ReturnSpeed             = 200
+    -- Forward speed at which ReturnSpeed reaches full strength.
+    -- Below this speed, return is scaled down (avoids fighting low-speed maneuvering).
+    -- Set lower (e.g. 20) to make return fast even when nearly stationary.
+    local ReturnSpeedAttenuation  = 40
+
+    -- [Input Curve - ANALOG ONLY]
+    -- Only affects controller/analog input. With keyboard (0 or ±1), has no effect.
+    -- LinearBlend=1.0 = fully linear. LinearBlend=0.3 = 70% cubic (precise center).
+    local LinearBlend             = 0.3
+
+    -- [Caster]
+    local Caster                  = 20
+
+    -- [Drift Assist - Core]
+    local SlipCorrectionThreshold = 1
+    local DriftThreshold          = 2.5
+    local SlipCounterForce        = 1.5
+    local DriftResistance         = 50
+
+    -- [Drift Assist - Correction Ramp via Smoothstep]
+    -- Slip angle (radians) at which the correction starts fading in. ~3 degrees.
+    local CorrectionStart         = 0.05
+    -- Slip angle (radians) at which the correction is fully active. ~14 degrees.
+    local CorrectionFull          = 0.25
+
+    -- [Drift Assist - Stability / Anti-Hunting]
+    -- Scales drift assist by the car's current yaw rate.
+    -- When yaw is high (spinning), full assist. When yaw is low (stabilized),
+    -- assist is scaled back to prevent hunting / tank-slappers.
+    -- Yaw rate (deg/s) at which assist reaches full strength.
+    local StabilityThreshold      = 80
+    -- Minimum assist scale when chassis is nearly stable (prevents it cutting off fully).
+    local MinStabilityScale       = 0.2
+
+    -- [Drift Assist - Player Input Multipliers while drifting]
+    local OppositeMultiplier      = 1.25
+    local SameDirMultiplier       = 1.5
+
+    -- [Gyro]
+    local GyroCounterForce        = 1.5
+    local GyroSpeedThreshold      = 100
+    local GyroMinScale            = 0
+    local GyroMaxScale            = 3
+
+    -- [Lateral Smoothing]
+    -- Low-pass filter alpha (0–1). Lower = smoother, slightly delayed.
+    -- 0.25 is a safe default. Raise toward 0.4 if corrections feel laggy.
+    local LateralSmoothAlpha      = 0.25
+
+    -- [Vehicle Orientation]
+    local ForwardAxisMultiplier   = Vector(-1,0,0)
+
+    ---------------------------------------------------------------------------
+    --## CORE LOGIC ##
+    ---------------------------------------------------------------------------
+
+    -- Smoothstep: smooth 0→1 curve between edge0 and edge1
+    local function smoothstep(edge0, edge1, x)
+        local t = math.clamp((x - edge0) / (edge1 - edge0), 0, 1)
+        return t * t * (3 - 2 * t)
+    end
+
+    local AngleT          = 0   -- Steering accumulator (the actual wheel angle)
+    local InA, InD        = 0, 0
+    local smoothedLateral = 0
+    local SetAng          = chip()
+    SetAng:setNocollideAll(true)
+
+    net.receive("requestBase", function(_, ply)
+        if not wire.ports.Base:isValid() then return end
+        net.start("sendBase")
+            net.writeEntity(wire.ports.Base)
+            net.writeVector(ForwardAxisMultiplier)
+        net.send(ply)
+    end)
+
+    hook.add("think","SetangDriftAssist_v3_1",function()
+        local Base = wire.ports.Base
+        if not Base or not Base:isValid() then return end
+
+        local Pod = wire.ports.Pod
+        if Pod then InA, InD = Pod.A or 0, Pod.D or 0 end
+
+        local dt = game.getTickInterval()
+
+        -- Local velocity decomposition
+        local worldVel   = Base:getVelocity()
+        local localVel   = Base:worldToLocal(worldVel + Base:getPos())
+        local fwdLocal   = ForwardAxisMultiplier
+        local rightLocal = Vector(fwdLocal.y, -fwdLocal.x, 0)
+
+        local ForwardSpeed = localVel:dot(fwdLocal)   / 14.5
+        local RawLateral   = localVel:dot(rightLocal) / 14.5
+        local SpeedDir     = (ForwardSpeed >= 0) and 1 or -1
+        local absForward   = math.abs(ForwardSpeed)
+
+        -- Low-pass filter lateral velocity: removes tick-to-tick physics noise
+        smoothedLateral = smoothedLateral + (RawLateral - smoothedLateral) * LateralSmoothAlpha
+
+        wire.ports.SpeedL    = ForwardSpeed
+        wire.ports.SpeedDir  = SpeedDir
+        wire.ports.SlipAmount = smoothedLateral
+
+        -- ----------------------------------------------------------------
+        -- Speed decay factor (the natural self-centering, identical to v2.87)
+        -- At 0 speed: factor = 1.0 (no change to AngleT).
+        -- At SpeedEffect speed: factor = 0 (angle fully zeroed).
+        -- ----------------------------------------------------------------
+        local speedDecay = 1 - math.min(absForward, SpeedEffect) / SpeedEffect
+
+        -- ----------------------------------------------------------------
+        -- Slip angle & smoothstep correction scale
+        -- Replaces v2.87's linear SlipAngleFactor with a smooth ramp.
+        -- ----------------------------------------------------------------
+        local slipAngle       = math.atan2(math.abs(smoothedLateral), math.max(absForward, 0.01))
+        local correctionScale = smoothstep(CorrectionStart, CorrectionFull, slipAngle)
+
+        -- ----------------------------------------------------------------
+        -- Gyro: Yaw damping (anti-spin-out)
+        -- ----------------------------------------------------------------
+        local upWorld    = Base:localToWorldVector(Vector(0,0,1))
+        local yawVel     = Base:getAngleVelocity():dot(upWorld)
+        local speedScale = math.clamp(absForward / GyroSpeedThreshold, 0, 1)
+        local gyroScale  = GyroMinScale + (GyroMaxScale - GyroMinScale) * speedScale
+        local yawDamping = yawVel * dt * GyroCounterForce * gyroScale * SpeedDir
+        wire.ports.YawDampAmt = yawDamping
+
+        -- ----------------------------------------------------------------
+        -- Drift correction
+        -- ----------------------------------------------------------------
+        local isSlipping     = math.abs(smoothedLateral) > SlipCorrectionThreshold
+        local slipCorrection = 0
+        if isSlipping then
+            slipCorrection = smoothedLateral * SlipCounterForce * -SpeedDir
+        end
+
+        local isDrifting    = math.abs(smoothedLateral) > DriftThreshold
+        local driftDir      = 0
+        local driftCorrection = 0
+        if isDrifting then
+            driftDir = (smoothedLateral > 0) and 1 or -1
+
+            -- Stability factor: high yaw = spinning = full assist.
+            -- Low yaw = stable = scale back to prevent hunting.
+            local stabilityFactor = math.clamp(
+                math.abs(yawVel) / StabilityThreshold,
+                MinStabilityScale, 1.0
+            )
+
+            driftCorrection = (slipCorrection / DriftResistance + yawDamping)
+                            * correctionScale
+                            * stabilityFactor
+        end
+
+        wire.ports.IsSlipping = isSlipping and 1 or 0
+        wire.ports.IsDrifting = isDrifting and 1 or 0
+
+        -- ----------------------------------------------------------------
+        -- Player input
+        -- Cubic curve: (x^3 * 0.7) + (x * 0.3)
+        -- Compresses center sensitivity without reducing max lock authority.
+        -- ----------------------------------------------------------------
+        local rawInput      = InA - InD
+        local curvedInput   = rawInput * rawInput * rawInput * (1 - LinearBlend)
+                            + rawInput * LinearBlend
+        -- dt-scaled: SteeringSpeed is now in degrees/second, consistent across tick rates
+        local inputEffect   = curvedInput * SteeringSpeed * dt
+
+        -- Drift input multipliers
+        if isDrifting and rawInput ~= 0 then
+            local inputDir = (rawInput > 0) and -1 or 1
+            if inputDir == driftDir then
+                inputEffect = curvedInput * SteeringSpeed * SameDirMultiplier * dt
+            else
+                inputEffect = curvedInput * SteeringSpeed * OppositeMultiplier * dt
+            end
+        end
+
+        -- ----------------------------------------------------------------
+        -- Final accumulator (v2.87 core, unchanged paradigm)
+        --   1. Add input and drift correction to the accumulator
+        --   2. Clamp to lock
+        --   3. Apply explicit return-to-center if input released & not drifting
+        --   4. Apply speed decay — additional natural centering at high speed
+        -- ----------------------------------------------------------------
+        AngleT = AngleT + inputEffect + driftCorrection
+        AngleT = math.clamp(AngleT, -Lock, Lock)
+
+        -- Explicit return-to-center: mimics caster/pneumatic trail self-aligning torque.
+        -- Scales with speed so it feels natural (no snap at standstill).
+        -- Disabled during active drift so the assist isn't fought by centering.
+        if math.abs(rawInput) < 0.01 and not isDrifting then
+            local returnScale = math.clamp(absForward / ReturnSpeedAttenuation, 0, 1)
+            local returnStep  = ReturnSpeed * dt * returnScale
+            -- Move AngleT toward 0 by returnStep, without overshooting.
+            if AngleT > 0 then
+                AngleT = math.max(AngleT - returnStep, 0)
+            elseif AngleT < 0 then
+                AngleT = math.min(AngleT + returnStep, 0)
+            end
+        end
+
+        AngleT = AngleT * speedDecay
+
+        wire.ports.Angle = AngleT
+
+        if not SetAng:isPlayerHolding() then
+            SetAng:enableMotion()
+            local finalAng = Base:localToWorldAngles(Angle(0, AngleT, -AngleT / Caster))
+            SetAng:setAngles(finalAng)
+        end
+    end)
+
+-- ========================================================================
+-- VISUAL DEBUG (Client-side)
+-- ========================================================================
+elseif player() == owner() then
+    local Debug = false
+
+    if Debug then
+        local base
+        local fwdAxis
+
+        timer.create("requestBase", 0.5, 0, function()
+            net.start("requestBase")
+            net.send()
+        end)
+
+        net.receive("sendBase", function()
+            base    = net.readEntity()
+            fwdAxis = net.readVector()
+            timer.stop("requestBase")
+        end)
+
+        enableHud(owner(), true)
+        local font = render.createFont("Trebuchet24", 24, nil, false, nil, nil, true)
+
+        hook.add("drawHud", "hud", function()
+            if not base or not base:isValid() or not fwdAxis then return end
+
+            local rightAxis = Vector(fwdAxis.y, -fwdAxis.x, 0)
+            local basePos   = base:localToWorld(Vector(0,0,0))
+            local right     = base:localToWorld(-rightAxis     * 50)
+            local up        = base:localToWorld(Vector(0,0,1)  * 50)
+            local fwd       = base:localToWorld(-fwdAxis       * 50)
+            local alpha     = math.max(300 - owner():getPos():getDistanceSqr(basePos) / 1000, 0)
+
+            if alpha > 0 then
+                render.pushViewMatrix({ type = "3D" })
+                render.setColor(Color(0,   0,   255)) render.draw3DLine(basePos, fwd)
+                render.setColor(Color(255, 0,   0))   render.draw3DLine(basePos, right)
+                render.setColor(Color(0,   255, 0))   render.draw3DLine(basePos, up)
+                render.popViewMatrix()
+
+                render.setFont(font)
+                render.setColor(Color(0,   0,   255, alpha)) render.drawSimpleText(fwd:toScreen().x,   fwd:toScreen().y,   "Forward", 1, 1)
+                render.setColor(Color(255, 0,   0,   alpha)) render.drawSimpleText(right:toScreen().x, right:toScreen().y, "Right",   1, 1)
+                render.setColor(Color(0,   255, 0,   alpha)) render.drawSimpleText(up:toScreen().x,    up:toScreen().y,    "Up",      1, 1)
+            end
+        end)
+    end
+end

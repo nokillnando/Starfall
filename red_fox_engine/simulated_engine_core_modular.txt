@@ -3,10 +3,16 @@
 
 local Core = {}
 _G.RedFoxEngineCore = Core
-local Version = "3.08" -- v3 Alpha
+local Version = "3.09" -- v3 Alpha
 
 --[[
 Changelog:
+V3.09
+    Differential Locking, Finally
+    Center Lock, Center LSD, Center Open, Front Lock, Front LSD, Front Open, Rear Lock, Rear LSD, Rear Open
+    Its not perfect, but it works
+    Has addon example for differential locking
+
 V3.08
     Fixed minor issue with gear when using handbrake
 
@@ -94,8 +100,8 @@ if SERVER then
         -- Wire Setup
         local coreInputNames = { "Pod", "Chassis", "Engine", "FrontWheels", "RearWheels" }
         local coreInputTypes = { "wirelink", "entity", "entity", "array", "array" }
-        local coreOutputNames = { "RPM", "Gear", "Clutch", "Throttle_Delay", "Clutch_Delay", "Torque", "Flywheel_PowerInertia", "Flywheel_RPM", "Brake", "Active", "Ignition", "Throttle", "Speed_KPH", "Turbo_PSI", "Redline", "MaxTorque", "BrakeF", "BrakeR", "SpeedN", "Braking", "GearMode", "Turbo_Boost", "InReverse", "Driver" }
-        local coreOutputTypes = { "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "entity" }
+        local coreOutputNames = { "RPM", "Gear", "Clutch", "Throttle_Delay", "Clutch_Delay", "Torque", "Flywheel_PowerInertia", "Flywheel_RPM", "Brake", "Active", "Ignition", "Throttle", "Speed_KPH", "Turbo_PSI", "Redline", "MaxTorque", "BrakeF", "BrakeR", "SpeedN", "Braking", "GearMode", "Turbo_Boost", "InReverse", "Driver", "FrontLocked", "RearLocked", "AllLocked" }
+        local coreOutputTypes = { "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "normal", "entity", "normal", "normal", "normal" }
         
         -- ====== AUTO-WIRE: Addon Wire Inputs/Outputs ======
         -- Automatically create wire inputs and outputs for addons
@@ -898,6 +904,34 @@ if SERVER then
             -- Must recalculate every frame to follow engine rotation
             local EngineDirection = getAxis(Engine, c.EngineAxis)
             
+            if not s.WheelSpinAxis then s.WheelSpinAxis = {} end
+            
+            local function getWheelSpinAxis(w)
+                local localAxis = s.WheelSpinAxis[w]
+                if not localAxis and isValid(w) then
+                    local localDir = w:worldToLocal(EngineDirection + w:getPos()):getNormalized()
+                    local absX = math.abs(localDir.x)
+                    local absY = math.abs(localDir.y)
+                    local absZ = math.abs(localDir.z)
+                    if absX > absY and absX > absZ then
+                        localAxis = Vector(localDir.x > 0 and 1 or -1, 0, 0)
+                    elseif absY > absX and absY > absZ then
+                        localAxis = Vector(0, localDir.y > 0 and 1 or -1, 0)
+                    else
+                        localAxis = Vector(0, 0, localDir.z > 0 and 1 or -1)
+                    end
+                    s.WheelSpinAxis[w] = localAxis
+                end
+                return localAxis
+            end
+
+            local function getWheelWorldDir(w)
+                if not isValid(w) then return EngineDirection end
+                local localAxis = getWheelSpinAxis(w)
+                if not localAxis then return EngineDirection end
+                return (w:localToWorld(localAxis) - w:getPos()):getNormalized()
+            end
+            
             -- ============================================================================
             -- WHEEL RPM & BRAKE FORCES (Run Every Frame)
             -- ============================================================================
@@ -942,19 +976,25 @@ if SERVER then
                     end
                 end
                 
-                for i, _ in ipairs(FrontWheels) do
-                    local wheelRPM = FrontRPMs[i] or 0
-                    local force = 5 * wheelRPM * tickMult
-                    local brakeMult = c.BrakeMult or 1
-                    local finalBrake = (brakeForcesFront and brakeForcesFront[i]) or brakeF
-                    netWheelTorqueFront[i] = EngineDirection * force * finalBrake * brakeMult
+                for i, w in ipairs(FrontWheels) do
+                    if isValid(w) then
+                        local wheelRPM = FrontRPMs[i] or 0
+                        local force = 5 * wheelRPM * tickMult
+                        local brakeMult = c.BrakeMult or 1
+                        local finalBrake = (brakeForcesFront and brakeForcesFront[i]) or brakeF
+                        local wheelWorldDir = getWheelWorldDir(w)
+                        netWheelTorqueFront[i] = wheelWorldDir * force * finalBrake * brakeMult
+                    end
                 end
-                for i, _ in ipairs(RearWheels) do
-                    local wheelRPM = RearRPMs[i] or 0
-                    local force = 5 * wheelRPM * tickMult
-                    local brakeMult = c.BrakeMult or 1
-                    local finalBrake = (brakeForcesRear and brakeForcesRear[i]) or brakeR
-                    netWheelTorqueRear[i] = EngineDirection * force * finalBrake * brakeMult
+                for i, w in ipairs(RearWheels) do
+                    if isValid(w) then
+                        local wheelRPM = RearRPMs[i] or 0
+                        local force = 5 * wheelRPM * tickMult
+                        local brakeMult = c.BrakeMult or 1
+                        local finalBrake = (brakeForcesRear and brakeForcesRear[i]) or brakeR
+                        local wheelWorldDir = getWheelWorldDir(w)
+                        netWheelTorqueRear[i] = wheelWorldDir * force * finalBrake * brakeMult
+                    end
                 end
             end
 
@@ -1099,8 +1139,8 @@ if SERVER then
             for _, w in pairs(FrontWheels) do
                 if isValid(w) then
                     local angVel = w:getAngleVelocity()
-                    local localEngineDir = w:worldToLocal(EngineDirection + w:getPos())
-                    local rpm = -angVel:dot(localEngineDir) / 8
+                    local localAxis = getWheelSpinAxis(w)
+                    local rpm = localAxis and (-angVel:dot(localAxis) / 8) or 0
                     RPM_Sum = RPM_Sum + rpm
                     RPM_Count = RPM_Count + 1
                     table.insert(s.FrontRPMs, rpm)
@@ -1110,8 +1150,8 @@ if SERVER then
             for _, w in pairs(RearWheels) do
                 if isValid(w) then
                     local angVel = w:getAngleVelocity()
-                    local localEngineDir = w:worldToLocal(EngineDirection + w:getPos())
-                    local rpm = -angVel:dot(localEngineDir) / 8
+                    local localAxis = getWheelSpinAxis(w)
+                    local rpm = localAxis and (-angVel:dot(localAxis) / 8) or 0
                     RPM_Sum = RPM_Sum + rpm
                     RPM_Count = RPM_Count + 1
                     table.insert(s.RearRPMs, rpm)
@@ -2088,6 +2128,9 @@ if SERVER then
             if Driver and isValid(Driver) then
                 wire.ports.Driver = Driver
             end
+             pcall(function() wire.ports.FrontLocked = (s.FrontDiffType == 2 or s.CenterDiffType == 2) and 1 or 0 end)
+             pcall(function() wire.ports.RearLocked = (s.RearDiffType == 2 or s.CenterDiffType == 2) and 1 or 0 end)
+             pcall(function() wire.ports.AllLocked = (s.CenterDiffType == 2) and 1 or 0 end)
             
             -- ====== AUTO-WIRE: Addon Wire Outputs ======
             -- Automatically write addon wire outputs from addon table values
@@ -2121,13 +2164,16 @@ if SERVER then
             -- ============================================================================
             -- POWER APPLICATION TO WHEELS (Runs Every Frame)
             -- ============================================================================
-            
-            if s.Flywheel_Power and math.abs(s.Flywheel_Power) > 0.1 and s.Active then
+            local hasWheels = (#FrontWheels > 0 or #RearWheels > 0)
+            if hasWheels then
                 local desiredMass = s.EffectiveVehicleMass or config.Engine_SimulatedVehicleMass or 1000
                 local actualMass = s.ActualVehicleMass or desiredMass
                 local massScale = actualMass / math.max(desiredMass, 1)
                 massScale = math.clamp(massScale, c.Engine_MinMassScale or 0.2, c.Engine_MaxMassScale or 2.5)
-                local scaledPower = s.Flywheel_Power * massScale
+                local scaledPower = 0
+                if s.Flywheel_Power and math.abs(s.Flywheel_Power) > 0.1 and s.Active then
+                    scaledPower = s.Flywheel_Power * massScale
+                end
 
                 local FrontPowerRatio = (c.PowerDistribution or 50) / 100
                 local RearPowerRatio = 1 - FrontPowerRatio
@@ -2135,51 +2181,214 @@ if SERVER then
                 local forceMult = (c.ForceMult or 1) * 39.37 * 2 * tickMult
                 local torqueDir = (c.TorqueInvert and -1 or 1)
 
+                -- Initialize state differential values to allow real-time addon modification
+                if s.FrontDiffType == nil then s.FrontDiffType = c.FrontDiffType or 1 end
+                if s.RearDiffType == nil then s.RearDiffType = c.RearDiffType or 1 end
+                if s.FrontLSDStiffness == nil then s.FrontLSDStiffness = c.FrontLSDStiffness or 3.0 end
+                if s.RearLSDStiffness == nil then s.RearLSDStiffness = c.RearLSDStiffness or 3.0 end
+                if s.FrontLSDLockRatio == nil then s.FrontLSDLockRatio = (c.FrontLSDLockRatio or 90) / 100 end
+                if s.RearLSDLockRatio == nil then s.RearLSDLockRatio = (c.RearLSDLockRatio or 90) / 100 end
+                if s.FrontLSDPreload == nil then s.FrontLSDPreload = c.FrontLSDPreload or 15.0 end
+                if s.RearLSDPreload == nil then s.RearLSDPreload = c.RearLSDPreload or 15.0 end
+                if s.CenterDiffType == nil then s.CenterDiffType = c.CenterDiffType or 0 end -- 0 = open/2WD/independent, 1 = Center LSD, 2 = Center Lock
+                if s.CenterFrontLSDStiffness == nil then s.CenterFrontLSDStiffness = c.CenterFrontLSDStiffness or 3.0 end
+                if s.CenterRearLSDStiffness == nil then s.CenterRearLSDStiffness = c.CenterRearLSDStiffness or 3.0 end
+                if s.CenterFrontLSDLockRatio == nil then s.CenterFrontLSDLockRatio = (c.CenterFrontLSDLockRatio or 90) / 100 end
+                if s.CenterRearLSDLockRatio == nil then s.CenterRearLSDLockRatio = (c.CenterRearLSDLockRatio or 90) / 100 end
+                if s.CenterFrontLSDPreload == nil then s.CenterFrontLSDPreload = c.CenterFrontLSDPreload or 15.0 end
+                if s.CenterRearLSDPreload == nil then s.CenterRearLSDPreload = c.CenterRearLSDPreload or 15.0 end
+
+                -- Check if center coupling (AWD lock/LSD) is active
+                local isCenterCoupled = (s.CenterDiffType > 0)
+
+                -- Calculate average RPM of all wheels (for center locking/coupling)
+                local avgAllRPM = 0
+                if isCenterCoupled then
+                    local fRPMs = s.FrontRPMs or {}
+                    local rRPMs = s.RearRPMs or {}
+                    local sumAllRPM = 0
+                    local allDriveCount = 0
+                    for _, rpm in ipairs(fRPMs) do
+                        sumAllRPM = sumAllRPM + rpm
+                        allDriveCount = allDriveCount + 1
+                    end
+                    for _, rpm in ipairs(rRPMs) do
+                        sumAllRPM = sumAllRPM + rpm
+                        allDriveCount = allDriveCount + 1
+                    end
+                    avgAllRPM = allDriveCount > 0 and (sumAllRPM / allDriveCount) or 0
+                end
+
                 -- Front wheels
-                if #FrontWheels > 0 and FrontPowerRatio > 0 then
+                if #FrontWheels > 0 and (FrontPowerRatio > 0 or isCenterCoupled) then
                     local FrontPower = scaledPower * FrontPowerRatio
                     local PowerPerWheel = FrontPower / #FrontWheels
-                    for i, w in pairs(FrontWheels) do
-                        local wheelScale = 1
-                        if s.FrontWheelPowerScale and s.FrontWheelPowerScale[i] then
-                            wheelScale = s.FrontWheelPowerScale[i]
+                    
+                    -- Calculate Average RPM for Front Axle
+                    local fRPMs = s.FrontRPMs or {}
+                    local sumFRPM = 0
+                    for _, rpm in ipairs(fRPMs) do sumFRPM = sumFRPM + rpm end
+                    local avgFRPM = #fRPMs > 0 and (sumFRPM / #fRPMs) or 0
+                    
+                    local diffType = s.FrontDiffType or 0
+                    local lsdStiffness = 0
+                    local lockRatio = s.FrontLSDLockRatio or 0.9
+                    local diffType = s.FrontDiffType or 0
+                    local lsdStiffness = 0
+                    local lockRatio = s.FrontLSDLockRatio or 0.9
+                    if isCenterCoupled then
+                        if s.CenterDiffType == 1 then
+                            lsdStiffness = s.CenterFrontLSDStiffness or 3.0
+                            lockRatio = s.CenterFrontLSDLockRatio or 0.9
+                        else
+                            lsdStiffness = 30.0 -- Hard lock all wheels to the global average
                         end
-                        -- Use EngineDirection in world space
-                        local torque = EngineDirection * (PowerPerWheel * wheelScale) * forceMult * torqueDir
-                        
-                        -- Safety Clamp (Increased for functionality)
-                        local limit = 50000 
-                        if torque.x ~= torque.x then torque = Vector(0,0,0) end -- NaN check
-                        torque = Vector(
-                            clamp(torque.x, -limit, limit),
-                            clamp(torque.y, -limit, limit),
-                            clamp(torque.z, -limit, limit)
-                        )
-                        netWheelTorqueFront[i] = (netWheelTorqueFront[i] or Vector(0,0,0)) + torque
+                    elseif diffType == 1 then
+                        lsdStiffness = s.FrontLSDStiffness or 3.0
+                    elseif diffType == 2 then
+                        lsdStiffness = 30.0 -- Hard Locked Differential
+                    end
+
+                    for i, w in pairs(FrontWheels) do
+                        if isValid(w) then
+                            local wheelScale = 1
+                            if s.FrontWheelPowerScale and s.FrontWheelPowerScale[i] then
+                                wheelScale = s.FrontWheelPowerScale[i]
+                            end
+                            local wheelWorldDir = getWheelWorldDir(w)
+                            local torque = wheelWorldDir * (PowerPerWheel * wheelScale) * forceMult * torqueDir
+                            
+                            -- Add locking/LSD torque if enabled
+                            if lsdStiffness > 0 and #FrontWheels > 1 then
+                                local wRPM = fRPMs[i] or 0
+                                local targetRPM = isCenterCoupled and avgAllRPM or avgFRPM
+                                local diffRPM = wRPM - targetRPM
+                                
+                                -- Opposing torque proportional to diff RPM
+                                local lsdTorqueVal = diffRPM * lsdStiffness
+                                
+                                -- Clamp locking torque relative to current engine load + a small stable preload
+                                -- This prevents HAVOK self-spinning oscillations at standstill
+                                -- Clamp locking torque relative to current engine load + a small stable preload
+                                -- This prevents HAVOK self-spinning oscillations at standstill
+                                local maxLSDTorque
+                                local preload = isCenterCoupled and (s.CenterFrontLSDPreload or 15.0) or (s.FrontLSDPreload or 15.0)
+                                if diffType == 2 or (isCenterCoupled and s.CenterDiffType == 2) then
+                                    if math.abs(s.Speed or 0) < 1.0 and math.abs(s.Throttle or 0) < 0.05 then
+                                        maxLSDTorque = preload
+                                    else
+                                        maxLSDTorque = 10000
+                                    end
+                                elseif diffType == 1 or (isCenterCoupled and s.CenterDiffType == 1) then
+                                    -- Viscous LSD: locking capacity is speed-sensitive and doesn't scale down with throttle.
+                                    -- We clamp it to a high maximum capacity limit (e.g. 5000 Nm)
+                                    maxLSDTorque = 5000
+                                else
+                                    -- Clutch-type/Open default fallback
+                                    local basePower = isCenterCoupled and (math.abs(scaledPower) / (#FrontWheels + #RearWheels)) or math.abs(PowerPerWheel * wheelScale)
+                                    maxLSDTorque = basePower * lockRatio + preload
+                                end
+                                lsdTorqueVal = math.clamp(lsdTorqueVal, -maxLSDTorque, maxLSDTorque)
+                                
+                                local lsdTorque = wheelWorldDir * lsdTorqueVal * forceMult * torqueDir
+                                torque = torque - lsdTorque
+                            end
+
+                            -- Safety Clamp (Increased for functionality)
+                            local limit = 50000 
+                            if torque.x ~= torque.x then torque = Vector(0,0,0) end -- NaN check
+                            torque = Vector(
+                                clamp(torque.x, -limit, limit),
+                                clamp(torque.y, -limit, limit),
+                                clamp(torque.z, -limit, limit)
+                            )
+                            netWheelTorqueFront[i] = (netWheelTorqueFront[i] or Vector(0,0,0)) + torque
+                        end
                     end
                 end
                 
                 -- Rear wheels  
-                if #RearWheels > 0 and RearPowerRatio > 0 then
+                if #RearWheels > 0 and (RearPowerRatio > 0 or isCenterCoupled) then
                     local RearPower = scaledPower * RearPowerRatio
                     local PowerPerWheel = RearPower / #RearWheels
-                    for i, w in pairs(RearWheels) do
-                        local forceMult = (c.ForceMult or 1) * 39.37 * 2 * tickMult
-                        local torqueDir = (c.TorqueInvert and -1 or 1)
-                        local wheelScale = 1
-                        if s.RearWheelPowerScale and s.RearWheelPowerScale[i] then
-                            wheelScale = s.RearWheelPowerScale[i]
+                    
+                    -- Calculate Average RPM for Rear Axle
+                    local rRPMs = s.RearRPMs or {}
+                    local sumRRPM = 0
+                    for _, rpm in ipairs(rRPMs) do sumRRPM = sumRRPM + rpm end
+                    local avgRRPM = #rRPMs > 0 and (sumRRPM / #rRPMs) or 0
+                    
+                    local diffType = s.RearDiffType or 0
+                    local lsdStiffness = 0
+                    local lockRatio = s.RearLSDLockRatio or 0.9
+                    if isCenterCoupled then
+                        if s.CenterDiffType == 1 then
+                            lsdStiffness = s.CenterRearLSDStiffness or 3.0
+                            lockRatio = s.CenterRearLSDLockRatio or 0.9
+                        else
+                            lsdStiffness = 30.0 -- Hard lock all wheels to the global average
                         end
-                        local torque = EngineDirection * (PowerPerWheel * wheelScale) * forceMult * torqueDir
-                        -- Safety Clamp
-                        local limit = 50000
-                        if torque.x ~= torque.x then torque = Vector(0,0,0) end -- NaN check
-                        torque = Vector(
-                            clamp(torque.x, -limit, limit),
-                            clamp(torque.y, -limit, limit),
-                            clamp(torque.z, -limit, limit)
-                        )
-                        netWheelTorqueRear[i] = (netWheelTorqueRear[i] or Vector(0,0,0)) + torque
+                    elseif diffType == 1 then
+                        lsdStiffness = s.RearLSDStiffness or 3.0
+                    elseif diffType == 2 then
+                        lsdStiffness = 30.0 -- Hard Locked Differential
+                    end
+
+                    for i, w in pairs(RearWheels) do
+                        if isValid(w) then
+                            local forceMult = (c.ForceMult or 1) * 39.37 * 2 * tickMult
+                            local torqueDir = (c.TorqueInvert and -1 or 1)
+                            local wheelScale = 1
+                            if s.RearWheelPowerScale and s.RearWheelPowerScale[i] then
+                                wheelScale = s.RearWheelPowerScale[i]
+                            end
+                            local wheelWorldDir = getWheelWorldDir(w)
+                            local torque = wheelWorldDir * (PowerPerWheel * wheelScale) * forceMult * torqueDir
+                            
+                            -- Add locking/LSD torque if enabled
+                            if lsdStiffness > 0 and #RearWheels > 1 then
+                                local wRPM = rRPMs[i] or 0
+                                local targetRPM = isCenterCoupled and avgAllRPM or avgRRPM
+                                local diffRPM = wRPM - targetRPM
+                                
+                                -- Opposing torque proportional to diff RPM
+                                local lsdTorqueVal = diffRPM * lsdStiffness
+                                
+                                -- Clamp locking torque relative to current engine load + a small stable preload
+                                -- This prevents HAVOK self-spinning oscillations at standstill
+                                local maxLSDTorque
+                                local preload = isCenterCoupled and (s.CenterRearLSDPreload or 15.0) or (s.RearLSDPreload or 15.0)
+                                if diffType == 2 or (isCenterCoupled and s.CenterDiffType == 2) then
+                                    if math.abs(s.Speed or 0) < 1.0 and math.abs(s.Throttle or 0) < 0.05 then
+                                        maxLSDTorque = preload
+                                    else
+                                        maxLSDTorque = 10000
+                                    end
+                                elseif diffType == 1 or (isCenterCoupled and s.CenterDiffType == 1) then
+                                    -- Viscous LSD: locking capacity is speed-sensitive and doesn't scale down with throttle.
+                                    -- We clamp it to a high maximum capacity limit (e.g. 5000 Nm)
+                                    maxLSDTorque = 5000
+                                else
+                                    -- Clutch-type/Open default fallback
+                                    local basePower = isCenterCoupled and (math.abs(scaledPower) / (#FrontWheels + #RearWheels)) or math.abs(PowerPerWheel * wheelScale)
+                                    maxLSDTorque = basePower * lockRatio + preload
+                                end
+                                lsdTorqueVal = math.clamp(lsdTorqueVal, -maxLSDTorque, maxLSDTorque)
+                                
+                                local lsdTorque = wheelWorldDir * lsdTorqueVal * forceMult * torqueDir
+                                torque = torque - lsdTorque
+                            end
+
+                            -- Safety Clamp
+                            local limit = 50000
+                            if torque.x ~= torque.x then torque = Vector(0,0,0) end -- NaN check
+                            torque = Vector(
+                                clamp(torque.x, -limit, limit),
+                                clamp(torque.y, -limit, limit),
+                                clamp(torque.z, -limit, limit)
+                            )
+                            netWheelTorqueRear[i] = (netWheelTorqueRear[i] or Vector(0,0,0)) + torque
+                        end
                     end
                 end
                 

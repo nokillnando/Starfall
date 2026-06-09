@@ -1,0 +1,222 @@
+-- Red Fox Engine Addon: Differential Locking Control
+-- Implements Front, Rear, and All-Wheel (Center) differential locking toggles with key detection.
+-- Allows configuring and overwriting locking types, stiffnesses, and lock ratios when locks are active.
+-- Follows standard Red Fox Engine Addon Framework.
+
+return {
+    DiffLock = {
+        Enabled = true, -- Set to true to use (overridden by config)
+
+        -- Configuration Keys
+        FrontLockKey = "k",        -- Key to toggle Front Axle lock
+        RearLockKey = "l",         -- Key to toggle Rear Axle lock
+        AllLockKey = "j",          -- Key to toggle All-Wheel (Center) lock
+
+        -- Register keys for client-to-server syncing
+        InputKeyFields = { "FrontLockKey", "RearLockKey", "AllLockKey" },
+
+        -- Addon Configuration Defaults (Non-Locked/Normal state - nil fallback to global config defaults)
+
+        -- Axle-Specific Differential Config (nil = fallback to global defaults above)
+        FrontDiffType = nil,       -- 0 = Open, 1 = Viscous LSD, 2 = Locked
+        FrontLSDStiffness = nil,   -- Front Viscous stiffness
+        FrontLSDLockRatio = nil,   -- Front Max lock percentage
+        
+        RearDiffType = nil,        -- 0 = Open, 1 = Viscous LSD, 2 = Locked
+        RearLSDStiffness = nil,    -- Rear Viscous stiffness
+        RearLSDLockRatio = nil,    -- Rear Max lock percentage
+
+        CenterDiffType = nil,      -- 0 = Open, 1 = Viscous LSD, 2 = Locked
+        CenterFrontLSDStiffness = nil, -- Front-Center Viscous stiffness
+        CenterFrontLSDLockRatio = nil, -- Front-Center Max lock percentage (0 to 100)
+        CenterRearLSDStiffness = nil,  -- Rear-Center Viscous stiffness
+        CenterRearLSDLockRatio = nil,  -- Rear-Center Max lock percentage (0 to 100)
+
+        -- Addon Configuration Overwrites (Active when Locked/Enabled)
+        -- Types: 0 = Open, 1 = Viscous LSD, 2 = Locked
+        FrontLockType = 2,          -- Type to apply when front lock is toggled ON
+        FrontLockStiffness = 30.0,  -- Viscous stiffness when front lock is active (high = stiffer)
+        FrontLockRatio = 95,        -- Lock ratio when front lock is active (0 to 100)
+
+        RearLockType = 2,           -- Type to apply when rear lock is toggled ON
+        RearLockStiffness = 30.0,   -- Viscous stiffness when rear lock is active
+        RearLockRatio = 95,         -- Lock ratio when rear lock is active (0 to 100)
+
+        CenterLockType = 2,         -- Type to apply when center lock (All Wheels) is toggled ON
+        CenterFrontLockStiffness = 30.0, -- Front-Center viscous stiffness when center lock active
+        CenterFrontLockRatio = 95,       -- Front-Center lock ratio when center lock active (0 to 100)
+        CenterRearLockStiffness = 30.0,  -- Rear-Center viscous stiffness when center lock active
+        CenterRearLockRatio = 95,        -- Rear-Center lock ratio when center lock active (0 to 100)
+
+        -- Internal States (0 = Open / LSD / Default, 2 = Locked/Active)
+        FrontLockedState = 0,      -- 0 = default config state, 2 = Lock Override active
+        RearLockedState = 0,       -- 0 = default config state, 2 = Lock Override active
+        AllLockedState = false,    -- false = default, true = Lock All Wheels active
+
+        -- Wire Inputs (allows toggling via wire buttons)
+        WireInputs = {
+            { name = "FrontLock", type = "normal" },
+            { name = "RearLock", type = "normal" },
+            { name = "AllLock", type = "normal" }
+        },
+
+        -- Wire Outputs (Mapped to fields in this table)
+        WireOutputs = {
+            { name = "FrontLocked", source = "FrontLockedOut", type = "normal" },
+            { name = "RearLocked", source = "RearLockedOut", type = "normal" },
+            { name = "AllLocked", source = "AllLockedOut", type = "normal" }
+        },
+
+        -- Synced State (Networked to client)
+        SyncedState = { "FrontLockedState", "RearLockedState", "AllLockedState" },
+
+        -- Wire output mapped fields
+        FrontLockedOut = 0,
+        RearLockedOut = 0,
+        AllLockedOut = 0,
+
+        -- Helper: Print hint to driver
+        PrintHint = function(ply, text)
+            if isValid(ply) and ply:isPlayer() then
+                if SERVER then
+                    pcall(printHud, ply, text)
+                elseif ply == player() then
+                    pcall(printHud, text)
+                end
+            end
+        end,
+
+        -- Helper: Check if a wire input is connected
+        IsInputConnected = function(name)
+            local wl = wire and wire.getWirelink and wire.getWirelink(chip())
+            if wl and wl.isWired then
+                return wl:isWired(name)
+            end
+            return false
+        end,
+
+        -- Hook: Initialization
+        OnInit = function(state, config)
+            local addon = config.Addons.DiffLock
+            addon.FrontLockedState = 0
+            addon.RearLockedState = 0
+            addon.AllLockedState = false
+            addon.FrontLockedOut = 0
+            addon.RearLockedOut = 0
+            addon.AllLockedOut = 0
+        end,
+
+        -- Hook: Main Update Loop
+        OnEngineUpdate = function(state, config)
+            local addon = config.Addons.DiffLock
+            local driver = state.Driver
+            
+            -- ========================================================================
+            -- WIRE INPUT CONTROLS
+            -- ========================================================================
+            -- Allow wire inputs to override/set the lock states ONLY if they are actually connected
+            if wire and wire.ports then
+                if addon.IsInputConnected("FrontLock") then
+                    addon.FrontLockedState = (wire.ports.FrontLock > 0) and 2 or 0
+                end
+                if addon.IsInputConnected("RearLock") then
+                    addon.RearLockedState = (wire.ports.RearLock > 0) and 2 or 0
+                end
+                if addon.IsInputConnected("AllLock") then
+                    addon.AllLockedState = (wire.ports.AllLock > 0)
+                end
+            end
+
+            -- ========================================================================
+            -- KEYBOARD/DRIVER CONTROLS
+            -- ========================================================================
+            if isValid(driver) then
+                local keyState = state.DriverKeyState and state.DriverKeyState[driver]
+                if keyState then
+                    -- 1. Front Lock Toggle
+                    if keyState.pressedKeys and keyState.pressedKeys[addon.FrontLockKey] then
+                        if addon.FrontLockedState == 2 then
+                            addon.FrontLockedState = 0
+                            addon.PrintHint(driver, "Front Differential: OPEN / LSD (Default)")
+                        else
+                            addon.FrontLockedState = 2
+                            local modeStr = (addon.FrontLockType == 1) and "LSD (Override)" or "LOCKED (Welded)"
+                            addon.PrintHint(driver, "Front Differential: " .. modeStr)
+                        end
+                        keyState.pressedKeys[addon.FrontLockKey] = nil
+                        state.ForceNetNow = true
+                    end
+
+                    -- 2. Rear Lock Toggle
+                    if keyState.pressedKeys and keyState.pressedKeys[addon.RearLockKey] then
+                        if addon.RearLockedState == 2 then
+                            addon.RearLockedState = 0
+                            addon.PrintHint(driver, "Rear Differential: OPEN / LSD (Default)")
+                        else
+                            addon.RearLockedState = 2
+                            local modeStr = (addon.RearLockType == 1) and "LSD (Override)" or "LOCKED (Welded)"
+                            addon.PrintHint(driver, "Rear Differential: " .. modeStr)
+                        end
+                        keyState.pressedKeys[addon.RearLockKey] = nil
+                        state.ForceNetNow = true
+                    end
+
+                    -- 3. All Lock Toggle
+                    if keyState.pressedKeys and keyState.pressedKeys[addon.AllLockKey] then
+                        addon.AllLockedState = not addon.AllLockedState
+                        if addon.AllLockedState then
+                            local modeStr = (addon.CenterLockType == 1) and "ACTIVE (Viscous LSD Center)" or "ACTIVE (Center Welded)"
+                            addon.PrintHint(driver, "All Wheels Lock: " .. modeStr)
+                        else
+                            addon.PrintHint(driver, "All Wheels Lock: INACTIVE")
+                        end
+                        keyState.pressedKeys[addon.AllLockKey] = nil
+                        state.ForceNetNow = true
+                    end
+                end
+            end
+
+            -- ========================================================================
+            -- APPLY OVERRIDES TO ENGINE PHYSICS STATE
+            -- ========================================================================
+            -- Dynamically override front, rear, and all-wheel differential lock states
+            if addon.AllLockedState then
+                state.CenterDiffType = addon.CenterLockType or 2
+                state.CenterFrontLSDStiffness = addon.CenterFrontLockStiffness or 30.0
+                state.CenterRearLSDStiffness = addon.CenterRearLockStiffness or 30.0
+                state.CenterFrontLSDLockRatio = (addon.CenterFrontLockRatio or 95) / 100
+                state.CenterRearLSDLockRatio = (addon.CenterRearLockRatio or 95) / 100
+            else
+                state.CenterDiffType = addon.CenterDiffType or 0
+                state.CenterFrontLSDStiffness = addon.CenterFrontLSDStiffness
+                state.CenterRearLSDStiffness = addon.CenterRearLSDStiffness
+
+                -- Apply axle locks if all-wheel lock is not overriding them
+                if addon.FrontLockedState == 2 then
+                    state.FrontDiffType = addon.FrontLockType or 2
+                    state.FrontLSDStiffness = addon.FrontLockStiffness or 30.0
+                    state.FrontLSDLockRatio = (addon.FrontLockRatio or 95) / 100
+                else
+                    state.FrontDiffType = addon.FrontDiffType or config.FrontDiffType or 1
+                    state.FrontLSDStiffness = addon.FrontLSDStiffness or config.FrontLSDStiffness or 3.0
+                    state.FrontLSDLockRatio = (addon.FrontLSDLockRatio or (config.FrontLSDLockRatio or 90)) / 100
+                end
+
+                if addon.RearLockedState == 2 then
+                    state.RearDiffType = addon.RearLockType or 2
+                    state.RearLSDStiffness = addon.RearLockStiffness or 30.0
+                    state.RearLSDLockRatio = (addon.RearLockRatio or 95) / 100
+                else
+                    state.RearDiffType = addon.RearDiffType or config.RearDiffType or 1
+                    state.RearLSDStiffness = addon.RearLSDStiffness or config.RearLSDStiffness or 3.0
+                    state.RearLSDLockRatio = (addon.RearLSDLockRatio or (config.RearLSDLockRatio or 90)) / 100
+                end
+            end
+
+            -- Update wire output mappings
+            addon.FrontLockedOut = (state.FrontDiffType == 2 or state.CenterDiffType == 2) and 1 or 0
+            addon.RearLockedOut = (state.RearDiffType == 2 or state.CenterDiffType == 2) and 1 or 0
+            addon.AllLockedOut = (state.CenterDiffType == 2) and 1 or 0
+        end
+    }
+}

@@ -10,6 +10,11 @@ local Core = _G.RedFoxEngineCore
 --Make sure to wire an hud component to see hints
 --[[
 Changelog
+
+V3.04
+    Differential locking and LSD stuff
+    Its not perfect, but it works
+    Addon example for differential locking
     
 V3.03
     Fixed key delay(for the most part)  for extrafeatures addon
@@ -20,7 +25,7 @@ V3.03
 
 -- Configuration Table
 local config = {
-    ConfigVersion = "3.03",
+    ConfigVersion = "3.04",
     
     -- Engine Specifications
     Engine_Bore = 87,
@@ -60,6 +65,24 @@ local config = {
     SpeedScale = 1.33, -- Multiply wire speed outputs by this factor (use 1.33 for player-scale speed)
     
     PowerDistribution = 0, -- 0 = RWD, 100 = FWD, 50 = AWD
+    -- Differential Configuration
+    FrontDiffType = 1,         -- 0 = Open, 1 = Viscous LSD, 2 = Locked
+    FrontLSDStiffness = 3.0,   -- Front Viscous stiffness
+    FrontLSDLockRatio = 90,    -- Front Max lock percentage (0 to 100)
+    FrontLSDPreload = 15.0,    -- Front Preload torque
+    
+    RearDiffType = 1,          -- 0 = Open, 1 = Viscous LSD, 2 = Locked
+    RearLSDStiffness = 3.0,    -- Rear Viscous stiffness
+    RearLSDLockRatio = 90,     -- Rear Max lock percentage (0 to 100)
+    RearLSDPreload = 15.0,     -- Rear Preload torque
+    
+    CenterDiffType = 0,        -- 0 = Open (Independent/2WD), 1 = Viscous LSD Center, 2 = Locked Center
+    CenterFrontLSDStiffness = 3.0,  -- Front-Center viscous stiffness
+    CenterFrontLSDLockRatio = 90,   -- Front-Center max lock percentage (0 to 100)
+    CenterFrontLSDPreload = 15.0,   -- Front-Center preload torque
+    CenterRearLSDStiffness = 3.0,   -- Rear-Center viscous stiffness
+    CenterRearLSDLockRatio = 90,    -- Rear-Center max lock percentage (0 to 100)
+    CenterRearLSDPreload = 15.0,    -- Rear-Center preload torque
     
     -- Transmission Tuning
     AutoGear = true,

@@ -154,6 +154,44 @@ Now that this has been said, go scroll down
     Parent = "Wheel_Front_Left"-----Now you can set wheels and more in a single chip, works as a custom parent for each mesh entry
     FixAngles = { pitch=false, yaw=false, roll=false, invert=false } -- Set axes to lock to AngleFixTarget's world rotation. Use invert=true for mirrored wheels (like right-side calipers).
     AngleFixTarget = "Base"---------Entity input name whose angle is used for FixAngles (defaults to Base)
+    ColorCommand--------------------String (e.g. "Body"), enables chat-activated color/phong/reflection adjustments (e.g. typing "!Body 255 0 0" in chat while looking at the car). Supports optional overrides separated by "|" (e.g. "!Body color | phong_tint | envmap_tint | phong_mult | envmap_mult").
+    
+    
+    ColorCommand Chat Commands:
+    
+    If you define "ColorCommand = 'CommandName'" on a mesh, the vehicle owner looking at the vehicle can type
+    "!CommandName [arguments]" (or /CommandName) in chat to dynamically recolor that mesh and its materials.
+    
+    Arguments are separated by the pipe character "|" and support the following options:
+    
+    1. Base Color (Segment 1 - Required):
+       - What it does:
+         Sets the base diffuse/albedo color of the hologram/mesh and its material (ColorAndAlpha).
+       - Hex Format: "#RRGGBB" or "#RRGGBBAA" (e.g. #FF0000 or #FF0000FF)
+       - RGB Format: "R G B" or "R, G, B" (can be 0-255 integers or 0.0-1.0 floats, e.g. 255 0 0 or 1 0 0)
+       - RGBA Format: "R G B A" or "R, G, B, A" (e.g. 255 0 0 255)
+       
+    2. Specular Tints (Optional Segments):
+       - What it does:
+         Overrides/tints the color of specular highlights (phong) and environmental reflections (envmap).
+         Tints are parsed using Hex, RGB, or RGBA formats (same as base color).
+       - Logic & Variables Affected:
+         - If you provide ONE additional color segment, it tints BOTH Phong ($phongtint) and EnvMap ($envmaptint).
+           Example: "!CommandName #FF0000 | #0000FF" (Red paint with Blue specular highlights and reflections)
+         - If you provide TWO additional color segments, the 1st tints Phong ($phongtint), and the 2nd tints EnvMap ($envmaptint).
+           Example: "!CommandName #FF0000 | #0000FF | #00FF00" (Red paint, Blue specular highlights, Green reflections)
+       
+    3. Specular Multipliers (Optional Segments - Numbers or Percentages):
+       - What it does:
+         Boosts or dims the intensity of phong highlights (specular brightness) and envmap reflections (shininess).
+       - Formats:
+         - Can be percentages (e.g. "150%" or "150" - values > 2 are divided by 100).
+         - Can be multipliers (e.g. "1.5" or "0.5" - floats <= 2.0).
+       - Logic & Variables Affected:
+         - If you provide ONE numeric segment, it scales BOTH Phong and EnvMap intensities.
+           Example: "!CommandName #FF0000 | 150%" (Red paint, 1.5x brighter specular highlights and reflections)
+         - If you provide TWO numeric segments, the 1st scales Phong ($phongtint multiplier), and the 2nd scales EnvMap ($envmaptint multiplier).
+           Example: "!CommandName #FF0000 | #0000FF | 1.5 | 50%" (Red paint, Blue specular highlights, 1.5x phong boost, 0.5x reflection envmap boost)
     
     
     Texture swap examples:
@@ -245,7 +283,7 @@ Now that this has been said, go scroll down
     ]]--
 --############################################################################################################################################
 --Actual things to change
-local ConfigVersion = "2.14"
+local ConfigVersion = "2.15"
 local meshName = "Body - Main" --Just the chip name when finished
 local globalScale = Vector(1) -- Scale all meshes added by this amount, or add a scale vector to individual meshes
 local offsetPos = Vector(0, 0, 0) -- Offsets are relative to chip/base
@@ -254,9 +292,14 @@ local meshSpawnDelay = 0.1 -- Delay in seconds between spawning each mesh, adjus
 local showMeshSpawnProgress = false -- Set to true to show progress in console
 
 local debugPrints = false  -- Set to false to disable most console messages
-local showProgressDisplay = true  -- Set to true to show 3D2D progress display, only useful for the owner, as other players cant see it
-local progressDisplayType = "bar"  -- "bar" or "text" for the display style
-local progressDisplayHeight = 35  -- Height above the chip
+local showProgressDisplay = true  -- Set to true to show progress display, only useful for the owner (unless using hologram style)
+local progressDisplayType = "hologram"  -- "bar", "text", or "hologram" for the display style
+local progressDisplayHeight = 45  -- Height above the chip
+local progressDisplayPos = nil       -- Optional: Vector offset position (e.g. Vector(0, 0, 35)), overrides progressDisplayHeight
+local progressDisplayScale = nil     -- Optional: Vector or number for hologram scale (e.g. 5.5 or Vector(5.5, 5.5, 1))
+local progressDisplayColor = nil     -- Optional: Primary color (Mesh progress theme)
+local progressDisplayColor2 = nil    -- Optional: Secondary color (Texture progress theme)
+local progressDisplayBgColor = nil   -- Optional: Background color (e.g. Color(10, 14, 24, 240) or Vector(10, 14, 24))
 local AllowCheckVersion = true  -- Set to false to disable online version checking
 local UpdateRate = 33           -- Network update frequency (Hz)
 local DownloadImages = true     -- Set to true to bypass texture limits by downloading png/jpg to temp
@@ -280,6 +323,7 @@ local meshes = {
             --Parent = "Wheel_Front_Left" --now you can set wheels and more in a single chip
             --FixAngles = { pitch=false, yaw=false, roll=false },
             --AngleFixTarget = "Base",
+            --ColorCommand = "paint_car", -- Enables chat-activated color commands e.g. "!paint_car [color] | [phong tint] | [envmap tint]"
            --[[
             TextureSwaps = {
                 ["Brake"] = { --Input name
@@ -380,7 +424,11 @@ local progressData = {
     builtMeshes = 0,
     spawnedMeshes = 0,
     totalSpawnItems = 0,
-    currentStage = "Idle"
+    currentStage = "Idle",
+    currentMeshName = "",
+    currentTextureName = "",
+    totalTextures = 0,
+    loadedTextures = 0
 }
 
 -- Process the meshes table to add defaults
@@ -414,6 +462,11 @@ if _G.MeshLoaderCore then
         showProgressDisplay = showProgressDisplay,
         progressDisplayType = progressDisplayType,
         progressDisplayHeight = progressDisplayHeight,
+        progressDisplayPos = progressDisplayPos,
+        progressDisplayScale = progressDisplayScale,
+        progressDisplayColor = progressDisplayColor,
+        progressDisplayColor2 = progressDisplayColor2,
+        progressDisplayBgColor = progressDisplayBgColor,
         meshes = meshes,
         downloadStatus = downloadStatus,
         progressData = progressData,
