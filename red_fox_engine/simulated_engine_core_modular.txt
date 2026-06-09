@@ -3387,13 +3387,19 @@ if CLIENT then
                     starterInterval = starterLoopTime
                 end
                 starterLoopActive = true
-                -- Play with custom path
-                local starterSound = sound.create(chip(), actualPath, false)
+                -- Reuse the starter sound object if it already exists, avoiding sound.create() duplication limit (20)
+                local starterSound = sounds["Starter"]
+                if not starterSound then
+                    starterSound = sound.create(chip(), actualPath, false)
+                    sounds["Starter"] = starterSound
+                end
+                
                 if starterSound then
                     starterSound:setPitch(starterLoopPitch)
                     starterSound:setVolume(starterLoopVolume)
-                    starterSound:play()
-                    sounds["Starter"] = starterSound
+                    if not starterSound:isPlaying() then
+                        starterSound:play()
+                    end
                 end
                 starterLastPlay = timer.curtime()
                 -- Set up looping timer
