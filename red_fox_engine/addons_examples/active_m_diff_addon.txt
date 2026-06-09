@@ -25,16 +25,16 @@ return {
         FrontMaxLockRatio = 95,      -- Maximum locking capacity percentage (0 to 100)
 
         -- Rear Axle Active Parameters (Tuning)
-        RearMinStiffness = 1.0,      -- Lock stiffness when open/cruising (1.0 = open/very soft)
-        RearMaxStiffness = 30.0,     -- Max locking stiffness under load (30.0 = hard welded lock)
-        RearMinLockRatio = 10,       -- Minimum locking capacity percentage (0 to 100)
-        RearMaxLockRatio = 98,       -- Maximum locking capacity percentage (0 to 100)
+        RearMinStiffness = 5.0,      -- Lock stiffness when open/cruising (1.0 = open/very soft)
+        RearMaxStiffness = 20.0,     -- Max locking stiffness under load (30.0 = hard welded lock)
+        RearMinLockRatio = 15,       -- Minimum locking capacity percentage (0 to 100)
+        RearMaxLockRatio = 40,       -- Maximum locking capacity percentage (0 to 100)
 
         -- Front-Center Coupling Active Parameters (Tuning)
-        CenterFrontMinStiffness = 1.0,  -- Front-Center stiffness when open/cruising
-        CenterFrontMaxStiffness = 30.0, -- Front-Center max stiffness under load
-        CenterFrontMinLockRatio = 10,   -- Front-Center min lock percentage (0 to 100)
-        CenterFrontMaxLockRatio = 90,   -- Front-Center max lock percentage (0 to 100)
+        CenterFrontMinStiffness = 5.0,  -- Front-Center stiffness when open/cruising
+        CenterFrontMaxStiffness = 20.0, -- Front-Center max stiffness under load
+        CenterFrontMinLockRatio = 0,   -- Front-Center min lock percentage (0 to 100)
+        CenterFrontMaxLockRatio = 40,   -- Front-Center max lock percentage (0 to 100)
 
         -- Rear-Center Coupling Active Parameters (Tuning)
         CenterRearMinStiffness = 1.0,   -- Rear-Center stiffness when open/cruising
@@ -43,8 +43,7 @@ return {
         CenterRearMaxLockRatio = 90,    -- Rear-Center max lock percentage (0 to 100)
         
         -- Tuning Scales
-        ThrottleScale = 15.0,      -- How aggressively throttle locks the differential
-        SlipScale = 0.5,           -- How aggressively wheel speed difference (RPM) locks the diff
+        SlipScale = 2.0,           -- How aggressively wheel speed difference (RPM) locks the diff (higher = locks faster on slip)
         SlipThreshold = 12.0,      -- Wheel speed difference (RPM) to trigger slip detection (higher = ignores normal cornering)
         BypassCapsOnSlip = true,   -- If true, slips automatically bypass throttle caps to capture traction
         SteerDeclineSpeed = 40,    -- Speed (KPH) under which steering declines locking stiffness (prevents low speed binding)
@@ -138,7 +137,8 @@ return {
             if addon.TargetFrontAxle then
                 local lockRange = math.max(addon.FrontMaxLockRatio - addon.FrontMinLockRatio, 1)
                 local throttleLock = throttle * lockRange
-                local slipLock = frontSlipRPM * (lockRange * 0.1)
+                -- Scale slip locking contribution by throttle position so that off-throttle slip lets the diff open up
+                local slipLock = frontSlipRPM * (lockRange * 0.1) * throttle
                 local lockPct = addon.FrontMinLockRatio + throttleLock + slipLock
                 
                 -- Apply steering reduction
@@ -193,7 +193,8 @@ return {
             if addon.TargetRearAxle then
                 local lockRange = math.max(addon.RearMaxLockRatio - addon.RearMinLockRatio, 1)
                 local throttleLock = throttle * lockRange
-                local slipLock = rearSlipRPM * (lockRange * 0.1)
+                -- Scale slip locking contribution by throttle position so that off-throttle slip lets the diff open up
+                local slipLock = rearSlipRPM * (lockRange * 0.1) * throttle
                 local lockPct = addon.RearMinLockRatio + throttleLock + slipLock
                 
                 -- Apply steering reduction
@@ -248,7 +249,7 @@ return {
             if addon.TargetFrontCenter then
                 local lockRange = math.max(addon.CenterFrontMaxLockRatio - addon.CenterFrontMinLockRatio, 1)
                 local throttleLock = throttle * lockRange
-                local slipLock = frontSlipRPM * (lockRange * 0.1) -- locks on axle wheel differences
+                local slipLock = frontSlipRPM * (lockRange * 0.1) * throttle -- locks on axle wheel differences under throttle
                 local lockPct = addon.CenterFrontMinLockRatio + throttleLock + slipLock
                 
                 lockPct = lockPct * lockReduction
@@ -258,7 +259,7 @@ return {
                 if addon.BypassCapsOnSlip and frontSlipRPM >= dynamicSlipThreshold then
                     shouldCap = false
                 end
-
+                
                 if shouldCap then
                     local throttleCap = 0
                     if throttle > 0 then
@@ -298,7 +299,7 @@ return {
             if addon.TargetRearCenter then
                 local lockRange = math.max(addon.CenterRearMaxLockRatio - addon.CenterRearMinLockRatio, 1)
                 local throttleLock = throttle * lockRange
-                local slipLock = rearSlipRPM * (lockRange * 0.1)
+                local slipLock = rearSlipRPM * (lockRange * 0.1) * throttle
                 local lockPct = addon.CenterRearMinLockRatio + throttleLock + slipLock
                 
                 lockPct = lockPct * lockReduction
