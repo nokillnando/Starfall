@@ -3753,8 +3753,11 @@ if CLIENT then
                          if not soundInRange then
                              -- Mute all active sounds once when going out of range
                              for _, snd in pairs(sounds) do
-                                 if type(snd) == "Sound" and snd:isValid() then
-                                     snd:setVolume(0)
+                                 local t = type(snd)
+                                 if t == "Sound" or t == "Bass" then
+                                     if not snd.isValid or snd:isValid() then
+                                         snd:setVolume(0)
+                                     end
                                  end
                              end
                          else
