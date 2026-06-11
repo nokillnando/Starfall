@@ -2,11 +2,12 @@
 --@author [C17] Red Fox
 --@shared
 
-local Version = "1.15"
+local Version = "1.16"
 
 --[[
 Changelog
-    
+V1.16
+    Optimization
 V1.15
     Fixed stupid constraint retrieval lag    
 
