@@ -3,10 +3,18 @@
 
 local Core = {}
 _G.RedFoxEngineCore = Core
-local Version = "3.09" -- v3 Alpha
+local Version = "3.10" -- v3 Alpha
 
 --[[
 Changelog:
+V3.10  
+    Hopefully this wont come to bite me later
+    Fixed or rather tried to, optimize overall core due to last changes
+    Related to differential stuff
+    At 33 update rate it should hover at around 500~ usage down from up to 2k or more, atleast thats what i seen on servers
+    Please notify me if something broke or the usage is acting wierd
+    On singleplayer usage is still rather high apparently?
+
 V3.09
     Differential Locking, Finally
     Center Lock, Center LSD, Center Open, Front Lock, Front LSD, Front Open, Rear Lock, Rear LSD, Rear Open
@@ -97,6 +105,26 @@ if SERVER then
         -- ============================================================================
         local c = config
         
+        -- Axis Getter Caching for Performance
+        local function getAxisGetter(name)
+            if type(name) == "Vector" then
+                return function(ent)
+                    if not isValid(ent) then return Vector(0,0,0) end
+                    return ent:getForward() * name.x + ent:getRight() * name.y + ent:getUp() * name.z
+                end
+            elseif name == "Up" then return function(ent) return isValid(ent) and ent:getUp() or Vector(0,0,0) end
+            elseif name == "Down" then return function(ent) return isValid(ent) and -ent:getUp() or Vector(0,0,0) end
+            elseif name == "Forward" then return function(ent) return isValid(ent) and ent:getForward() or Vector(0,0,0) end
+            elseif name == "Backward" then return function(ent) return isValid(ent) and -ent:getForward() or Vector(0,0,0) end
+            elseif name == "Right" then return function(ent) return isValid(ent) and ent:getRight() or Vector(0,0,0) end
+            elseif name == "Left" then return function(ent) return isValid(ent) and -ent:getRight() or Vector(0,0,0) end
+            else return function(ent) return isValid(ent) and ent:getUp() or Vector(0,0,0) end end
+        end
+
+        local getEngineDirection = getAxisGetter(c.EngineAxis)
+        local getChassisFeedDirection = getAxisGetter(c.ChassisFeedDirectionAxis)
+        local getChassisFeedForwardDirection = getAxisGetter(c.ChassisFeedForwardAxis)
+        
         -- Wire Setup
         local coreInputNames = { "Pod", "Chassis", "Engine", "FrontWheels", "RearWheels" }
         local coreInputTypes = { "wirelink", "entity", "entity", "array", "array" }
@@ -167,7 +195,27 @@ if SERVER then
             Throttle_Delay = 0, Clutch_Delay = 0,
             IsInManualMode = false, IsInSportMode = false,
             Timers = {},
-            LastSyncedValues = {}  -- Track last sent values for delta-based sending
+            LastSyncedValues = {},  -- Track last sent values for delta-based sending
+            FrontRPMs = {},
+            RearRPMs = {},
+            Flywheels_RPM = {},
+            
+            -- Differential Configuration Defaults
+            FrontDiffType = config.FrontDiffType or 1,
+            RearDiffType = config.RearDiffType or 1,
+            CenterDiffType = config.CenterDiffType or 0,
+            FrontLSDStiffness = config.FrontLSDStiffness or 3.0,
+            RearLSDStiffness = config.RearLSDStiffness or 3.0,
+            FrontLSDLockRatio = (config.FrontLSDLockRatio or 90) / 100,
+            RearLSDLockRatio = (config.RearLSDLockRatio or 90) / 100,
+            FrontLSDPreload = config.FrontLSDPreload or 15.0,
+            RearLSDPreload = config.RearLSDPreload or 15.0,
+            CenterFrontLSDStiffness = config.CenterFrontLSDStiffness or 3.0,
+            CenterRearLSDStiffness = config.CenterRearLSDStiffness or 3.0,
+            CenterFrontLSDLockRatio = (config.CenterFrontLSDLockRatio or 90) / 100,
+            CenterRearLSDLockRatio = (config.CenterRearLSDLockRatio or 90) / 100,
+            CenterFrontLSDPreload = config.CenterFrontLSDPreload or 15.0,
+            CenterRearLSDPreload = config.CenterRearLSDPreload or 15.0
         }
         
         -- Physics Object Cache (Improves performance by avoiding C++ boundary crossings every tick)
@@ -882,29 +930,13 @@ if SERVER then
             local FrontWheels = wire.ports.FrontWheels or {}
             local RearWheels = wire.ports.RearWheels or {}
             
-            -- Determine Drive Axis (used for wheel RPM and force application)
-            local function getAxis(ent, name)
-                if type(name) == "Vector" then
-                    -- Transform local vector to world space using entity's orientation
-                    local fwd = ent:getForward()
-                    local right = ent:getRight()
-                    local up = ent:getUp()
-                    return fwd * name.x + right * name.y + up * name.z
-                end
-                if name == "Up" then return ent:getUp()
-                elseif name == "Down" then return -ent:getUp()
-                elseif name == "Forward" then return ent:getForward()
-                elseif name == "Backward" then return -ent:getForward()
-                elseif name == "Right" then return ent:getRight()
-                elseif name == "Left" then return -ent:getRight()
-                else return ent:getUp() end
-            end
-            
             -- EngineDirection should follow the Engine entity orientation (E2 parity)
             -- Must recalculate every frame to follow engine rotation
-            local EngineDirection = getAxis(Engine, c.EngineAxis)
+            local EngineDirection = getEngineDirection(Engine)
             
             if not s.WheelSpinAxis then s.WheelSpinAxis = {} end
+            if not s.WheelSpinAxisComponent then s.WheelSpinAxisComponent = {} end
+            if not s.WheelSpinDirectionMethod then s.WheelSpinDirectionMethod = {} end
             
             local function getWheelSpinAxis(w)
                 local localAxis = s.WheelSpinAxis[w]
@@ -913,40 +945,108 @@ if SERVER then
                     local absX = math.abs(localDir.x)
                     local absY = math.abs(localDir.y)
                     local absZ = math.abs(localDir.z)
+                    
+                    local comp = "x"
                     if absX > absY and absX > absZ then
                         localAxis = Vector(localDir.x > 0 and 1 or -1, 0, 0)
+                        comp = localDir.x > 0 and "x" or "-x"
                     elseif absY > absX and absY > absZ then
                         localAxis = Vector(0, localDir.y > 0 and 1 or -1, 0)
+                        comp = localDir.y > 0 and "y" or "-y"
                     else
                         localAxis = Vector(0, 0, localDir.z > 0 and 1 or -1)
+                        comp = localDir.z > 0 and "z" or "-z"
                     end
                     s.WheelSpinAxis[w] = localAxis
+                    s.WheelSpinAxisComponent[w] = comp
                 end
                 return localAxis
             end
 
             local function getWheelWorldDir(w)
                 if not isValid(w) then return EngineDirection end
-                local localAxis = getWheelSpinAxis(w)
-                if not localAxis then return EngineDirection end
-                return (w:localToWorld(localAxis) - w:getPos()):getNormalized()
+                local method = s.WheelSpinDirectionMethod[w]
+                if not method then
+                    local localAxis = getWheelSpinAxis(w)
+                    if not localAxis then return EngineDirection end
+                    if localAxis.x > 0.9 then method = "Forward"
+                    elseif localAxis.x < -0.9 then method = "-Forward"
+                    elseif localAxis.y > 0.9 then method = "Left"
+                    elseif localAxis.y < -0.9 then method = "Right"
+                    elseif localAxis.z > 0.9 then method = "Up"
+                    elseif localAxis.z < -0.9 then method = "-Up"
+                    else method = "Forward" end
+                    s.WheelSpinDirectionMethod[w] = method
+                end
+                
+                if method == "Forward" then return w:getForward()
+                elseif method == "-Forward" then return -w:getForward()
+                elseif method == "Left" then return -w:getRight()
+                elseif method == "Right" then return w:getRight()
+                elseif method == "Up" then return w:getUp()
+                elseif method == "-Up" then return -w:getUp()
+                else return w:getForward() end
             end
             
             -- ============================================================================
-            -- WHEEL RPM & BRAKE FORCES (Run Every Frame)
+            -- WHEEL PHYSICS & DIFFERENTIAL CALCULATIONS (Run Every Frame / Smart Skip)
             -- ============================================================================
+            local ChassisPhys = getPhys(Chassis)
+            local isMoveable = isValid(ChassisPhys) and ChassisPhys:isMoveable()
+            
+            -- Prepare unified torque accumulators to minimize applyTorque calls
+            local netWheelTorqueFront = {}
+            local netWheelTorqueRear = {}
+            
             -- Wheel RPMs are calculated at UpdateRate frequency and cached in state
             -- Use cached FrontRPMs/RearRPMs for this frame's force applications
             local FrontRPMs = s.FrontRPMs or {}
             local RearRPMs = s.RearRPMs or {}
             local Flywheels_RPM = s.Flywheels_RPM or {}
 
-            -- Prepare unified torque accumulators to minimize applyTorque calls
-            local netWheelTorqueFront = {}
-            local netWheelTorqueRear = {}
+            -- Check if we can skip expensive wheel & differential calculations this frame.
+            -- This occurs when:
+            -- 1. The vehicle is completely frozen (isMoveable is false).
+            -- 2. OR when:
+            --    a. The engine is off/idle and not applying torque (scaledPower is near 0).
+            --    b. The vehicle is stationary (s.Speed is very low).
+            --    c. The wheels are not spinning (average/individual wheel RPMs are near 0).
+            -- This optimization dramatically reduces CPU instructions (ops) when the vehicle is stationary or frozen.
+            local isStationary = (s.Speed or 0) < 0.1
+            local wheelsSpinning = false
+            for _, rpm in ipairs(FrontRPMs) do
+                if math.abs(rpm) > 1 then wheelsSpinning = true; break end
+            end
+            if not wheelsSpinning then
+                for _, rpm in ipairs(RearRPMs) do
+                    if math.abs(rpm) > 1 then wheelsSpinning = true; break end
+                end
+            end
+            
+            -- Determine if engine is applying active power to wheels
+            local desiredMass = s.EffectiveVehicleMass or config.Engine_SimulatedVehicleMass or 1000
+            local actualMass = s.ActualVehicleMass or desiredMass
+            local massScale = actualMass / math.max(desiredMass, 1)
+            massScale = math.clamp(massScale, c.Engine_MinMassScale or 0.2, c.Engine_MaxMassScale or 2.5)
+            local scaledPower = 0
+            if s.Flywheel_Power and math.abs(s.Flywheel_Power) > 0.1 and s.Active then
+                scaledPower = s.Flywheel_Power * massScale
+            end
+            
+            local hasPower = math.abs(scaledPower) > 0.1
+            local shouldRunWheelPhysics = isMoveable and (hasPower or not isStationary or wheelsSpinning)
+
+            -- Wheel World Direction cache (to avoid duplicate localToWorld calls on the same wheel)
+            local cachedWheelWorldDirs = {}
+            local function getCachedWheelWorldDir(w)
+                if cachedWheelWorldDirs[w] then return cachedWheelWorldDirs[w] end
+                local dir = getWheelWorldDir(w)
+                cachedWheelWorldDirs[w] = dir
+                return dir
+            end
 
             -- Apply braking torque (runs every frame, uses cached BrakeF/BrakeR from gate)
-            if s.Brake == 1 then
+            if shouldRunWheelPhysics and s.Brake == 1 then
                 local brakeF = s.BrakeF or 0
                 local brakeR = s.BrakeR or 0
                 local brakeForcesFront = nil
@@ -982,7 +1082,7 @@ if SERVER then
                         local force = 5 * wheelRPM * tickMult
                         local brakeMult = c.BrakeMult or 1
                         local finalBrake = (brakeForcesFront and brakeForcesFront[i]) or brakeF
-                        local wheelWorldDir = getWheelWorldDir(w)
+                        local wheelWorldDir = getCachedWheelWorldDir(w)
                         netWheelTorqueFront[i] = wheelWorldDir * force * finalBrake * brakeMult
                     end
                 end
@@ -992,7 +1092,7 @@ if SERVER then
                         local force = 5 * wheelRPM * tickMult
                         local brakeMult = c.BrakeMult or 1
                         local finalBrake = (brakeForcesRear and brakeForcesRear[i]) or brakeR
-                        local wheelWorldDir = getWheelWorldDir(w)
+                        local wheelWorldDir = getCachedWheelWorldDir(w)
                         netWheelTorqueRear[i] = wheelWorldDir * force * finalBrake * brakeMult
                     end
                 end
@@ -1136,22 +1236,44 @@ if SERVER then
             
             
             
-            for _, w in pairs(FrontWheels) do
+            for _, w in ipairs(FrontWheels) do
                 if isValid(w) then
                     local angVel = w:getAngleVelocity()
                     local localAxis = getWheelSpinAxis(w)
-                    local rpm = localAxis and (-angVel:dot(localAxis) / 8) or 0
+                    local comp = s.WheelSpinAxisComponent[w]
+                    
+                    local dotVal = 0
+                    if comp == "x" then dotVal = angVel.x
+                    elseif comp == "-x" then dotVal = -angVel.x
+                    elseif comp == "y" then dotVal = angVel.y
+                    elseif comp == "-y" then dotVal = -angVel.y
+                    elseif comp == "z" then dotVal = angVel.z
+                    elseif comp == "-z" then dotVal = -angVel.z
+                    end
+                    
+                    local rpm = -dotVal / 8
                     RPM_Sum = RPM_Sum + rpm
                     RPM_Count = RPM_Count + 1
                     table.insert(s.FrontRPMs, rpm)
                     table.insert(s.Flywheels_RPM, rpm)
                 end
             end
-            for _, w in pairs(RearWheels) do
+            for _, w in ipairs(RearWheels) do
                 if isValid(w) then
                     local angVel = w:getAngleVelocity()
                     local localAxis = getWheelSpinAxis(w)
-                    local rpm = localAxis and (-angVel:dot(localAxis) / 8) or 0
+                    local comp = s.WheelSpinAxisComponent[w]
+                    
+                    local dotVal = 0
+                    if comp == "x" then dotVal = angVel.x
+                    elseif comp == "-x" then dotVal = -angVel.x
+                    elseif comp == "y" then dotVal = angVel.y
+                    elseif comp == "-y" then dotVal = -angVel.y
+                    elseif comp == "z" then dotVal = angVel.z
+                    elseif comp == "-z" then dotVal = -angVel.z
+                    end
+                    
+                    local rpm = -dotVal / 8
                     RPM_Sum = RPM_Sum + rpm
                     RPM_Count = RPM_Count + 1
                     table.insert(s.RearRPMs, rpm)
@@ -2165,54 +2287,43 @@ if SERVER then
             -- POWER APPLICATION TO WHEELS (Runs Every Frame)
             -- ============================================================================
             local hasWheels = (#FrontWheels > 0 or #RearWheels > 0)
-            if hasWheels then
-                local desiredMass = s.EffectiveVehicleMass or config.Engine_SimulatedVehicleMass or 1000
-                local actualMass = s.ActualVehicleMass or desiredMass
-                local massScale = actualMass / math.max(desiredMass, 1)
-                massScale = math.clamp(massScale, c.Engine_MinMassScale or 0.2, c.Engine_MaxMassScale or 2.5)
-                local scaledPower = 0
-                if s.Flywheel_Power and math.abs(s.Flywheel_Power) > 0.1 and s.Active then
-                    scaledPower = s.Flywheel_Power * massScale
-                end
-
+            if hasWheels and shouldRunWheelPhysics then
                 local FrontPowerRatio = (c.PowerDistribution or 50) / 100
                 local RearPowerRatio = 1 - FrontPowerRatio
                 
                 local forceMult = (c.ForceMult or 1) * 39.37 * 2 * tickMult
                 local torqueDir = (c.TorqueInvert and -1 or 1)
 
-                -- Initialize state differential values to allow real-time addon modification
-                if s.FrontDiffType == nil then s.FrontDiffType = c.FrontDiffType or 1 end
-                if s.RearDiffType == nil then s.RearDiffType = c.RearDiffType or 1 end
-                if s.FrontLSDStiffness == nil then s.FrontLSDStiffness = c.FrontLSDStiffness or 3.0 end
-                if s.RearLSDStiffness == nil then s.RearLSDStiffness = c.RearLSDStiffness or 3.0 end
-                if s.FrontLSDLockRatio == nil then s.FrontLSDLockRatio = (c.FrontLSDLockRatio or 90) / 100 end
-                if s.RearLSDLockRatio == nil then s.RearLSDLockRatio = (c.RearLSDLockRatio or 90) / 100 end
-                if s.FrontLSDPreload == nil then s.FrontLSDPreload = c.FrontLSDPreload or 15.0 end
-                if s.RearLSDPreload == nil then s.RearLSDPreload = c.RearLSDPreload or 15.0 end
-                if s.CenterDiffType == nil then s.CenterDiffType = c.CenterDiffType or 0 end -- 0 = open/2WD/independent, 1 = Center LSD, 2 = Center Lock
-                if s.CenterFrontLSDStiffness == nil then s.CenterFrontLSDStiffness = c.CenterFrontLSDStiffness or 3.0 end
-                if s.CenterRearLSDStiffness == nil then s.CenterRearLSDStiffness = c.CenterRearLSDStiffness or 3.0 end
-                if s.CenterFrontLSDLockRatio == nil then s.CenterFrontLSDLockRatio = (c.CenterFrontLSDLockRatio or 90) / 100 end
-                if s.CenterRearLSDLockRatio == nil then s.CenterRearLSDLockRatio = (c.CenterRearLSDLockRatio or 90) / 100 end
-                if s.CenterFrontLSDPreload == nil then s.CenterFrontLSDPreload = c.CenterFrontLSDPreload or 15.0 end
-                if s.CenterRearLSDPreload == nil then s.CenterRearLSDPreload = c.CenterRearLSDPreload or 15.0 end
+                -- Fetch differential values from state (pre-initialized or modified by addons)
+                local frontDiffType = s.FrontDiffType or c.FrontDiffType or 1
+                local rearDiffType = s.RearDiffType or c.RearDiffType or 1
+                local centerDiffType = s.CenterDiffType or c.CenterDiffType or 0
+                local frontLSDStiffness = s.FrontLSDStiffness or c.FrontLSDStiffness or 3.0
+                local rearLSDStiffness = s.RearLSDStiffness or c.RearLSDStiffness or 3.0
+                local frontLSDLockRatio = s.FrontLSDLockRatio or (c.FrontLSDLockRatio or 90) / 100
+                local rearLSDLockRatio = s.RearLSDLockRatio or (c.RearLSDLockRatio or 90) / 100
+                local frontLSDPreload = s.FrontLSDPreload or c.FrontLSDPreload or 15.0
+                local rearLSDPreload = s.RearLSDPreload or c.RearLSDPreload or 15.0
+                local centerFrontLSDStiffness = s.CenterFrontLSDStiffness or c.CenterFrontLSDStiffness or 3.0
+                local centerRearLSDStiffness = s.CenterRearLSDStiffness or c.CenterRearLSDStiffness or 3.0
+                local centerFrontLSDLockRatio = s.CenterFrontLSDLockRatio or (c.CenterFrontLSDLockRatio or 90) / 100
+                local centerRearLSDLockRatio = s.CenterRearLSDLockRatio or (c.CenterRearLSDLockRatio or 90) / 100
+                local centerFrontLSDPreload = s.CenterFrontLSDPreload or c.CenterFrontLSDPreload or 15.0
+                local centerRearLSDPreload = s.CenterRearLSDPreload or c.CenterRearLSDPreload or 15.0
 
                 -- Check if center coupling (AWD lock/LSD) is active
-                local isCenterCoupled = (s.CenterDiffType > 0)
+                local isCenterCoupled = (centerDiffType > 0)
 
                 -- Calculate average RPM of all wheels (for center locking/coupling)
                 local avgAllRPM = 0
                 if isCenterCoupled then
-                    local fRPMs = s.FrontRPMs or {}
-                    local rRPMs = s.RearRPMs or {}
                     local sumAllRPM = 0
                     local allDriveCount = 0
-                    for _, rpm in ipairs(fRPMs) do
+                    for _, rpm in ipairs(FrontRPMs) do
                         sumAllRPM = sumAllRPM + rpm
                         allDriveCount = allDriveCount + 1
                     end
-                    for _, rpm in ipairs(rRPMs) do
+                    for _, rpm in ipairs(RearRPMs) do
                         sumAllRPM = sumAllRPM + rpm
                         allDriveCount = allDriveCount + 1
                     end
@@ -2225,42 +2336,38 @@ if SERVER then
                     local PowerPerWheel = FrontPower / #FrontWheels
                     
                     -- Calculate Average RPM for Front Axle
-                    local fRPMs = s.FrontRPMs or {}
                     local sumFRPM = 0
-                    for _, rpm in ipairs(fRPMs) do sumFRPM = sumFRPM + rpm end
-                    local avgFRPM = #fRPMs > 0 and (sumFRPM / #fRPMs) or 0
+                    for _, rpm in ipairs(FrontRPMs) do sumFRPM = sumFRPM + rpm end
+                    local avgFRPM = #FrontRPMs > 0 and (sumFRPM / #FrontRPMs) or 0
                     
-                    local diffType = s.FrontDiffType or 0
+                    local diffType = frontDiffType or 0
                     local lsdStiffness = 0
-                    local lockRatio = s.FrontLSDLockRatio or 0.9
-                    local diffType = s.FrontDiffType or 0
-                    local lsdStiffness = 0
-                    local lockRatio = s.FrontLSDLockRatio or 0.9
+                    local lockRatio = frontLSDLockRatio or 0.9
                     if isCenterCoupled then
-                        if s.CenterDiffType == 1 then
-                            lsdStiffness = s.CenterFrontLSDStiffness or 3.0
-                            lockRatio = s.CenterFrontLSDLockRatio or 0.9
+                        if centerDiffType == 1 then
+                            lsdStiffness = centerFrontLSDStiffness or 3.0
+                            lockRatio = centerFrontLSDLockRatio or 0.9
                         else
                             lsdStiffness = 30.0 -- Hard lock all wheels to the global average
                         end
                     elseif diffType == 1 then
-                        lsdStiffness = s.FrontLSDStiffness or 3.0
+                        lsdStiffness = frontLSDStiffness or 3.0
                     elseif diffType == 2 then
                         lsdStiffness = 30.0 -- Hard Locked Differential
                     end
 
-                    for i, w in pairs(FrontWheels) do
+                    for i, w in ipairs(FrontWheels) do
                         if isValid(w) then
                             local wheelScale = 1
                             if s.FrontWheelPowerScale and s.FrontWheelPowerScale[i] then
                                 wheelScale = s.FrontWheelPowerScale[i]
                             end
-                            local wheelWorldDir = getWheelWorldDir(w)
+                            local wheelWorldDir = getCachedWheelWorldDir(w)
                             local torque = wheelWorldDir * (PowerPerWheel * wheelScale) * forceMult * torqueDir
                             
                             -- Add locking/LSD torque if enabled
                             if lsdStiffness > 0 and #FrontWheels > 1 then
-                                local wRPM = fRPMs[i] or 0
+                                local wRPM = FrontRPMs[i] or 0
                                 local targetRPM = isCenterCoupled and avgAllRPM or avgFRPM
                                 local diffRPM = wRPM - targetRPM
                                 
@@ -2269,17 +2376,15 @@ if SERVER then
                                 
                                 -- Clamp locking torque relative to current engine load + a small stable preload
                                 -- This prevents HAVOK self-spinning oscillations at standstill
-                                -- Clamp locking torque relative to current engine load + a small stable preload
-                                -- This prevents HAVOK self-spinning oscillations at standstill
                                 local maxLSDTorque
-                                local preload = isCenterCoupled and (s.CenterFrontLSDPreload or 15.0) or (s.FrontLSDPreload or 15.0)
-                                if diffType == 2 or (isCenterCoupled and s.CenterDiffType == 2) then
+                                local preload = isCenterCoupled and (centerFrontLSDPreload or 15.0) or (frontLSDPreload or 15.0)
+                                if diffType == 2 or (isCenterCoupled and centerDiffType == 2) then
                                     if math.abs(s.Speed or 0) < 1.0 and math.abs(s.Throttle or 0) < 0.05 then
                                         maxLSDTorque = preload
                                     else
                                         maxLSDTorque = 10000
                                     end
-                                elseif diffType == 1 or (isCenterCoupled and s.CenterDiffType == 1) then
+                                elseif diffType == 1 or (isCenterCoupled and centerDiffType == 1) then
                                     -- Viscous LSD: locking capacity is speed-sensitive and doesn't scale down with throttle.
                                     -- We clamp it to a high maximum capacity limit (e.g. 5000 Nm)
                                     maxLSDTorque = 5000
@@ -2313,41 +2418,38 @@ if SERVER then
                     local PowerPerWheel = RearPower / #RearWheels
                     
                     -- Calculate Average RPM for Rear Axle
-                    local rRPMs = s.RearRPMs or {}
                     local sumRRPM = 0
-                    for _, rpm in ipairs(rRPMs) do sumRRPM = sumRRPM + rpm end
-                    local avgRRPM = #rRPMs > 0 and (sumRRPM / #rRPMs) or 0
+                    for _, rpm in ipairs(RearRPMs) do sumRRPM = sumRRPM + rpm end
+                    local avgRRPM = #RearRPMs > 0 and (sumRRPM / #RearRPMs) or 0
                     
-                    local diffType = s.RearDiffType or 0
+                    local diffType = rearDiffType or 0
                     local lsdStiffness = 0
-                    local lockRatio = s.RearLSDLockRatio or 0.9
+                    local lockRatio = rearLSDLockRatio or 0.9
                     if isCenterCoupled then
-                        if s.CenterDiffType == 1 then
-                            lsdStiffness = s.CenterRearLSDStiffness or 3.0
-                            lockRatio = s.CenterRearLSDLockRatio or 0.9
+                        if centerDiffType == 1 then
+                            lsdStiffness = centerRearLSDStiffness or 3.0
+                            lockRatio = centerRearLSDLockRatio or 0.9
                         else
                             lsdStiffness = 30.0 -- Hard lock all wheels to the global average
                         end
                     elseif diffType == 1 then
-                        lsdStiffness = s.RearLSDStiffness or 3.0
+                        lsdStiffness = rearLSDStiffness or 3.0
                     elseif diffType == 2 then
                         lsdStiffness = 30.0 -- Hard Locked Differential
                     end
 
-                    for i, w in pairs(RearWheels) do
+                    for i, w in ipairs(RearWheels) do
                         if isValid(w) then
-                            local forceMult = (c.ForceMult or 1) * 39.37 * 2 * tickMult
-                            local torqueDir = (c.TorqueInvert and -1 or 1)
                             local wheelScale = 1
                             if s.RearWheelPowerScale and s.RearWheelPowerScale[i] then
                                 wheelScale = s.RearWheelPowerScale[i]
                             end
-                            local wheelWorldDir = getWheelWorldDir(w)
+                            local wheelWorldDir = getCachedWheelWorldDir(w)
                             local torque = wheelWorldDir * (PowerPerWheel * wheelScale) * forceMult * torqueDir
                             
                             -- Add locking/LSD torque if enabled
                             if lsdStiffness > 0 and #RearWheels > 1 then
-                                local wRPM = rRPMs[i] or 0
+                                local wRPM = RearRPMs[i] or 0
                                 local targetRPM = isCenterCoupled and avgAllRPM or avgRRPM
                                 local diffRPM = wRPM - targetRPM
                                 
@@ -2357,14 +2459,14 @@ if SERVER then
                                 -- Clamp locking torque relative to current engine load + a small stable preload
                                 -- This prevents HAVOK self-spinning oscillations at standstill
                                 local maxLSDTorque
-                                local preload = isCenterCoupled and (s.CenterRearLSDPreload or 15.0) or (s.RearLSDPreload or 15.0)
-                                if diffType == 2 or (isCenterCoupled and s.CenterDiffType == 2) then
+                                local preload = isCenterCoupled and (centerRearLSDPreload or 15.0) or (rearLSDPreload or 15.0)
+                                if diffType == 2 or (isCenterCoupled and centerDiffType == 2) then
                                     if math.abs(s.Speed or 0) < 1.0 and math.abs(s.Throttle or 0) < 0.05 then
                                         maxLSDTorque = preload
                                     else
                                         maxLSDTorque = 10000
                                     end
-                                elseif diffType == 1 or (isCenterCoupled and s.CenterDiffType == 1) then
+                                elseif diffType == 1 or (isCenterCoupled and centerDiffType == 1) then
                                     -- Viscous LSD: locking capacity is speed-sensitive and doesn't scale down with throttle.
                                     -- We clamp it to a high maximum capacity limit (e.g. 5000 Nm)
                                     maxLSDTorque = 5000
@@ -2397,15 +2499,10 @@ if SERVER then
                 if isValid(Chassis) and isValid(Engine) then
                     local ChassisPhys = getPhys(Chassis)
                     if isValid(ChassisPhys) then
-                        -- E2: C:applyOffsetForce(ChassisFeedDirection * -Flywheel_Power, E:pos() - (ChassisFeedDirection * ChassisAccFeed))
-                        -- E2: C:applyOffsetForce(ChassisFeedDirection * Flywheel_Power, E:pos() + (ChassisFeedDirection * ChassisAccFeed))
-                        local ChassisFeedDirection = getAxis(Chassis, c.ChassisFeedDirectionAxis)
-                        local ChassisFeedForwardDirection = getAxis(Chassis, c.ChassisFeedForwardAxis)
+                        local ChassisFeedDirection = getChassisFeedDirection(Chassis)
+                        local ChassisFeedForwardDirection = getChassisFeedForwardDirection(Chassis)
                         local ChassisAccFeed = c.ChassisAccFeedMult or 39.37
                         
-                        -- Apply opposing forces at offset positions to create rotation moment
-                        -- Force magnitude scaled by Flywheel_Power (acceleration force) and tick rate
-                        -- If braking, scale down accel feed to avoid double pitching moments
                         local brakeInput = s.Brake or 0
                         local throttleInput = s.Throttle or 0
                         local accelScale = 1 - math.clamp(brakeInput, 0, 1)
@@ -2440,21 +2537,23 @@ if SERVER then
             -- UNIFIED TORQUE APPLICATION (Runs Every Frame)
             -- Merges brake and engine torques to minimize expensive physics calls
             -- ============================================================================
-            for i, w in ipairs(FrontWheels) do
-                local tq = netWheelTorqueFront[i]
-                if tq and (tq.x ~= 0 or tq.y ~= 0 or tq.z ~= 0) and isValid(w) then
-                    local phys = getPhys(w)
-                    if isValid(phys) then
-                        phys:applyTorque(tq)
+            if shouldRunWheelPhysics then
+                for i, w in ipairs(FrontWheels) do
+                    local tq = netWheelTorqueFront[i]
+                    if tq and (tq.x ~= 0 or tq.y ~= 0 or tq.z ~= 0) and isValid(w) then
+                        local phys = getPhys(w)
+                        if isValid(phys) then
+                            phys:applyTorque(tq)
+                        end
                     end
                 end
-            end
-            for i, w in ipairs(RearWheels) do
-                local tq = netWheelTorqueRear[i]
-                if tq and (tq.x ~= 0 or tq.y ~= 0 or tq.z ~= 0) and isValid(w) then
-                    local phys = getPhys(w)
-                    if isValid(phys) then
-                        phys:applyTorque(tq)
+                for i, w in ipairs(RearWheels) do
+                    local tq = netWheelTorqueRear[i]
+                    if tq and (tq.x ~= 0 or tq.y ~= 0 or tq.z ~= 0) and isValid(w) then
+                        local phys = getPhys(w)
+                        if isValid(phys) then
+                            phys:applyTorque(tq)
+                        end
                     end
                 end
             end
@@ -2476,8 +2575,8 @@ if SERVER then
                         FrontWheels = FrontWheels,
                         RearWheels = RearWheels,
                         EngineDirection = EngineDirection,
-                        ChassisDirection = getAxis(Chassis, c.ChassisFeedDirectionAxis),
-                        ChassisForward = getAxis(Chassis, c.ChassisFeedForwardAxis),
+                        ChassisDirection = getChassisFeedDirection(Chassis),
+                        ChassisForward = getChassisFeedForwardDirection(Chassis),
                     }
                     
                     for name, addon in pairs(c.Addons) do
