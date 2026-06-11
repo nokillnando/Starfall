@@ -49,16 +49,29 @@ local function round(val, decimals) return math.round(val, decimals) end
 local function sign(val) return val > 0 and 1 or (val < 0 and -1 or 0) end
 
 -- Generalized N-point Bezier helper for Torque Curve (P0 = 0)
+local binomialCache = {}
+local function getBinomialCoefficients(N)
+    local cached = binomialCache[N]
+    if cached then return cached end
+    
+    local coeffs = {}
+    for i = 1, N do
+        local C = 1
+        for j = 1, i do C = C * (N - j + 1) / j end
+        coeffs[i] = C
+    end
+    binomialCache[N] = coeffs
+    return coeffs
+end
+
 function Core.getTorqueMultiplier(torqueTable, factor)
     if not torqueTable or #torqueTable == 0 then return 1 end
     local N = #torqueTable
+    local coeffs = getBinomialCoefficients(N)
     local result = 0
     local invF = 1 - factor
     for i = 1, N do
-        -- Calculate binomial coefficient C(N, i) dynamically
-        local C = 1
-        for j = 1, i do C = C * (N - j + 1) / j end
-        result = result + C * (invF^(N - i)) * (factor^i) * torqueTable[i]
+        result = result + coeffs[i] * (invF^(N - i)) * (factor^i) * torqueTable[i]
     end
     return result
 end
@@ -2737,6 +2750,11 @@ if CLIENT then
         local soundEnt = chip()
         local TargetRPM = 0
         local CurrentRPM = 0
+        local isHoloVisible = false
+        local defaultSoundsMuted = false
+        local soundFrameCounter = 0
+        local soundInRange = true
+        local nextFrameTime = 0
 
         -- Version Check Logic
         local function checkVersionOnSpawn(cfg)
@@ -3321,20 +3339,30 @@ if CLIENT then
             local marker = net.readString()
             if marker == "AddonDisplay" then
                 config.AddonDisplay = config.AddonDisplay or {}
+                local anyChanged = false
                 local key = net.readString()
                 while key and key ~= "" do
                     local valType = net.readString()
+                    local newVal
                     if valType == "number" then
-                        config.AddonDisplay[key] = net.readFloat()
+                        newVal = net.readFloat()
                     elseif valType == "string" then
-                        config.AddonDisplay[key] = net.readString()
+                        newVal = net.readString()
                     elseif valType == "boolean" then
-                        config.AddonDisplay[key] = (net.readBit() == 1)
+                        newVal = (net.readBit() == 1)
                     else
                         -- Unknown type: skip by reading as string
-                        config.AddonDisplay[key] = net.readString()
+                        newVal = net.readString()
+                    end
+                    
+                    if config.AddonDisplay[key] ~= newVal then
+                        config.AddonDisplay[key] = newVal
+                        anyChanged = true
                     end
                     key = net.readString()
+                end
+                if anyChanged then
+                    invalidateDisplayCache() -- Force stats recalculation only on display data updates
                 end
             else
                 -- If marker isn't AddonDisplay, assume empty terminator was sent and do nothing
@@ -3709,6 +3737,37 @@ if CLIENT then
         hook.add("think", "EngineClient", function()
              if not initialized then return end
              
+             soundFrameCounter = soundFrameCounter + 1
+             if soundFrameCounter >= 15 then
+                 soundFrameCounter = 0
+                 local ply = player()
+                 if isValid(ply) then
+                     local myPos = ply:getPos()
+                     local chipPos = soundEnt:getPos()
+                     local dist = myPos:getDistance(chipPos)
+                     local maxDist = config.SoundDistance or 3000
+                     local inRange = (dist <= maxDist)
+                     
+                     if inRange ~= soundInRange then
+                         soundInRange = inRange
+                         if not soundInRange then
+                             -- Mute all active sounds once when going out of range
+                             for _, snd in pairs(sounds) do
+                                 if type(snd) == "Sound" and snd:isValid() then
+                                     snd:setVolume(0)
+                                 end
+                             end
+                         else
+                             -- Snap values on re-entering range to prevent ramp-up lag
+                             CurrentRPM = TargetRPM
+                             LerpedThrottle = EngineThrottle
+                         end
+                     end
+                 end
+             end
+             
+             if not soundInRange then return end
+             
              -- Linear Interpolation for Smoothness
              -- Move CurrentRPM towards TargetRPM
              -- timer.frametime() * 10 gives a smooth slide.
@@ -3737,56 +3796,55 @@ if CLIENT then
              
             -- Allow addons to suppress default engine sounds via generic flag
             local suppressDefaultSounds = (config.SuppressDefaultSounds == true)
-             
-             -- On Sound (Load/Throttle): Responsive to engine load, smooth throttle-based blending
-             if sounds["On"] then
-                 if suppressDefaultSounds then
-                     -- Addon overrides sounds - silence the default engine sounds
-                     sounds["On"]:setVolume(0)
-                 else
-                     -- E2: pitch = (RPM / OnDiv) * 155 + (50 * Active) * PitchMult
-                     -- Starfall scale: 0.5 = 50% pitch, 1 = normal, 2 = 200% (double)
-                     -- E2 pitch max ~205. Divide by ~200 to normalize to ~1.0 max in Starfall
-                     local pitchBase = (rpm / (config.Engine_SoundOnDiv or 30)) * 155 + (active and 50 or 0)
-                     local pitchNorm = (pitchBase / 200) * (config.Engine_SoundOnPitchMult or 1)
-                     -- Volume: throttle state blended with RPM envelope for natural fade in/out
-                     -- OnRPMStart allows earlier onset at lower RPM, OnVolumeMin keeps some idle presence
-                     local onRpmStart = config.Engine_SoundOnRPMStart or 0
-                     local onRpmDenom = math.max((config.Engine_Redline or 9000) - onRpmStart, 1)
-                     local onGateCurve = config.Engine_SoundOnGateCurve or 1
-                     local onRpmGate = math.clamp((rpm - onRpmStart) / onRpmDenom, 0, 1) ^ onGateCurve
-                     local onVolumeMin = config.Engine_SoundOnVolumeMin or 0
-                     local onVolCurve = config.Engine_SoundOnVolumeCurve or 1
-                     local onRpmFactor = onVolumeMin + (1 - onVolumeMin) * (rpmPercent ^ onVolCurve)
-                     local volumeFinal = onRpmFactor * onRpmGate * throttleOn * (config.Engine_SoundOnVolume or 1) * (config.Engine_SoundOverallDiv or 1)
-                     
-                     sounds["On"]:setPitch(math.max(0.1, pitchNorm * 100))
-                     sounds["On"]:setVolume(math.max(0, volumeFinal))
-                 end
-             end
-             
-             -- Off Sound (Coast/Engine Braking): Inverse blend, plays when throttle is OFF
-             if sounds["Off"] then
-                 if suppressDefaultSounds then
-                     -- Addon overrides sounds - silence the default engine sounds
-                     sounds["Off"]:setVolume(0)
-                 else
-                     -- E2: pitch = (RPM / OffDiv) * 155 + (50 * Active) * PitchMult (same pitch formula)
-                     -- Volume uses inverse throttle blend: high when NOT throttling (engine braking/coasting)
-                     local offPitchCurve = config.Engine_SoundOffPitchCurve or 1
-                     local offPitchRpm = (config.Engine_Redline or 9000) * (rpmPercent ^ offPitchCurve)
-                     local pitchBase = (offPitchRpm / (config.Engine_SoundOffDiv or 30)) * 155 + (active and 50 or 0)
-                     local pitchNorm = (pitchBase / 200) * (config.Engine_SoundOffPitchMult or 1)
-                     -- Off volume: (1-throttle) for smooth throttle blend
-                     -- OffRPMInfluence = 0 ignores RPM (consistent coasting), 1 scales by RPM
-                     local offRpmInfluence = config.Engine_SoundOffRPMInfluence or 0
-                     local offRpmFactor = (1 - offRpmInfluence) + (offRpmInfluence * rpmPercent)
-                     local volumeFinal = offRpmFactor * throttleOff * (config.Engine_SoundOffVolume or 1) * (config.Engine_SoundOverallDiv or 1)
-                     
-                     sounds["Off"]:setPitch(math.max(0.1, pitchNorm * 100))
-                     sounds["Off"]:setVolume(math.max(0, volumeFinal))
-                 end
-             end
+            
+            if suppressDefaultSounds then
+                if not defaultSoundsMuted then
+                    if sounds["On"] then sounds["On"]:setVolume(0) end
+                    if sounds["Off"] then sounds["Off"]:setVolume(0) end
+                    defaultSoundsMuted = true
+                end
+            else
+                defaultSoundsMuted = false
+                -- On Sound (Load/Throttle): Responsive to engine load, smooth throttle-based blending
+                if sounds["On"] then
+                    -- E2: pitch = (RPM / OnDiv) * 155 + (50 * Active) * PitchMult
+                    -- Starfall scale: 0.5 = 50% pitch, 1 = normal, 2 = 200% (double)
+                    -- E2 pitch max ~205. Divide by ~200 to normalize to ~1.0 max in Starfall
+                    local pitchBase = (rpm / (config.Engine_SoundOnDiv or 30)) * 155 + (active and 50 or 0)
+                    local pitchNorm = (pitchBase / 200) * (config.Engine_SoundOnPitchMult or 1)
+                    -- Volume: throttle state blended with RPM envelope for natural fade in/out
+                    -- OnRPMStart allows earlier onset at lower RPM, OnVolumeMin keeps some idle presence
+                    local onRpmStart = config.Engine_SoundOnRPMStart or 0
+                    local onRpmDenom = math.max((config.Engine_Redline or 9000) - onRpmStart, 1)
+                    local onGateCurve = config.Engine_SoundOnGateCurve or 1
+                    local onRpmGate = math.clamp((rpm - onRpmStart) / onRpmDenom, 0, 1) ^ onGateCurve
+                    local onVolumeMin = config.Engine_SoundOnVolumeMin or 0
+                    local onVolCurve = config.Engine_SoundOnVolumeCurve or 1
+                    local onRpmFactor = onVolumeMin + (1 - onVolumeMin) * (rpmPercent ^ onVolCurve)
+                    local volumeFinal = onRpmFactor * onRpmGate * throttleOn * (config.Engine_SoundOnVolume or 1) * (config.Engine_SoundOverallDiv or 1)
+                    
+                    sounds["On"]:setPitch(math.max(0.1, pitchNorm * 100))
+                    sounds["On"]:setVolume(math.max(0, volumeFinal))
+                end
+                
+                -- Off Sound (Coast/Engine Braking): Inverse blend, plays when throttle is OFF
+                if sounds["Off"] then
+                    -- E2: pitch = (RPM / OffDiv) * 155 + (50 * Active) * PitchMult (same pitch formula)
+                    -- Volume uses inverse throttle blend: high when NOT throttling (engine braking/coasting)
+                    local offPitchCurve = config.Engine_SoundOffPitchCurve or 1
+                    local offPitchRpm = (config.Engine_Redline or 9000) * (rpmPercent ^ offPitchCurve)
+                    local pitchBase = (offPitchRpm / (config.Engine_SoundOffDiv or 30)) * 155 + (active and 50 or 0)
+                    local pitchNorm = (pitchBase / 200) * (config.Engine_SoundOffPitchMult or 1)
+                    -- Off volume: (1-throttle) for smooth throttle blend
+                    -- OffRPMInfluence = 0 ignores RPM (consistent coasting), 1 scales by RPM
+                    local offRpmInfluence = config.Engine_SoundOffRPMInfluence or 0
+                    local offRpmFactor = (1 - offRpmInfluence) + (offRpmInfluence * rpmPercent)
+                    local volumeFinal = offRpmFactor * throttleOff * (config.Engine_SoundOffVolume or 1) * (config.Engine_SoundOverallDiv or 1)
+                    
+                    sounds["Off"]:setPitch(math.max(0.1, pitchNorm * 100))
+                    sounds["Off"]:setVolume(math.max(0, volumeFinal))
+                end
+            end
              
              -- Turbo sound (if enabled) - smooth fade in/out based on actual boost
              if sounds["Turbo"] and config.Turbo then
@@ -3833,6 +3891,20 @@ if CLIENT then
         
         local EngineVersion = "3"  -- Version matches config
         
+        -- Client-side caching of engine stats for rendering performance
+        local cachedHP, cachedTorque, cachedHPRPM, cachedTorqueRPM
+        local cachedStats = nil
+        local cachedEnabledAddons = nil
+
+        local function invalidateDisplayCache()
+            cachedHP = nil
+            cachedTorque = nil
+            cachedHPRPM = nil
+            cachedTorqueRPM = nil
+            cachedStats = nil
+            cachedEnabledAddons = nil
+        end
+
         local function calculateEnginePower(config)
             local ad = config.AddonDisplay or {}
             local redline = ad.redline or config.Engine_Redline or 9000
@@ -3947,11 +4019,17 @@ if CLIENT then
             stats.flywheelMass = ad.flywheelMass or config.Engine_FlywheelMass or 8
 
             -- Power and Torque (prefer addon values)
+            local function getEnginePower()
+                if cachedHP then return cachedHP, cachedTorque, cachedHPRPM, cachedTorqueRPM end
+                cachedHP, cachedTorque, cachedHPRPM, cachedTorqueRPM = calculateEnginePower(config)
+                return cachedHP, cachedTorque, cachedHPRPM, cachedTorqueRPM
+            end
+
             if ad.hp or ad.peakTorque then
                 stats.hp = ad.hp or 0
                 stats.maxTorque = ad.peakTorque or 0
             else
-                local hp, torque, hpRpm, tqRpm = calculateEnginePower(config)
+                local hp, torque, hpRpm, tqRpm = getEnginePower()
                 stats.hp = hp
                 stats.maxTorque = torque
                 stats.hpRpm = hpRpm
@@ -4010,6 +4088,18 @@ if CLIENT then
             table.sort(addons)
             return addons
         end
+
+        local function getEngineStats()
+            if cachedStats then return cachedStats end
+            cachedStats = calculateEngineStats(config)
+            return cachedStats
+        end
+
+        local function getEnabledAddonsCached()
+            if cachedEnabledAddons then return cachedEnabledAddons end
+            cachedEnabledAddons = getEnabledAddons(config)
+            return cachedEnabledAddons
+        end
         
         -- ====== ENGINE INFO HUD (RenderTarget Implementation) ======
         -- Renders stats to a texture off-screen (efficient) and displays it in world
@@ -4031,7 +4121,6 @@ if CLIENT then
         rtMat:setFloat("$alpha", 1) -- Set alpha float as per user example
         
         -- State for RT update
-        local nextFrameTime = 0
         local fps = 10 -- Update FPS (low is fine for static text)
         local frameInterval = 1 / fps
         
@@ -4042,22 +4131,26 @@ if CLIENT then
             local now = timer.systime()
             if now < nextFrameTime then return end
             
+            -- Optimization: Only render if the hologram is actually visible to a player
+            if not isHoloVisible then
+                nextFrameTime = now + 0.25 -- Check visibility dot/distance again in 0.25 seconds
+                return
+            end
+            
             -- Optimization: Only render if a player is close enough to see it
-            -- We can iterate players or just check local player since this is client-side script
             local ply = player()
             local chipEnt = chip()
             if not isValid(chipEnt) then return end
             
             -- Distance Check (Reuse config distance)
             local guiConfig = config.InfoGUI or {}
-            local maxDistance = guiConfig.Distance or 1000 -- Increased default for debug
-            if ply:getPos():getDistance(chipEnt:getPos()) > maxDistance then return end
+            local maxDistance = guiConfig.Distance or 1000
+            if ply:getPos():getDistance(chipEnt:getPos()) > maxDistance then 
+                nextFrameTime = now + 0.5 -- Rate limit distance checks when far away to 2Hz
+                return 
+            end
             
             nextFrameTime = now + frameInterval
-            
-            
-            -- DEBUG
-            -- print("Updating RT")
             
             -- Select RT
             render.selectRenderTarget(rtName)
@@ -4065,8 +4158,8 @@ if CLIENT then
             render.clear(Color(0, 0, 0, 0))
             
             -- Prepare Stats
-            local stats = calculateEngineStats(config)
-            local addons = getEnabledAddons(config)
+            local stats = getEngineStats()
+            local addons = getEnabledAddonsCached()
             
             -- Calculate Heights
             local lineHeight = 32
@@ -4287,58 +4380,49 @@ if CLIENT then
             local scaleVal = guiConfig.Scale or 6
             holo:setScale(Vector(scaleVal, scaleVal, 1))
             
-            -- Face Player Logic (Tick-based)
+            -- Face Player Logic (Tick-based with optimized 10Hz visibility check)
+            local visFrameCounter = 0
             hook.add("think", "engineInfoHoloThink", function()
                 if not isValid(holo) then return end
-                if not isValid(chip()) then return end
                 
-                -- Visibility Check (Distance & Angle)
-                local ply = player()
-                local maxDistance = guiConfig.Distance or 1000
-                local viewAngleDot = guiConfig.ViewAngleDot or 0.9 -- Default 0.9 (approx 25 deg cone)
+                visFrameCounter = visFrameCounter + 1
+                if visFrameCounter >= 10 then
+                    visFrameCounter = 0
+                    local ply = player()
+                    local chipEnt = chip()
+                    if isValid(ply) and isValid(chipEnt) then
+                        local maxDistance = guiConfig.Distance or 1000
+                        local viewAngleDot = guiConfig.ViewAngleDot or 0.9
+                        
+                        local holoPos = holo:getPos()
+                        local plyEye = ply:getEyePos()
+                        local toHolo = (holoPos - plyEye):getNormalized()
+                        local lookDir = ply:getEyeAngles():getForward()
+                        
+                        if ply:getPos():getDistance(chipEnt:getPos()) > maxDistance or toHolo:dot(lookDir) < viewAngleDot then
+                            isHoloVisible = false
+                            holo:setColor(Color(0,0,0,0))
+                        else
+                            if not isHoloVisible then
+                                -- Transitioned to visible: force immediate RT update
+                                nextFrameTime = 0
+                            end
+                            isHoloVisible = true
+                            holo:setColor(Color(255,255,255,254))
+                        end
+                    end
+                end
                 
-                local holoPos = holo:getPos()
-                local plyEye = ply:getEyePos()
-                
-                -- Vector from Player Eyes to Holo Center
-                local toHolo = (holoPos - plyEye):getNormalized()
-                local lookDir = ply:getEyeAngles():getForward()
-                
-                -- Dot Product: 1 = Looking directly at it.
-                -- We check if dot > threshold (visible).
-                -- Also check max distance.
-                -- Note: toHolo is Player->Holo. lookDir is Player->Forward.
-                -- So dot should be positive and close to 1.
-                
-                if ply:getPos():getDistance(chip():getPos()) > maxDistance or toHolo:dot(lookDir) < viewAngleDot then
-                     -- Check if user wants "Always Show if Close"?
-                     -- For now, strict check as requested.
-                     holo:setColor(Color(0,0,0,0)) -- Hide
-                else
-                    holo:setColor(Color(255,255,255,254)) -- Show
-                    
-                    -- Billboard effect: Face Player Eyes
-                    -- logic: (Target - Source):getAngle()
-                    -- Source = Holo, Target = Eyes.
-                    -- This vectors points FROM Holo TO Eyes.
-                    -- Forward axis of Holo points to Eyes.
-                    
-                    local padAng = (plyEye - holoPos):getAngle()
-                    
-                    -- User requested rotation logic:
-                    -- m:setAngles((eyePos() - m:getTranslation()):getAngle() + Angle(90, 0, 0))
-                    -- m:rotate(Angle(0, 90, 0))
-                    
-                    -- Applying + Angle(90, 0, 0) (Pitch 90)
-                    padAng.p = padAng.p + 90
-                    
-                    -- Rotating around Up (Yaw) +90?
-                    -- "m:rotate(Angle(0, 90, 0))" -> Rotate around local Y (Yaw) or Z? 
-                    -- Source Angle(p,y,r). rotate(Angle) usually applies rotation.
-                    -- Local 90 Yaw.
-                    padAng:rotateAroundAxis(padAng:getUp(), 90)
-                    
-                    holo:setAngles(padAng)
+                if isHoloVisible then
+                    local ply = player()
+                    if isValid(ply) then
+                        local holoPos = holo:getPos()
+                        local plyEye = ply:getEyePos()
+                        local padAng = (plyEye - holoPos):getAngle()
+                        padAng.p = padAng.p + 90
+                        padAng:rotateAroundAxis(padAng:getUp(), 90)
+                        holo:setAngles(padAng)
+                    end
                 end
             end)
         end
