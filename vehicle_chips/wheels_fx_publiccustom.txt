@@ -77,51 +77,59 @@ if SERVER then
         return    
     end
     
-    local filterCache = {}
+    local function getConstrainedEntities(root)
+        if not root or not root:isValid() then return {} end
+        local fullTree = { root }
+        local seen = { [root] = true }
+        local queue = { root }
+
+        while #queue > 0 do
+            local current = table.remove(queue, 1)
+            if current and current:isValid() then
+                local constraints = constraint.getTable(current)
+                if constraints then
+                    for i = 1, #constraints do
+                        local c = constraints[i]
+                        if c then
+                            local other = (c.Ent1 == current) and c.Ent2 or c.Ent1
+                            if other and other:isValid() and not seen[other] then
+                                seen[other] = true
+                                fullTree[#fullTree+1] = other
+                                queue[#queue+1] = other
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        return fullTree
+    end
+
+    local function getResolvedDynamic()
+        local dynamicFilter = wire.ports.ExtraFilterSemiDynamic
+        local resolved = {}
+        if dynamicFilter and #dynamicFilter > 0 then
+            local checked = {}
+            for _, root in ipairs(dynamicFilter) do
+                if root and root:isValid() then
+                    local constrained = getConstrainedEntities(root)
+                    for _, part in pairs(constrained) do
+                        if part and part:isValid() then
+                            local idx = part:entIndex()
+                            if not checked[idx] then
+                                checked[idx] = true
+                                table.insert(resolved, part)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        return resolved
+    end
     
     function checkFilterUpdates()
-         local dynamicFilter = wire.ports.ExtraFilterSemiDynamic
-         local resolved = {}
-         local inputsSeen = {}
-         
-         if dynamicFilter and #dynamicFilter > 0 then
-             local checked = {}
-             
-             for _, root in ipairs(dynamicFilter) do
-                 if root and root:isValid() then
-                     local rootIdx = root:entIndex()
-                     inputsSeen[rootIdx] = true
-                     
-                     -- Check Cache
-                     if not filterCache[rootIdx] then
-                        -- [EXPENSIVE] Only runs once per unique, valid input entity
-                         local constrained = root:getAllConstrained()
-                         table.insert(constrained, root)
-                         filterCache[rootIdx] = constrained
-                     end
-                     
-                     -- Use Cache
-                     local cachedParts = filterCache[rootIdx]
-                     for _, part in pairs(cachedParts) do
-                         if part and part:isValid() then
-                             local idx = part:entIndex()
-                             if not checked[idx] then
-                                 checked[idx] = true
-                                 table.insert(resolved, part)
-                             end
-                         end
-                     end
-                 end
-             end
-         end
-         
-         -- Garbage collect cache (remove entries no longer in input)
-         -- limit GC to avoid lag? No, table iteration is fast compared to getAllConstrained.
-         for idx, _ in pairs(filterCache) do
-             if not inputsSeen[idx] then
-                 filterCache[idx] = nil
-             end
-         end
+         local resolved = getResolvedDynamic()
          
          -- Check for changes
          local hash = ""
@@ -138,7 +146,7 @@ if SERVER then
             net.send(find.allPlayers())
          end
     end
-    timer.create("check_filter_updates", 3, 0, checkFilterUpdates)
+    timer.create("check_filter_updates", 10, 0, checkFilterUpdates)
     
     hook.add("tick","send_stress_angvels",function()
         sendStressAngVel(wire.ports.Wheels)
@@ -159,8 +167,7 @@ if SERVER then
              local checked = {}
              for _, ent in ipairs(staticFilter) do
                  if ent and ent:isValid() and not checked[ent] then
-                     local constrained = ent:getAllConstrained()
-                     table.insert(constrained, ent)
+                     local constrained = getConstrainedEntities(ent)
                      for _, c in pairs(constrained) do
                          if not checked[c] then
                              checked[c] = true
@@ -169,7 +176,7 @@ if SERVER then
                      end
                  end
              end
-        end
+         end
         
         if table.count(wheels) > 0 then
             local cid = wire.ports.Chassis:isValid() and wire.ports.Chassis:entIndex() or 0
@@ -192,6 +199,15 @@ if SERVER then
                 net.writeUInt(e:entIndex(), 13)
             end
 
+            net.send(ply)
+
+            -- Send current dynamic filter to this player
+            local resolvedDynamic = getResolvedDynamic()
+            net.start("update_dynamic_filter")
+            net.writeUInt(#resolvedDynamic, 13)
+            for _, e in ipairs(resolvedDynamic) do
+                net.writeUInt(e:entIndex(), 13)
+            end
             net.send(ply)
         end
     end)

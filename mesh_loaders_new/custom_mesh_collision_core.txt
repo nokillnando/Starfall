@@ -210,11 +210,23 @@ if SERVER then
                 local prop2 = nonParentProps[j]
                 
                 if prop1.config.weldWithOtherEnts and prop2.config.weldWithOtherEnts then
-                    constraint.weld(prop1.entity, prop2.entity, 0, 0, 0, true)
+                    local con = constraint.weld(prop1.entity, prop2.entity, 0, 0, 0, true)
+                    if con and con:isValid() then
+                        if con.doNotDuplicate then
+                            con:doNotDuplicate(not prop1.config.doNotDuplicateConstraints)
+                        end
+                        table.insert(SF_CREATED_CONSTRAINTS, con)
+                    end
                 end
                 
                 if prop1.config.nocollideWithOtherEnts and prop2.config.nocollideWithOtherEnts then
-                    constraint.nocollide(prop1.entity, prop2.entity, 0, 0)
+                    local con = constraint.nocollide(prop1.entity, prop2.entity, 0, 0)
+                    if con and con:isValid() then
+                        if con.doNotDuplicate then
+                            con:doNotDuplicate(not prop1.config.doNotDuplicateConstraints)
+                        end
+                        table.insert(SF_CREATED_CONSTRAINTS, con)
+                    end
                 end
             end
         end
@@ -225,7 +237,13 @@ if SERVER then
                 if prop.config.allowNocollideWithFWheels then
                     for _, wheel in ipairs(wheelsF) do
                         if wheel and wheel:isValid() then
-                            constraint.nocollide(prop.entity, wheel, 0, 0)
+                            local con = constraint.nocollide(prop.entity, wheel, 0, 0)
+                            if con and con:isValid() then
+                                if con.doNotDuplicate then
+                                    con:doNotDuplicate(not prop.config.doNotDuplicateConstraints)
+                                end
+                                table.insert(SF_CREATED_CONSTRAINTS, con)
+                            end
                         end
                     end
                 end
@@ -238,7 +256,13 @@ if SERVER then
                 if prop.config.allowNocollideWithBWheels then
                     for _, wheel in ipairs(wheelsB) do
                         if wheel and wheel:isValid() then
-                            constraint.nocollide(prop.entity, wheel, 0, 0)
+                            local con = constraint.nocollide(prop.entity, wheel, 0, 0)
+                            if con and con:isValid() then
+                                if con.doNotDuplicate then
+                                    con:doNotDuplicate(not prop.config.doNotDuplicateConstraints)
+                                end
+                                table.insert(SF_CREATED_CONSTRAINTS, con)
+                            end
                         end
                     end
                 end
@@ -275,7 +299,13 @@ if SERVER then
                 ent:setParent(base)
             end
         else
-            constraint.weld(ent, base, 0, 0, 0, true)
+            local con = constraint.weld(ent, base, 0, 0, 0, true)
+            if con and con:isValid() then
+                if con.doNotDuplicate then
+                    con:doNotDuplicate(not config.doNotDuplicateConstraints)
+                end
+                table.insert(SF_CREATED_CONSTRAINTS, con)
+            end
         end
         
         local physObj = ent:getPhysicsObject()
@@ -335,7 +365,9 @@ if SERVER then
             ent:setColor(config.ColorAndAlpha)
         end
         
-        ent:doNotDuplicate()
+        if ent.doNotDuplicate then
+            ent:doNotDuplicate()
+        end
         
         physObj:setMaterial(config.physMaterial)
         physObj:setDamping(config.linearDamping, config.rotDamping)
@@ -629,13 +661,22 @@ if SERVER then
     
         for ent, threshold in pairs(entityHealthTable) do
             if ent:isValid() then
-                local health = ent:acfPropHealth()
-                if health and health < threshold then
-                    if activeConfig.printACFremoval then
-                        print("Removing entity due to low ACF health: " .. tostring(ent))
+                local success, health = pcall(ent.acfPropHealth, ent)
+                if success then
+                    if health and health < threshold then
+                        if activeConfig.printACFremoval then
+                            print("Removing entity due to low ACF health: " .. tostring(ent))
+                        end
+                        ent:remove()
+                        entityHealthTable[ent] = nil  -- Remove from the table
                     end
-                    ent:remove()
-                    entityHealthTable[ent] = nil  -- Remove from the table
+                else
+                    -- If it fails but the entity is somehow invalid, remove it.
+                    -- If it's valid but throws an error, we keep it to try again, or maybe it's fundamentally broken.
+                    -- To avoid infinite pcall spam if it's broken, we could remove it, but let's check validity first.
+                    if not ent:isValid() then
+                        entityHealthTable[ent] = nil
+                    end
                 end
             else
                 entityHealthTable[ent] = nil  -- Remove from the table if entity is invalid

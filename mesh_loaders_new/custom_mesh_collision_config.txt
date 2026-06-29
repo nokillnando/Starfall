@@ -226,6 +226,7 @@ if SERVER then
     config.setAlphaWhenProcessing = true  -- Global toggle for processing alpha visibility
     config.processingAlpha = 255          -- Alpha value during processing
     config.debugCompletion = false      -- Toggle for completion debugging
+    config.doNotDuplicateConstraints = true -- Stops constraints from being saved on duplication or map save
     
     -- Mesh Configurations
     local meshConfigs = {
@@ -272,7 +273,8 @@ if SERVER then
             physMaterial = "default",
             allowNocollideWithFWheels = false,
             allowNocollideWithBWheels = false,
-            allowIndividualColMeshes = false
+            allowIndividualColMeshes = false,
+            doNotDuplicateConstraints = true
         }
         
         -- Check if config is provided

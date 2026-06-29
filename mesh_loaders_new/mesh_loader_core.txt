@@ -1921,7 +1921,7 @@ if CLIENT then
                     else
                         holo:setRenderMode(9)
                     end
-
+        
                     holo:setMaterial("!" .. rtMat:getName())
                     local scaleVal = config.progressDisplayScale or 5.5
                     local scaleVec = type(scaleVal) == "Vector" and scaleVal or Vector(scaleVal, scaleVal, 1)
