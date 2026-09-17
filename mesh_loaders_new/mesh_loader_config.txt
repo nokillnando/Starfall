@@ -2,27 +2,11 @@
 --@author [C17] Red Fox
 --@shared
 --@include mesh_loaders_new/mesh_loader_core.txt
---@include mesh_loaders_new/mesh_loader_ui.txt
 dofile("mesh_loaders_new/mesh_loader_core.txt")
 
 --[[
 
-V2.19
-    Added in-game '!booth' Live Vehicle Editor & Configurator HUD with mouse interaction
-    Added vehicle-isolated Preset management system (!savepreset, !loadpreset, !listpresets, !delpreset)
-    Added Dynamic Parts & Bodykit variant switching system (Part & Variant tags)
-    Added High-Speed Wheel Blur texture swapping (WheelBlurTexture & WheelBlurRPM)
-    Added native Pearlescent / Color-Shift paint support (Pearlescent = { ... })
-
-V2.18
-    Compatibility updates with Core V2.20
-    Added BlendTintByBaseAlpha, BlendTintColorOverBase, and custom Shader parameter support
-    
-V2.17
-    Compatibility updates with Core V2.19
-    
-V2.16
-    Compatibility updates with Core V2.18
+    Changelog:
     
 V2.14
     Detail texture support variables
@@ -158,10 +142,6 @@ Now that this has been said, go scroll down
     LowPolyTexture------------------Linear texture filtering, PS1 style
     Color2--------------------------Vector, think of it as a extra color brightness if needed
     SuppressEngineLighting----------Make it fullbright
-    Shader--------------------------Shader to create (defaults to "VertexLitGeneric", can be "Modulate", "UnlitGeneric", etc.)
-    Mod2x---------------------------Bool (true/false), enables 2x overlay blending mode when using Modulate shader ($mod2x)
-    BlendTintByBaseAlpha------------Bool (true/false), enables tinting via base texture alpha mask ($blendtintbybasealpha)
-    BlendTintColorOverBase----------Float (0-1), blend mode for tint mask: 0 = multiply tint, 1 = replace base color with tint ($blendtintcoloroverbase)
     DetailLink----------------------URL or VTF path for the detail texture
     DetailBlendFactor---------------Float (0-1), how much the detail texture blends in
     DetailBlendMode-----------------Int (0-12), see valve wiki for blend modes
@@ -175,125 +155,6 @@ Now that this has been said, go scroll down
     FixAngles = { pitch=false, yaw=false, roll=false, invert=false } -- Set axes to lock to AngleFixTarget's world rotation. Use invert=true for mirrored wheels (like right-side calipers).
     AngleFixTarget = "Base"---------Entity input name whose angle is used for FixAngles (defaults to Base)
     ColorCommand--------------------String (e.g. "Body"), enables chat-activated color/phong/reflection adjustments (e.g. typing "!Body 255 0 0" in chat while looking at the car). Supports optional overrides separated by "|" (e.g. "!Body color | phong_tint | envmap_tint | phong_mult | envmap_mult").
-    Part----------------------------String (e.g. "Spoiler", "Hood", "Bumper"), groups submeshes into swappable bodykit variants
-    Variant-------------------------Int (e.g. 1, 2, 3), variant index for this part. Only the active variant is rendered. Switchable via !part or !booth!
-    WheelBlurTexture----------------URL or VTF path, rim blur texture dynamically activated when wheel angular velocity / RPM exceeds threshold
-    WheelBlurRPM--------------------Number (default 300), angular speed threshold for activating WheelBlurTexture
-    Pearlescent---------------------Table: { base = Color(...), shift = Color(...), intensity = 1.5 }, multi-tone color shifting paint system
-    
-    
-    In-Game Live Vehicle Editor & Configurator (!booth / /booth):
-    Type "!booth" or "/booth" in chat while in-game to open the interactive HUD Configurator.
-    - Tab 1: Live Paint & Shaders (RGBA sliders, live color preview, quick swatches, Phong & EnvMap specular boosts, Pearlescent themes)
-    - Tab 2: Texture Swaps (Dynamic heat/glow sliders, light textures, simulation controls, reset buttons)
-    - Tab 3: Submeshes & Lighting (Browse submeshes, hide/show, local offset X/Y/Z, rotation, scale, material & lighting tuning, export Lua chunk)
-    - Tab 4: Bodykits & Parts (Cycle through variants for each tagged Part group with [<] [>] buttons)
-    - Tab 5: Presets Manager (Save, load, overwrite, delete vehicle configs, 1-click Quick Name tags)
-    
-    Chat Commands:
-    !booth                 - Opens/closes the interactive Configurator menu (checks sight/vehicle)
-    !savepreset <name>     - Saves current vehicle colors, parts, and overrides to Starfall disk
-    !loadpreset <name>     - Loads a previously saved preset
-    !listpresets           - Prints all available presets for this vehicle to console
-    !delpreset <name>      - Deletes a saved preset
-    !part <name> <var>     - Changes active part variant (e.g. "!part Spoiler 2", or "!part Spoiler none" / 0 to remove)
-    !swap <name> [value]   - Activates a texture swap or skin (e.g. "!swap Skin 2", "!swap RotorGlow 1.0", "!swap FogLights")
-    
-    
-    =============================================================================
-    BODYKITS & SWAPPABLE PARTS SYSTEM (Part & Variant):
-    =============================================================================
-    You can group any number of submesh entries into swappable bodykit options
-    by tagging them with "Part" and "Variant" inside the `meshes = { ... }` table:
-    
-      Part    = "PartGroupName"   -- Name of the category (e.g. "Spoiler", "Hood", "Exhaust")
-      Variant = 1                 -- Variant number (1 = default/stock, 2 = custom, 3 = race, etc.)
-    
-    How it works:
-    1. When the vehicle spawns, Variant 1 is automatically visible; all other variants (2, 3, etc.) are hidden.
-    2. In-game, open "!booth" -> Tab 4 (Bodykits & Parts) to cycle between variants with [<] [>] buttons.
-       You can cycle down to "None (Off)" to completely remove/hide any part in real-time!
-    3. Or type in chat: "!part <PartName> <VariantNumber>" (e.g. "!part Spoiler 2", or "!part Spoiler none" / "!part Spoiler 0" to remove).
-    4. Any submesh WITHOUT a "Part" tag is considered a permanent base mesh and will ALWAYS remain visible.
-    5. A single variant can contain multiple submeshes (e.g. a GT Wing made of Blade + Mounts).
-    
-    -----------------------------------------------------------------------------
-    HOW TO MAKE PARTS OPTIONAL (e.g. Starting with NO spoiler on spawn):
-    -----------------------------------------------------------------------------
-    If you want the vehicle to spawn WITHOUT a spoiler by default, but still have
-    the option to add/equip one in the Configurator:
-      • Simply DO NOT define a mesh for Variant 1!
-      • Start your spoiler options at Variant 2 (e.g. OEM Spoiler = 2, GT Wing = 3).
-      • Because Variant 1 is empty, the car will spawn wingless by default!
-      • When you open !booth -> Tab 4, cycling to Variant 2 equips the OEM Spoiler,
-        Variant 3 equips the GT Wing, and cycling to None/Variant 1 removes it!
-    -----------------------------------------------------------------------------
-    
-    Practical Example inside meshes = { ... }:
-    
-        meshes = {
-            -- 1. Permanent Car Body (No Part tag - Always Visible):
-            {
-                mdl = "models/mycar/body_chassis.obj",
-                texture = "https://i.imgur.com/body_diffuse.png",
-                ColorCommand = "Body",
-            },
-            
-            -- 2. OEM Spoiler (Variant 2 - Car spawns wingless because Variant 1 is empty!):
-            {
-                mdl = "models/mycar/spoiler_stock.obj",
-                texture = "https://i.imgur.com/body_diffuse.png",
-                ColorCommand = "Body",
-                Part = "Spoiler",
-                Variant = 2,
-            },
-            
-            -- 3. Carbon GT Wing (Variant 2 - Made of TWO submeshes):
-            -- Submesh A: Carbon Wing Blade
-            {
-                mdl = "models/mycar/wing_gt_blade.obj",
-                texture = "https://i.imgur.com/carbon_fiber.png",
-                Shader = "VertexLitGeneric",
-                PhongBoost = 2.5,
-                Part = "Spoiler",
-                Variant = 2,
-            },
-            -- Submesh B: Metal Wing Stands
-            {
-                mdl = "models/mycar/wing_gt_mounts.obj",
-                texture = "models/debug/debugwhite",
-                ColorAndAlpha = Color(35, 35, 35, 255),
-                Part = "Spoiler",
-                Variant = 2,
-            },
-            
-            -- 4. Ducktail Spoiler (Variant 3):
-            {
-                mdl = "models/mycar/spoiler_ducktail.obj",
-                texture = "https://i.imgur.com/body_diffuse.png",
-                ColorCommand = "Body",
-                Part = "Spoiler",
-                Variant = 3,
-            },
-            
-            -- 5. Stock Hood (Variant 1):
-            {
-                mdl = "models/mycar/hood_oem.obj",
-                texture = "https://i.imgur.com/body_diffuse.png",
-                ColorCommand = "Body",
-                Part = "Hood",
-                Variant = 1,
-            },
-            
-            -- 6. Vented Vented Carbon Hood (Variant 2):
-            {
-                mdl = "models/mycar/hood_vented.obj",
-                texture = "https://i.imgur.com/carbon_fiber.png",
-                Part = "Hood",
-                Variant = 2,
-            },
-        }
-    =============================================================================
     
     
     ColorCommand Chat Commands:
@@ -335,22 +196,17 @@ Now that this has been said, go scroll down
     
     Texture swap examples:
     
-     IMPORTANT: All swaps for a specific mesh MUST be defined inside ONE single 'TextureSwaps = { ... }' table!
-     Do NOT create multiple 'TextureSwaps = { ... }' blocks inside the same mesh.
+    TextureSwaps = {
+        ["Brake"] = { --Input name
+            texture = "url here", --optional url or texture path
+            highlight = false, -- disable lighting or not when activating the swap, and optionally change color/alpha
+            color = Color(255,0,0,255), --optional
+            dynamic = true,
+            dynamicMin = 0,
+            dynamicMax = 300
+        } 
+    }
     
-      Example 1: Simple Single Dynamic Swap (e.g. Brake Lights)
-     TextureSwaps = {
-         ["Brake"] = {
-             texture = "url here",
-             highlight = false,
-             color = Color(255, 0, 0, 255),
-             dynamic = true,
-             dynamicMin = 0,
-             dynamicMax = 300,
-         }
-     }
-    
-     Example 2: Comprehensive Multi-Swap Suite (All in ONE table)
     TextureSwaps = {
         ["RunningLights"] = { 
             input = "Lights", -- Optional: Use a specific Wire input name instead of the table key
@@ -367,125 +223,21 @@ Now that this has been said, go scroll down
         ["Skin_Red"] = {
             input = "Skin",   -- Multiple swaps can share one input
             condition = 1,    -- Only activates if the "Skin" input value is exactly 1
-            texture = "url_for_red_texture",
-            PhongBoost = 2.5,                 -- Custom specular boost when this skin is active
-            EnvMapShinyness = Vector(0.1, 0.1, 0.1), -- Custom reflection intensity
+            texture = "url_for_red_texture"
         },
         ["Skin_Blue"] = {
             input = "Skin",
             condition = 2,    -- Only activates if the "Skin" input value is exactly 2
-            texture = "url_for_blue_texture",
-            PhongBoost = 1.0,
-            PhongExp = 128,                   -- Tighter, glossier highlights
-            PhongTint = Color(100, 200, 255), -- Blue tinted specular reflections
-        },
-        ["Carbon_Mode"] = {
-            input = "Carbon",
-            texture = "url_for_carbon_weave",
-            PhongBoost = 3.0,
-            PhongExp = 256,
-            EnvMapShinyness = Vector(0.02, 0.02, 0.02), -- Matte/semi-gloss clearcoat
+            texture = "url_for_blue_texture"
         },
         ["GlowEffect"] = {
             input = "Turbo",
             dynamic = true,   -- Scales color/alpha based on the input float value
             dynamicMin = 0,
             dynamicMax = 100,
-            color = Color(0,255,255,255),
-            RimLightBoost = 5.0,              -- Intense edge glow when spooling
+            color = Color(0,255,255,255)
         }
     }
-    
-    -----------------------------------------------------------------------------
-    SUPPORTED MATERIAL & SHADER OVERRIDES INSIDE TextureSwaps:
-    -----------------------------------------------------------------------------
-    Every swap entry can independently override ANY of the following properties:
-      • Flags                          = { 2048, 32, ... }      (Bitwise material flags)
-      • EnableHalfLambert              = true / false           (Valve Half-Lambert diffuse lighting)
-      • EnableBaseMapAlphaEnvMask      = true / false           (Use base texture alpha channel as envmap mask)
-      • EnableNormalmapAlphaEnvMapMask = true / false           (Use normalmap alpha channel as envmap mask)
-      • BaseMapAlphaPhongMask          = true / false           ($basemapalphaphongmask)
-      • BlendTintByBaseAlpha           = true / false           ($blendtintbybasealpha)
-      • BlendTintColorOverBase         = 0.0 - 1.0              ($blendtintcoloroverbase)
-      • Mod2x                          = true / false           ($mod2x multiplicative blending)
-      • UsePhong                       = true / false           ($phong enable/disable)
-      • InvertPhongMask                = true / false           ($invertphongmask)
-      • PhongBoost                     = 2.5                    ($phongboost, specular strength)
-      • PhongExp                       = 128                    ($phongexponent, highlight tightness)
-      • PhongTint                      = Color(r,g,b) / Vector  ($phongtint, custom specular tint)
-      • PhongAlbedoTint                = 1.0                    ($phongalbedotint)
-      • PhongAlbedoBoost               = 1.5                    ($phongalbedoboost)
-      • PhongFresnelRanges             = Vector(0.2, 0.5, 1)    ($phongfresnelranges)
-      • UseRimLight                    = true / false           ($rimlight enable/disable)
-      • RimLightBoost                  = 2.0                    ($rimlightboost, edge glow power)
-      • RimLightExp                    = 8                      ($rimlightexponent)
-      • EnvMapShinyness                = Color(r,g,b) / Vector  ($envmaptint, reflection strength/tint)
-      • EnvMapContrast                 = 0.5                    ($envmapcontrast, 0.0 - 1.0)
-      • EnvMapSaturation               = 1.0                    ($envmapsaturation, 0.0 - 1.0)
-      • EnvMapFresnel                  = 1.0                    ($envmapfresnel)
-      • DetailBlendFactor              = 0.5                    ($detailblendfactor)
-      • DetailBlendMode                = 0                      ($detailblendmode)
-      • DetailScale                    = 4                      ($detailscale)
-      • DetailTint                     = Vector(1, 1, 1)        ($detailtint)
-      • TextureScale                   = 1.0                    ($basetexturetransform scale)
-      • LowPolyTexture                 = true / false           (Point-filtered retro / pixel art texture)
-      • Color2                         = Vector(1, 1, 1)        ($color2)
-    When the swap turns off, the mesh automatically restores its base configurator settings!
-
-    =============================================================================
-    WHEEL BLUR SYSTEM (WheelBlurTexture & WheelBlurRPM):
-    =============================================================================
-    The mesh loader automatically detects spinning parent props (e.g. ACF/Base wheels)
-    and swaps the rim texture to a motion-blurred texture at high rotational speed!
-    
-    Parameters per mesh:
-      WheelBlurTexture = "https://i.imgur.com/rim_blurred.png"  -- URL or local material to use at speed
-      WheelBlurRPM     = 350                                     -- RPM / angular velocity threshold (default: 300)
-    
-    Wheel Setup Example:
-        {
-            mdl = "models/mycar/wheel_front_left.obj",
-            texture = "https://i.imgur.com/rim_static.png",
-            WheelBlurTexture = "https://i.imgur.com/rim_blurred.png",
-            WheelBlurRPM = 280,
-            Parent = "Wheel_FL",
-            Shader = "VertexLitGeneric",
-            PhongBoost = 2.0,
-        }
-
-    =============================================================================
-    DOWNLOADING IMAGES vs STREAMING (DownloadImages & DownloadImage):
-    =============================================================================
-    • Global setting: `local DownloadImages = true` (downloads .png/.jpg textures to
-      `data/sf_filedatatemp` to bypass Starfall's RenderTarget limits).
-    • Per-Submesh override: You can add `DownloadImage = false` or `DownloadImage = true`
-      inside any submesh entry in `meshes = { ... }` to force or skip saving that specific
-      texture to disk temp!
-      
-      Example:
-        {
-            mdl = "models/mycar/interior_gauges.obj",
-            texture = "https://i.imgur.com/gauges.png",
-            DownloadImage = false, -- Skips disk download; uses direct live URL streaming
-        }
-
-    =============================================================================
-    SHADER TYPE vs SUPPRESS LIGHTING (HIGHLIGHT):
-    =============================================================================
-    • Shader = "VertexLitGeneric":
-      Standard Source engine 3D shader with full diffuse, Phong specular highlights,
-      normal mapping ($bumpmap), and cubemap reflections ($envmap).
-    
-    • Shader = "UnlitGeneric":
-      Emissive 2D/3D shader that is completely unaffected by world light/shadows (fullbright).
-      (Note: UnlitGeneric does NOT calculate Phong or normal maps).
-      
-    • SuppressEngineLighting = true (or `highlight = true` in TextureSwaps):
-      Disables environmental shadow shading on a "VertexLitGeneric" mesh, forcing it to
-      render at full brightness while PRESERVING your Phong specular and reflection maps!
-      - Perfect for: Headlights, Daytime Running Lights (DRLs), illuminated dashboards,
-        and glowing brake rotors.
-    =============================================================================
 
     
         To use any of the following, EnvMapMask, BumpMap, you MUST enable the use of UseEnvMapSpecularReflections
@@ -531,7 +283,7 @@ Now that this has been said, go scroll down
     ]]--
 --############################################################################################################################################
 --Actual things to change
-local ConfigVersion = "2.20"
+local ConfigVersion = "2.15"
 local meshName = "Body - Main" --Just the chip name when finished
 local globalScale = Vector(1) -- Scale all meshes added by this amount, or add a scale vector to individual meshes
 local offsetPos = Vector(0, 0, 0) -- Offsets are relative to chip/base
@@ -550,8 +302,7 @@ local progressDisplayColor2 = nil    -- Optional: Secondary color (Texture progr
 local progressDisplayBgColor = nil   -- Optional: Background color (e.g. Color(10, 14, 24, 240) or Vector(10, 14, 24))
 local AllowCheckVersion = true  -- Set to false to disable online version checking
 local UpdateRate = 33           -- Network update frequency (Hz)
-local DownloadImages = true     -- Set to true to bypass texture limits by downloading png/jpg to temp (can also be set per-submesh using DownloadImage = false/true)
-local EnableBooth = true        -- Set to false to disable the booth configurator on this chip (e.g. for auxiliary or wheel chips)
+local DownloadImages = true     -- Set to true to bypass texture limits by downloading png/jpg to temp
 
 -- scale parameters can be added optionally for individual meshes, can leave them out if they aren't used
 local meshes = {
@@ -573,11 +324,6 @@ local meshes = {
             --FixAngles = { pitch=false, yaw=false, roll=false },
             --AngleFixTarget = "Base",
             --ColorCommand = "paint_car", -- Enables chat-activated color commands e.g. "!paint_car [color] | [phong tint] | [envmap tint]"
-            --Part = "Spoiler", -- Bodykit group
-            --Variant = 1,      -- Variant index
-            --WheelBlurTexture = "url_here", -- High speed wheel rim blur texture
-            --WheelBlurRPM = 300,            -- RPM threshold for blur
-            --Pearlescent = { base = Color(60, 0, 90), shift = Color(0, 255, 120), intensity = 1.5 },
            --[[
             TextureSwaps = {
                 ["Brake"] = { --Input name
@@ -634,15 +380,6 @@ local function getDefaultConfig()
         LowPolyTexture = 0,
         Color2 = Vector(1, 1, 1),
         SuppressEngineLighting = false,
-        Shader = "VertexLitGeneric",
-        Mod2x = false,
-        BlendTintByBaseAlpha = false,
-        BlendTintColorOverBase = 0,
-        Part = nil,
-        Variant = 1,
-        WheelBlurTexture = nil,
-        WheelBlurRPM = 300,
-        Pearlescent = nil,
         scale = Vector(1,1,1)
     }
 end
@@ -662,22 +399,6 @@ local function mergeConfig(userConfig)
         else
             finalConfig[k] = v
         end
-    end
-    
-    -- Normalize Part and Variant casing
-    if userConfig.part ~= nil then finalConfig.Part = userConfig.part end
-    if userConfig.variant ~= nil then finalConfig.Variant = tonumber(userConfig.variant) or 1 end
-    if userConfig.Part ~= nil then finalConfig.Part = userConfig.Part end
-    if userConfig.Variant ~= nil then finalConfig.Variant = tonumber(userConfig.Variant) or 1 end
-    
-    -- Handle native Pearlescent paint setup
-    if userConfig.Pearlescent and type(userConfig.Pearlescent) == "table" then
-        local baseCol = userConfig.Pearlescent.base or Color(255, 255, 255, 255)
-        local shiftCol = userConfig.Pearlescent.shift or Color(0, 255, 120, 255)
-        local intensity = userConfig.Pearlescent.intensity or 1.5
-        finalConfig.ColorAndAlpha = baseCol
-        finalConfig.PhongTint = Vector(shiftCol.r / 255, shiftCol.g / 255, shiftCol.b / 255) * intensity
-        finalConfig.EnvMapShinyness = Vector(shiftCol.r / 255, shiftCol.g / 255, shiftCol.b / 255) * (intensity * 0.05)
     end
     
     return finalConfig
@@ -731,7 +452,6 @@ if _G.MeshLoaderCore then
         ConfigVersion = ConfigVersion,
         UpdateRate = UpdateRate,
         DownloadImages = DownloadImages,
-        EnableBooth = EnableBooth,
         meshName = meshName,
         globalScale = globalScale,
         offsetPos = offsetPos,
@@ -760,7 +480,7 @@ if _G.MeshLoaderCore then
         _G.MeshLoaderCore.initServer(configTbl)
     end
 else
-    print("Error: MeshLoaderCore not loaded. Make sure mesh_loaders_new/mesh_loader_core.txt is included.")
+    print("Error: MeshLoaderCore not loaded. Make sure sfex_meshloader_core.txt is included.")
 end
 
 if CLIENT then
