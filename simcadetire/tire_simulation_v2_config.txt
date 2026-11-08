@@ -188,8 +188,8 @@ local UserConfig = {
     --   Front = { Compound = "Comfort", Preset = "Rally", Width = 195, AspectRatio = 55 }
     --   Front = { Compound = "Sport", Width = 155, AspectRatio = 70 }  -- no preset = global tuning used
     TireSetup = {
-        Front = { Compound = "Sport", Preset = "Sport", Width = 155, AspectRatio = 70 },
-        Rear  = { Compound = "Sport", Preset = "Sport", Width = 155, AspectRatio = 70 },
+        Front = { Compound = "Sport", Width = 155, AspectRatio = 70 },
+        Rear  = { Compound = "Sport", Width = 155, AspectRatio = 70 },
     },
     
 
