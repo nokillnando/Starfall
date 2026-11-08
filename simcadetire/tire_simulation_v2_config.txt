@@ -1,0 +1,240 @@
+--@name Tire Simulation Config V2
+--@author [C17] Red Fox
+--@shared
+--@include tire_simulation_v2_core.txt
+dofile("tire_simulation_v2_core.txt")
+
+-- ============================================================================
+-- TIRE COMPOUND DEFINITIONS (LATERAL & LONGITUDINAL PACEJKA)
+-- ============================================================================
+-- [PACEJKA MAGIC FORMULA TUNING]
+-- CoF:     Maximum overall grip limit (Coefficient of Friction).
+-- Lat_B:   Lateral Stiffness Factor (Cornering response).
+-- Lat_C:   Lateral Shape Factor (Plateau vs sharp peak).
+-- Lat_E:   Lateral Curvature Factor (Snap breakaway).
+-- Long_B:  Longitudinal Stiffness Factor (Acceleration & braking bite).
+-- Long_C:  Longitudinal Shape Factor.
+-- Long_E:  Longitudinal Curvature Factor.
+-- Load_A1/A2: Load Sensitivity (Downward force grip scaling).
+
+local InternalProperties = {
+    Comfort = {
+        CoF = 0.55, 
+        BaseRollingResistance = 0.15,
+        Lat_B = 8, Lat_C = 1.3, Lat_E = 0.1,
+        Long_B = 10, Long_C = 1.5, Long_E = 0.4,
+        Load_A1 = -0.0000004, Load_A2 = 2.0, 
+        SurfaceMultipliers = {
+            [67]=1.0, [84]=1.0, [87]=0.95, [77]=0.9, [71]=0.85, [86]=0.85, [89]=0.9, [74]=0.6, [68]=0.7,
+            [78]=0.65, [85]=0.75, [79]=0.8, [70]=0.5, [72]=0.5, [76]=1.0, [80]=0.9, Default = 0.9
+        }
+    },
+    Sport = {
+        CoF = 1.25, 
+        BaseRollingResistance = 0.1,
+        Lat_B = 10, Lat_C = 1.35, Lat_E = 0.1,
+        Long_B = 12, Long_C = 1.65, Long_E = 0.6,
+        Load_A1 = -0.0000005, Load_A2 = 2.2, 
+        SurfaceMultipliers = {
+            [67]=1.0, [84]=1.05, [87]=0.9, [77]=0.85, [71]=0.8, [86]=0.8, [89]=0.85, [74]=0.3, [68]=0.5,
+            [78]=0.4, [85]=0.55, [79]=0.6, [70]=0.4, [72]=0.4, [76]=1.0, [80]=0.95, Default = 1.0
+        }
+    },
+    Slick = {
+        CoF = 1.7, 
+        BaseRollingResistance = 0.07,
+        Lat_B = 12, Lat_C = 1.4, Lat_E = 0.1,
+        Long_B = 14, Long_C = 1.7, Long_E = 0.6,
+        Load_A1 = -0.0000001, Load_A2 = 1.8, 
+        SurfaceMultipliers = {
+            [67]=1.1, [84]=1.2, [87]=0.6, [77]=0.5, [71]=0.4, [86]=0.4, [89]=0.7, [74]=0.01, [68]=0.05,
+            [78]=0.01, [85]=0.05, [79]=0.1, [70]=0.2, [72]=0.2, [76]=0.9, [80]=0.8, Default = 1.0
+        }
+    },
+    Rally = {
+        CoF = 1.1, 
+        BaseRollingResistance = 0.17,
+        Lat_B = 9, Lat_C = 1.5, Lat_E = 0.1,
+        Long_B = 11, Long_C = 1.55, Long_E = 0.5,
+        Load_A1 = -0.0000004, Load_A2 = 2.1, 
+        SurfaceMultipliers = {
+            [67]=0.85, [84]=0.8, [87]=0.9, [77]=0.75, [71]=0.9, [86]=0.85, [89]=0.7, [74]=1.1, [68]=1.2,
+            [78]=1.15, [85]=1.1, [79]=1.0, [70]=0.6, [72]=0.6, [76]=0.8, [80]=0.75, Default = 0.8
+        }
+    }
+}
+
+-- =========================================
+-- COMPOUND PRESETS
+-- =========================================
+-- Use these as named handling profiles.
+-- You can assign them on each tire with:
+--   Front = { Compound = "Sport", Preset = "Racing", Width = 245, AspectRatio = 45 },
+--   Rear  = { Compound = "Sport", Preset = "Racing", Width = 245, AspectRatio = 45 },
+--
+-- If Preset is omitted, the tire falls back to the global tuning values below.
+-- If you want a different tire compound with the same preset, you can do:
+--   Front = { Compound = "Comfort", Preset = "Racing", Width = 195, AspectRatio = 55 },
+--   Rear  = { Compound = "Comfort", Preset = "Racing", Width = 195, AspectRatio = 55 },
+--
+-- The preset controls handling feel, while the compound controls the physical tire data.
+-- So you can mix compound and setup feel independently.
+local CompoundPresets = {
+    Comfort = {
+        OverallGripMultiplier = 0.010,
+        LateralGripMultiplier = 1.0,
+        LongitudinalGripMultiplier = 1.0,
+        FrontGripBias = 0.5,
+        RearGripBias = 0.75,
+        YawStabilityFactor = 0.10,
+        GripDampingFactor = 1.0,
+        LowSpeedLateralHoldDeadzone = 2.0,
+        LowSpeedHoldScale = 0.35,
+    },
+    Sport = {
+        OverallGripMultiplier = 0.010,
+        LateralGripMultiplier = 1.08,
+        LongitudinalGripMultiplier = 1.05,
+        FrontGripBias = 0.52,
+        RearGripBias = 0.82,
+        YawStabilityFactor = 0.08,
+        GripDampingFactor = 0.95,
+        LowSpeedLateralHoldDeadzone = 2.2,
+        LowSpeedHoldScale = 0.3,
+    },
+    Slick = {
+        OverallGripMultiplier = 0.010,
+        LateralGripMultiplier = 1.25,
+        LongitudinalGripMultiplier = 1.15,
+        FrontGripBias = 0.55,
+        RearGripBias = 0.9,
+        YawStabilityFactor = 0.06,
+        GripDampingFactor = 0.9,
+        LowSpeedLateralHoldDeadzone = 2.6,
+        LowSpeedHoldScale = 0.25,
+    },
+    Rally = {
+        OverallGripMultiplier = 0.010,
+        LateralGripMultiplier = 1.2,
+        LongitudinalGripMultiplier = 1.1,
+        FrontGripBias = 0.6,
+        RearGripBias = 0.95,
+        YawStabilityFactor = 0.12,
+        GripDampingFactor = 1.1,
+        LowSpeedLateralHoldDeadzone = 3.0,
+        LowSpeedHoldScale = 0.5,
+    },
+    Racing = {
+        OverallGripMultiplier = 0.012,
+        LateralGripMultiplier = 1.35,
+        LongitudinalGripMultiplier = 1.2,
+        FrontGripBias = 0.55,
+        RearGripBias = 0.9,
+        YawStabilityFactor = 0.05,
+        GripDampingFactor = 0.85,
+        LowSpeedLateralHoldDeadzone = 3.0,
+        LowSpeedHoldScale = 0.25,
+    },
+    Drift = {
+        OverallGripMultiplier = 0.010,
+        LateralGripMultiplier = 1.6,
+        LongitudinalGripMultiplier = 0.9,
+        FrontGripBias = 0.5,
+        RearGripBias = 1.0,
+        YawStabilityFactor = 0.0,
+        GripDampingFactor = 0.8,
+        LowSpeedLateralHoldDeadzone = 2.8,
+        LowSpeedHoldScale = 0.2,
+    },
+}
+
+-- ============================================================================
+-- VEHICLE CONFIGURATION
+-- ============================================================================
+local UserConfig = {
+    -- Display Settings
+    ShowAxisVisualizer = false, -- Draws 3D debug arrows on wheels/base for alignment
+    ShowTelemetry3D = true,     -- Draws live 3D combined grip pillars above every wheel
+    ShowPacejkaGraph = true,    -- Draws 2D math grip curve & live wheel operating points
+    ShowWheelHolograms = false, -- Draws dummy wheel models for debug
+    VisualizerLength = 2,       -- Length of debug axes
+    AllowPrintFilter = false,   -- Print when new entities are added to filter
+    AllowPrintMassRefresh = true, -- Print when mass refresh updates physical mass
+    AllowCheckVersion = true,  -- Check for Core updates on spawn
+
+    W = Color(255, 255, 255),   -- Console Print Color: Text
+    R = Color(255, 0, 0),       -- Console Print Color: Error
+    G = Color(0, 255, 0),       -- Console Print Color: Success
+
+    -- Core Physics Axis
+    ForwardAxis = Vector(1, 0, 0),
+    UpAxis = Vector(0, 0, 1),
+    
+    -- Vehicle Specs
+    TotalVehicleMass = 700,     -- Virtual Mass in KG (Affects load transfer/grip)
+    WeightRatioFront = 0.63,    -- Ratio of weight on front axle (0.0 - 1.0)
+    WeightRatioRear = 0.37,     -- Ratio of weight on rear axle (0.0 - 1.0)
+    CenterOfMassHeight = 25,    -- Virtual CG Height (Inches)
+    TireRadius = 16,            -- Inches (Used for trace distance & wheel surface speed)
+    
+    -- Simulation Quality
+    UpdateRate = 66,            -- Target updates per second (Hz). Lower (e.g. 33) to save CPU.
+    ConstraintRefreshInterval = 2.0, -- Re-scan base constraints this often (seconds)
+    
+    -- Tire Setup (Compound & Geometry)
+    -- Examples:
+    --   Front = { Compound = "Sport", Preset = "Sport", Width = 155, AspectRatio = 70 }
+    --   Front = { Compound = "Sport", Preset = "Racing", Width = 245, AspectRatio = 45 }
+    --   Front = { Compound = "Comfort", Preset = "Rally", Width = 195, AspectRatio = 55 }
+    --   Front = { Compound = "Sport", Width = 155, AspectRatio = 70 }  -- no preset = global tuning used
+    TireSetup = {
+        Front = { Compound = "Sport", Preset = "Sport", Width = 155, AspectRatio = 70 },
+        Rear  = { Compound = "Sport", Preset = "Sport", Width = 155, AspectRatio = 70 },
+    },
+    
+
+    -- Wheel Physics Material
+    WheelPhysicsMaterial = "jeeptire",  -- Default: "jeeptire"
+    
+    -- Tuning / Handling
+    OverallGripMultiplier = 0.010,       -- Global Grip Scale
+    LateralGripMultiplier = 1.0,         -- Lateral (Side) Grip Scale
+    LongitudinalGripMultiplier = 1.0,    -- Longitudinal (Drive/Brake) Grip Scale
+    LowSpeedLateralHoldDeadzone = 10.0,   -- Ignore tiny lateral pushes before low-speed hold engages
+    LowSpeedHoldScale = 1.35,            -- Reduce static slope/hold force while still preserving low-speed stability
+    FrontGripBias = 0.5,                -- Grip Multiplier Front (<1.0 = more understeer)
+    RearGripBias = 0.75,                 -- Grip Multiplier Rear (>1.0 = more stability)
+    YawStabilityFactor = 0.1,            -- "Simcade Assist": Dampens inertia spins (0.0 = disable)
+    GripDampingFactor = 1.0,             -- Smooths force application (Lower = snappier/sharper)
+    CompoundPresets = CompoundPresets,
+    Gravity = 9.81 * 39.37,              -- Source Engine Units (inches/s^2)
+    
+    -- Aero
+    FrontAeroFactor = 0.0,    -- Downforce Coeff Front
+    RearAeroFactor = 0.0,     -- Downforce Coeff Rear
+    
+    -- Load Transfer
+    BrakeTransferFactor = 20.6,    -- Weight transfer % during braking
+    ThrottleTransferFactor = 10.4, -- Weight transfer % during accel
+    
+    -- Inputs
+    ThrottleMaxValue = 1,
+    BrakeMaxValue = 1,
+    InputDeadzone = 0.05,
+    
+    -- Pass the compounds to Core
+    InternalProperties = InternalProperties
+}
+
+-- ============================================================================
+-- INITIALIZATION
+-- ============================================================================
+if _G.TireSimCoreV2 then
+    if CLIENT then
+        _G.TireSimCoreV2.initClient(UserConfig)
+    else
+        _G.TireSimCoreV2.initServer(UserConfig)
+    end
+else
+    print(UserConfig.R, "CRITICAL ERROR: TireSimCoreV2 not loaded!")
+end
