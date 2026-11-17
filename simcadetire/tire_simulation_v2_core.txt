@@ -2,7 +2,7 @@
 --@author [C17] Red Fox
 --@shared
 
-local Version = "2.00"
+local Version = "2.01"
 
 --[[
 Changelog
@@ -250,12 +250,17 @@ if CLIENT then
                         local rearAspect  = (activeConfig.TireSetup and activeConfig.TireSetup.Rear and activeConfig.TireSetup.Rear.AspectRatio) or 50
                         local avgAspect = (frontAspect + rearAspect) * 0.5
                         local aspectStiff = 50 / math.max(10, avgAspect)
+                        local frontWidth = (activeConfig.TireSetup and activeConfig.TireSetup.Front and activeConfig.TireSetup.Front.Width) or 155
+                        local rearWidth  = (activeConfig.TireSetup and activeConfig.TireSetup.Rear and activeConfig.TireSetup.Rear.Width) or 155
+                        local avgWidth = (frontWidth + rearWidth) * 0.5
+                        local widthFactor = avgWidth / 225
+                        local longStiff = (1.0 + (aspectStiff - 1.0) * 0.5) * math.sqrt(math.max(0.5, widthFactor))
                         
                         -- Pacejka curve caching (Lateral & Longitudinal)
                         local Lat_B = activeTireData.Lat_B * aspectStiff
                         local Lat_C = activeTireData.Lat_C
                         local Lat_E = activeTireData.Lat_E
-                        local Long_B = (activeTireData.Long_B or 12) * (1.0 + (aspectStiff - 1.0) * 0.5)
+                        local Long_B = (activeTireData.Long_B or 12) * longStiff
                         local Long_C = activeTireData.Long_C or 1.65
                         local Long_E = activeTireData.Long_E or 0.6
                         
@@ -263,7 +268,7 @@ if CLIENT then
                         local D_Lat = (graphHeight * 0.75) * (latScaleMult / maxMult)
                         local D_Long = (graphHeight * 0.75) * (longScaleMult / maxMult)
                         
-                        local configKey = (activePresetName or "GLOBAL") .. "_" .. activeCompoundName .. "_" .. scale .. "_" .. string.format("%.2f_%.2f", latScaleMult, longScaleMult)
+                        local configKey = (activePresetName or "GLOBAL") .. "_" .. activeCompoundName .. "_" .. scale .. "_" .. string.format("%.2f_%.2f_%.1f_%.1f", latScaleMult, longScaleMult, avgAspect, avgWidth)
                         if not cachedPacejkaPoints or not cachedPacejkaLongPoints or lastPacejkaConfigKey ~= configKey then
                             cachedPacejkaPoints = {}
                             cachedPacejkaLongPoints = {}
@@ -485,8 +490,8 @@ else -- SERVER
             for i = 1, 3 do
                 if i ~= axis then maxR = math.max(maxR, s[i] / 2) end
             end
-            -- Prioritize actual wheel OBB radius (like PropTire.WheelSize), fallback to Config.TireRadius
-            local radius = (maxR > 1) and math.clamp(maxR, 1, 200) or ((defaultRadius and defaultRadius > 0) and defaultRadius or 16)
+            -- Use Config.TireRadius when set (> 0), falling back to wheel OBB radius detection
+            local radius = (defaultRadius and defaultRadius > 0) and defaultRadius or ((maxR > 1) and math.clamp(maxR, 1, 200) or 16)
             return LOCAL_AXES[axis], radius
         end
 
@@ -564,7 +569,35 @@ else -- SERVER
         local cpuLoadPct = 0
         local lastReportedFilterCount = -1
         
-        local RightAxis = Config.RightAxis 
+        local RightAxis = Config.RightAxis
+
+        local function computeCleanUpVelocity(basePhys, vehicleUp)
+            local baseMass = math.max(1, basePhys:getMass())
+            local sysMass = baseMass
+            local upMom = basePhys:getVelocity():dot(vehicleUp) * baseMass
+            for _, wName in ipairs(OrderedWheelNames) do
+                local wd = Wheels[wName]
+                if wd and wd.PhysObj and wd.PhysObj:isValid() then
+                    local wm = math.max(1, wd.PhysObj:getMass())
+                    sysMass = sysMass + wm
+                    upMom = upMom + wd.PhysObj:getVelocity():dot(vehicleUp) * wm
+                end
+            end
+            return upMom / sysMass
+        end
+
+        local function traceFiltered(startPos, endPos)
+            local st = trace.line(startPos, endPos, VehicleFilter)
+            if st.Hit and not st.HitWorld and isValid(st.Entity) then
+                local p = st.Entity:getParent()
+                if isValid(p) and CheckedEntities[p] then
+                    CheckedEntities[st.Entity] = true
+                    VehicleFilter[#VehicleFilter + 1] = st.Entity
+                    st = trace.line(startPos, endPos, VehicleFilter)
+                end
+            end
+            return st
+        end
 
         local function formatMass(value)
             return string.format("%.1f", value or 0)
@@ -613,6 +646,22 @@ else -- SERVER
                 while #queue > 0 do
                     local current = table.remove(queue, 1)
                     if isValid(current) then
+                        local parent = current:getParent()
+                        if isValid(parent) and not seen[parent] then
+                            seen[parent] = true
+                            fullTree[#fullTree+1] = parent
+                            queue[#queue+1] = parent
+                        end
+                        local okChildren, children = pcall(function() return current:getChildren() end)
+                        if okChildren and type(children) == "table" then
+                            for _, child in ipairs(children) do
+                                if isValid(child) and not seen[child] then
+                                    seen[child] = true
+                                    fullTree[#fullTree+1] = child
+                                    queue[#queue+1] = child
+                                end
+                            end
+                        end
                         local constraints = constraint.getTable(current)
                         if constraints then
                             for i = 1, #constraints do
@@ -642,9 +691,11 @@ else -- SERVER
                         end
                         if not massChecked[ent] then
                             massChecked[ent] = true
-                            local phys = ent:getPhysicsObject()
-                            if isValid(phys) then
-                                currentMass = currentMass + phys:getMass()
+                            if not isValid(ent:getParent()) then
+                                local phys = ent:getPhysicsObject()
+                                if isValid(phys) then
+                                    currentMass = currentMass + phys:getMass()
+                                end
                             end
                         end
                     end
@@ -655,9 +706,27 @@ else -- SERVER
                 end
                 
                 TotalRealMass = currentMass
-                lastReportedFilterCount = #VehicleFilter
+                local filterCount = #VehicleFilter
+                if Config.AllowPrintFilter then
+                    print("[TireSimV2] Vehicle filter initialized with " .. filterCount .. " entities.")
+                end
+                if Config.AllowPrintMassRefresh then
+                    print(
+                        Config.W,
+                        "[TireSimV2] Total Physical Mass detected: ",
+                        Config.G,
+                        formatMass(currentMass) .. "kg",
+                        Config.W,
+                        " (Config Virtual: ",
+                        Config.G,
+                        formatMass(Config.TotalVehicleMass) .. "kg",
+                        Config.W,
+                        ")"
+                    )
+                end
+                lastReportedFilterCount = filterCount
 
-                return #VehicleFilter, currentMass, previousMass
+                return filterCount, currentMass, previousMass
             else
                 if TireScan.Active then return previousFilterCount, previousMass, previousMass end
 
@@ -702,6 +771,20 @@ else -- SERVER
                 local current = table.remove(queue, 1)
                 if isValid(current) then
                     table.insert(result, current)
+                    local parent = current:getParent()
+                    if isValid(parent) and not seen[parent] then
+                        seen[parent] = true
+                        table.insert(queue, parent)
+                    end
+                    local okChildren, children = pcall(function() return current:getChildren() end)
+                    if okChildren and type(children) == "table" then
+                        for _, child in ipairs(children) do
+                            if isValid(child) and not seen[child] then
+                                seen[child] = true
+                                table.insert(queue, child)
+                            end
+                        end
+                    end
                     local constraints = constraint.getTable(current)
                     if constraints then
                         for i = 1, #constraints do
@@ -737,9 +820,11 @@ else -- SERVER
                         end
                         if not massChecked[ent] then
                             massChecked[ent] = true
-                            local phys = ent:getPhysicsObject()
-                            if isValid(phys) then
-                                currentMass = currentMass + phys:getMass()
+                            if not isValid(ent:getParent()) then
+                                local phys = ent:getPhysicsObject()
+                                if isValid(phys) then
+                                    currentMass = currentMass + phys:getMass()
+                                end
                             end
                         end
                     end
@@ -820,16 +905,19 @@ else -- SERVER
                             local wheelPhysObj = wheelEntity:getPhysicsObject()
                             
                             if wheelPhysObj and wheelPhysObj:isValid() then
-                                wheelPhysObj:setMaterial(Config.WheelPhysicsMaterial or "jeeptire")
+                                local initMat = (Config.WheelPhysicsMaterial and Config.WheelPhysicsMaterial ~= "jeeptire") and Config.WheelPhysicsMaterial or "rubber"
+                                wheelPhysObj:setMaterial(initMat)
                             end
                             
                             local rightSign = (side == "Right") and 1 or ((side == "Left") and -1 or 0)
                             local isFrontWheel = (axleName == "Front")
-                            local alocal, detectedRadius = DetectWheelAxleAndRadius(wheelEntity, Config.TireRadius, Base:localToWorldVector(RightAxis))
+                            local axleRadius = tireProps.Radius or tireProps.TireRadius or Config.TireRadius
+                            local alocal, detectedRadius = DetectWheelAxleAndRadius(wheelEntity, axleRadius, Base:localToWorldVector(RightAxis))
                             
                             Wheels[wheelName] = {
                                 Entity = wheelEntity, PhysObj = wheelPhysObj,
                                 Axle = axleName,
+                                Preset = tireProps.Preset,
                                 CompoundName = tireProps.Compound or "Sport",
                                 Width = tireProps.Width or 155,
                                 AspectRatio = tireProps.AspectRatio or 70,
@@ -848,8 +936,10 @@ else -- SERVER
                             NumWheels = NumWheels + 1
     
                             if Config.ShowWheelHolograms then
-                                local holo = holograms.create(wheelEntity:getPos(), wheelEntity:getAngles(), "models/sprops/trans/wheel_d/t_wheel25.mdl", Vector(1,0.65,1))
-                                holo:setParent(Base); holo:setColor(Color(200, 200, 200, 200)); holo:setMaterial("models/debug/debugwhite"); holo:suppressEngineLighting(true)
+                                local rScale = (detectedRadius or 16) / 12.5
+                                local wScale = ((tireProps.Width or 155) / 225) * 0.65
+                                local holo = holograms.create(wheelEntity:getPos(), wheelEntity:getAngles(), "models/sprops/trans/wheel_d/t_wheel25.mdl", Vector(rScale, wScale, rScale))
+                                holo:setParent(wheelEntity); holo:setColor(Color(200, 200, 200, 200)); holo:setMaterial("models/debug/debugwhite"); holo:suppressEngineLighting(true)
                                 WheelHolos[wheelName] = holo
                             end
                         end
@@ -915,9 +1005,9 @@ else -- SERVER
         local lastVel = Vector(0,0,0)
         local thinkCounter = 0
         local lastTelemetrySend = 0
+        local lastGroundedMask = -1
+        local telemetryDirty = true
         local hasActiveForces = false
-        local baseSlopeAnchor = nil
-        local baseSlopeAnchorEnt = nil
     
         hook.add("think", "TireSimV2_Main", function()
             local Base = getValidBase()
@@ -928,9 +1018,9 @@ else -- SERVER
             
             tickTireScanner()
             
-            if not basePhys:isMoveable() then
+            local isBaseMoveable = basePhys:isMoveable()
+            if not isBaseMoveable then
                 hasActiveForces = false
-                return
             end
             
             local throttleVal = wire.ports.Throttle or 0
@@ -951,7 +1041,8 @@ else -- SERVER
                 end
             end
             
-            if not isMoving and not hasInput and not hasActiveForces then
+            local needsTelemetryClear = (Config.ShowTelemetry3D or Config.ShowPacejkaGraph) and (lastGroundedMask ~= 0)
+            if not isMoving and not hasInput and not hasActiveForces and not telemetryDirty and not needsTelemetryClear then
                 return
             end
             
@@ -964,8 +1055,6 @@ else -- SERVER
             end
      
             local tickInterval = game.getTickInterval()
-            local worldGrav = (physenv and physenv.getGravity and physenv.getGravity():getLength()) or 600
-            local gravTick = worldGrav * tickInterval
             local targetInterval = 1 / math.max(1, Config.UpdateRate)
             skipTicks = math.max(0, math.floor(targetInterval / tickInterval + 0.5) - 1)
             
@@ -975,7 +1064,8 @@ else -- SERVER
             local vehicleRight = Base:localToWorldVector(RightAxis)
             local vehicleUp = Base:localToWorldVector(Config.UpAxis)
             local effectiveVehicleMass = math.max(50, (TotalRealMass > 0) and TotalRealMass or (Config.TotalVehicleMass or 1500))
-            
+            local sysUpVel = computeCleanUpVelocity(basePhys, vehicleUp)
+            local chassisSpeed = currentVel:getLength()
 
             if shouldUpdateGrip then
                 local dt = math.max(0.001, tickInterval * (skipTicks + 1))
@@ -985,15 +1075,15 @@ else -- SERVER
                 if accel:getLengthSqr() > (maxAccel * maxAccel) then
                     accel = accel:getNormalized() * maxAccel
                 end
-                local localAccel = Base:worldToLocalVector(accel)
+                local fwdAccel = accel:dot(vehicleForward)
+                local rightAccel = accel:dot(vehicleRight)
                 
                 massRatio = math.max(0.1, math.min(1.0, effectiveVehicleMass / Config.TotalVehicleMass))
     
-                local weightTransferFwd = 0
+                local halfWheelsCount = math.max(1, NumWheels / 2)
                 local weightTransferRight = 0
-                if Wheelbase > 0 and TrackWidth > 0 then
-                    weightTransferFwd = (localAccel.x / Config.Gravity) * effectiveVehicleMass * Config.CenterOfMassHeight / Wheelbase
-                    weightTransferRight = (localAccel.y / Config.Gravity) * effectiveVehicleMass * Config.CenterOfMassHeight / TrackWidth
+                if TrackWidth > 0 then
+                    weightTransferRight = (-rightAccel / Config.Gravity) * effectiveVehicleMass * (Config.CenterOfMassHeight or 25) / TrackWidth
                 end
     
                 local throttleInput = 0
@@ -1011,16 +1101,15 @@ else -- SERVER
                     brakeInput = (maxBrake > 0) and math.clamp(math.abs(brakeRaw) / maxBrake, 0, 1) or 0
                 end
                 
+                local hasThrottleNow = throttleInput > Config.InputDeadzone
                 -- Fallback longitudinal G-force used ONLY for chassis load transfer when pedal wires are absent:
-                local accelG_Fwd = localAccel.x / Config.Gravity
-                local weightTransferThrottle = (throttleInput > Config.InputDeadzone) and throttleInput or math.clamp(accelG_Fwd, 0, 1)
+                local accelG_Fwd = fwdAccel / Config.Gravity
+                local weightTransferThrottle = hasThrottleNow and throttleInput or math.clamp(accelG_Fwd, 0, 1)
                 local weightTransferBrake = (brakeInput > Config.InputDeadzone) and brakeInput or math.clamp(-accelG_Fwd, 0, 1)
                 
-                local halfWheelsCount = math.max(1, NumWheels / 2)
                 local staticLoadFront = effectiveVehicleMass * Config.Gravity * frontRatioNormalized / halfWheelsCount
                 local staticLoadRear = effectiveVehicleMass * Config.Gravity * (1 - frontRatioNormalized) / halfWheelsCount
                 
-                local chassisSpeed = currentVel:getLength()
                 local chassisSpeedMph = chassisSpeed / 17.6
                 local speedMphDiv100Sq = (chassisSpeedMph / 100) ^ 2
                 local aeroLoadFront = Config.FrontAeroFactor * effectiveVehicleMass * speedMphDiv100Sq
@@ -1038,8 +1127,7 @@ else -- SERVER
                 local slips_t, slip_angles_t, damping_t = {}, {}, {}
                 
                 local baseAngVel = basePhys:getAngleVelocity()
-                local traceDist = Config.TireRadius + 5
-                local traceVec = -vehicleUp * traceDist
+                local SIDE_OFFSETS = {0, -1, 1}
                 
                 for j = #VehicleFilter, 1, -1 do
                      local e = VehicleFilter[j]
@@ -1071,8 +1159,43 @@ else -- SERVER
     
                         local wheelPhys = wheelData.PhysObj
                         local wheelPos = wheelPhys:localToWorld(wheelPhys:getMassCenter())
-                        local wheelTraceVec = -vehicleUp * traceDist
-                        local trace = trace.line(wheelPos, wheelPos + wheelTraceVec, VehicleFilter)
+                        local alocal = wheelData.alocal or Vector(0, 1, 0)
+                        local aRaw = wheelPhys:localToWorldVector(alocal)
+                        local a = (aRaw:getLengthSqr() > 0.0001) and aRaw:getNormalized() or vehicleRight
+                        local wheelRight = a
+                        if wheelRight:dot(vehicleRight) < 0 then wheelRight = -wheelRight end
+                        wheelData.CurrentRight = wheelRight
+
+                        -- Per-axle wheel radius (with global Config.TireRadius / OBB fallback)
+                        local rs = wheelData.Radius or Config.TireRadius or 16
+                        wheelData.EffectiveRadius = rs
+                        local reach = rs + math.min(2, rs * 0.15)
+                        local wheelTraceVec = -vehicleUp * reach
+
+                        local hw = math.clamp((wheelData.Width or 155) * 0.03937 * 0.4, 2, 8)
+                        local rawWheelFwd = a:cross(vehicleUp)
+                        local wheelFwd = (rawWheelFwd:getLengthSqr() > 0.0001) and rawWheelFwd:getNormalized() or vehicleForward
+                        local rayDirs = {
+                            wheelTraceVec,
+                            (-vehicleUp * 0.81915 + wheelFwd * 0.57358) * reach,
+                            (-vehicleUp * 0.81915 - wheelFwd * 0.57358) * reach
+                        }
+                        local bestTr = nil
+                        local bestFrac = 2.0
+                        for _, rayVec in ipairs(rayDirs) do
+                            for _, side in ipairs(SIDE_OFFSETS) do
+                                local sPos = wheelPos + a * (hw * side)
+                                local st = traceFiltered(sPos, sPos + rayVec)
+                                if st.Hit and not st.StartSolid then
+                                    local frac = st.Fraction or 1
+                                    if frac < bestFrac then
+                                        bestFrac = frac
+                                        bestTr = st
+                                    end
+                                end
+                            end
+                        end
+                        local tr = bestTr or { Hit = false, StartSolid = false }
                         
                         local latForceFinal = 0
                         local longForceFinal = 0
@@ -1086,17 +1209,9 @@ else -- SERVER
                         local fwdGroundVel = 0
                         local wheelSpinLinear = 0
                         
-                        if trace.Hit then
-                            local hitNormal = trace.HitNormal
+                        if tr.Hit and not tr.StartSolid then
+                            local hitNormal = tr.HitNormal
                             wheelData.HitNormal = hitNormal
-                            local alocal = wheelData.alocal or Vector(0, 1, 0)
-                            
-                            -- PropTire True Wheel Axle & Orthogonal Basis
-                            local aRaw = wheelPhys:localToWorldVector(alocal)
-                            local a = (aRaw:getLengthSqr() > 0.0001) and aRaw:getNormalized() or vehicleRight
-                            local wheelRight = a
-                            if wheelRight:dot(vehicleRight) < 0 then wheelRight = -wheelRight end
-                            wheelData.CurrentRight = wheelRight
                             
                             -- PropTire Longitudinal Basis (f = a x n, unflipped so linvel and fv share exact sign convention)
                             local fP = a:cross(hitNormal)
@@ -1112,27 +1227,23 @@ else -- SERVER
                             if wheelLat:dot(wheelRight) < 0 then wheelLat = -wheelLat end
                             wheelData.CurrentLat = wheelLat
                             
-                            -- Contact Patch Point (strictly in wheel plane from Physics Mass Center to eliminate steering torque)
-                            local contactDist = (wheelPos - trace.HitPos):dot(hitNormal)
-                            if contactDist > 1 then
-                                wheelData.EffectiveRadius = wheelData.EffectiveRadius and (wheelData.EffectiveRadius + (contactDist - wheelData.EffectiveRadius) * 0.25) or contactDist
-                            end
-                            -- Must strictly match the VPhysics collision radius so Source Engine's native rolling speed w = v / rs has 0 phantom slip!
-                            local rs = wheelData.EffectiveRadius or wheelData.Radius or Config.TireRadius or 16
-                            
                             local rawRadial = a:cross(fP)
                             local radialDown = (rawRadial:getLengthSqr() > 0.0001) and rawRadial:getNormalized() or -hitNormal
                             local contactPoint = wheelPos + radialDown * rs
                             wheelData.CurrentContactPos = contactPoint
-                            local hitMovableEnt = (not trace.HitWorld and trace.Entity and trace.Entity:isValid()) and trace.Entity or nil
+                            local hitMovableEnt = (not tr.HitWorld and tr.Entity and tr.Entity:isValid()) and tr.Entity or nil
                             wheelData.HitEntity = hitMovableEnt
                             wheelData.OnGround = true
 
-                            local vP = wheelPhys:getVelocity()
+                            local rawVel = wheelPhys:getVelocity()
+                            local vP = rawVel + vehicleUp * (sysUpVel - rawVel:dot(vehicleUp))
+                            local contactPointVel = vP
                             if hitMovableEnt then
                                 local gp = hitMovableEnt:getPhysicsObject()
                                 if gp and gp:isValid() then
-                                    vP = vP - gp:getVelocityAtPoint(contactPoint)
+                                    local vG = gp:getVelocityAtPoint(contactPoint)
+                                    vP = vP - vG
+                                    contactPointVel = contactPointVel - vG
                                 end
                             end
                             
@@ -1141,17 +1252,17 @@ else -- SERVER
                             fwdGroundVel = vP:dot(fP)
                             slipVel = wheelSpinLinear - fwdGroundVel
                             
-                            -- Chassis Contact Point Velocity for Lateral Slip
-                            local contactPointVel = basePhys:getVelocityAtPoint(wheelPos)
+                            -- Lateral Ground Velocity & Speed
                             local trueSpeed = contactPointVel:getLength()
-                            local latGroundVel = contactPointVel:dot(wheelLat)
+                            local latGroundVel = vP:dot(wheelLat)
                             local moving = math.max(math.abs(fwdGroundVel), math.abs(wheelSpinLinear), math.abs(latGroundVel), trueSpeed)
                             
                             local aspectVal = wheelData.AspectRatio or 50
                             local aspectStiffnessMult = 50 / math.max(10, aspectVal)
                             
-                            local rawSurfaceMult = activeTireData.SurfaceMultipliers[trace.MatType] or activeTireData.SurfaceMultipliers.Default
+                            local rawSurfaceMult = activeTireData.SurfaceMultipliers[tr.MatType] or activeTireData.SurfaceMultipliers.Default
                             gripPct = math.clamp(100 * rawSurfaceMult, 0, 100)
+                            wheelData.SurfaceCoF = (activeTireData.CoF or 1.0) * rawSurfaceMult
                             
                             local compoundPreset = (Config.CompoundPresets and compoundPresetName and Config.CompoundPresets[compoundPresetName]) or {}
                             local overallGripMult = compoundPreset.OverallGripMultiplier or Config.OverallGripMultiplier or 1.0
@@ -1181,6 +1292,7 @@ else -- SERVER
                             local longStiffness = (1.0 + (aspectStiffnessMult - 1.0) * 0.5) * math.sqrt(math.max(0.5, widthFactor))
                             
                             rollingResistance = activeTireData.BaseRollingResistance
+                            wheelData.RollDragForce = rollingResistance
                             
                             -- ========================================================
                             -- PROPTIRE MATERIAL SWITCHING (gmod_ice WHEN MOVING, rubber WHEN SLOW)
@@ -1188,17 +1300,17 @@ else -- SERVER
                             -- 100% of longitudinal & lateral traction is governed by the tire model!
                             -- ========================================================
                             if wheelData.slow == nil then wheelData.slow = true end
-                            if wheelData.slow and moving >= V_FAST then
+                            if wheelData.slow and moving >= V_FAST and (hasThrottleNow or chassisSpeed >= 25) then
                                 wheelData.slow = false
                                 if wheelData.CurrentMat ~= "gmod_ice" then
                                     wheelPhys:setMaterial("gmod_ice")
                                     wheelData.CurrentMat = "gmod_ice"
                                 end
-                            elseif not wheelData.slow and moving < V_SLOW then
+                            elseif not wheelData.slow and (moving < V_SLOW or (not hasThrottleNow and chassisSpeed < 20)) then
                                 wheelData.slow = true
                             end
                             if wheelData.slow then
-                                local restMat = Config.WheelPhysicsMaterial or "rubber"
+                                local restMat = (Config.WheelPhysicsMaterial and Config.WheelPhysicsMaterial ~= "jeeptire") and Config.WheelPhysicsMaterial or "rubber"
                                 if wheelData.CurrentMat ~= restMat then
                                     wheelPhys:setMaterial(restMat)
                                     wheelData.CurrentMat = restMat
@@ -1210,42 +1322,15 @@ else -- SERVER
                             -- SLIP & TRACTION CALCULATIONS (Exact PropTire + Pacejka Model)
                             -- ========================================================
                             if wheelData.slow then
-                                -- PropTire Resting / Low-Speed State (proptire.lua lines 1204-1220) + True World-Down Slope Hold
-                                local m = wheelPhys:getMass()
-                                local cornerMass = math.max(m, effectiveVehicleMass / math.max(1, NumWheels))
-                                local I = math.abs(wheelPhys:getInertia():dot(alocal)) / (U * U)
-                                local mx = (I > 0) and (1 / (1 / m + (1 - (wheelData.held or 0)) * (rs * rs) / I)) or m
-                                local fv = (math.abs(fwdGroundVel) < V_NOISE) and 0 or fwdGroundVel
-                                local lv = (math.abs(latGroundVel) < V_NOISE) and 0 or latGroundVel
-                                local invMassRatio = 1 / math.max(0.01, massRatio)
-                                local gfSlope = (cornerMass * gravTick * WORLD_DOWN:dot(fP)) * invMassRatio
-                                local glSlope = (cornerMass * gravTick * WORLD_DOWN:dot(wheelLat)) * invMassRatio
-                                
-                                if math.abs(wheelSpinLinear) < V_HOLD then
-                                    longForceFinal = math.clamp((-RELAX * fv * cornerMass) * invMassRatio - gfSlope, -maxLongGrip, maxLongGrip)
-                                    wheelData.RestCenterHold = true
-                                else
-                                    longForceFinal = math.clamp((RELAX * (wheelSpinLinear - fwdGroundVel) * mx) * invMassRatio - gfSlope, -maxLongGrip, maxLongGrip)
-                                    wheelData.RestCenterHold = false
-                                end
-
-                                -- Tiny lateral pushes should not collapse the entire low-speed grip envelope.
-                                local lowSpeedLateralDeadzone = (compoundPreset and compoundPreset.LowSpeedLateralHoldDeadzone) or Config.LowSpeedLateralHoldDeadzone or 2.0
-                                local lowSpeedHoldScale = math.clamp((compoundPreset and compoundPreset.LowSpeedHoldScale) or Config.LowSpeedHoldScale or 0.35, 0.0, 1.0)
-                                local latHoldStrength = lowSpeedHoldScale * 0.25
-                                if math.abs(lv) > lowSpeedLateralDeadzone then
-                                    latHoldStrength = lowSpeedHoldScale + (1.0 - lowSpeedHoldScale) * math.min(1.0, math.abs(lv) / math.max(lowSpeedLateralDeadzone * 4.0, 1.0))
-                                end
-                                local jyHold = math.clamp(((-RELAX * lv * cornerMass) * invMassRatio - glSlope) * latHoldStrength, -maxLatGrip, maxLatGrip)
-                                latForceFinal = -jyHold
-                                wheelData.RawFx = longForceFinal
-                                wheelData.RawFy = latForceFinal
-                                totalCombinedMag = 0 -- Resting hold does not saturate dynamic HUD bars
+                                longForceFinal = 0
+                                latForceFinal = 0
+                                wheelData.RawFx = 0
+                                wheelData.RawFy = 0
+                                totalCombinedMag = 0
                             else
-                                wheelData.RestCenterHold = false
-                                -- Lateral Slip Angle (alpha) - Progressive V1 scaling (safeSpeed = 300)
-                                local safeSpeed = math.max(trueSpeed, 300)
-                                local lateralSlipAngle = math.atan(latGroundVel / safeSpeed) * math.min(trueSpeed / 300, 1.0)
+                                -- PropTire True Lateral Slip Angle (alpha) with V0=40 floor (full lateral stiffness on curbs & low speeds)
+                                local denomSpeed = math.max(math.abs(fwdGroundVel), trueSpeed, V0)
+                                local lateralSlipAngle = math.clamp(math.atan(latGroundVel / denomSpeed), -1.55, 1.55)
                                 slipAngleMetric = lateralSlipAngle
                                 
                                 -- Uncoupled Lateral Pacejka Force
@@ -1280,14 +1365,9 @@ else -- SERVER
                                 
                                 -- PropTire Effective Longitudinal Mass & Impulse Limit (jxMax) (proptire.lua lines 1187 & 1245)
                                 local m = wheelPhys:getMass()
-                                local cornerMass = math.max(m, effectiveVehicleMass / math.max(1, NumWheels))
                                 local I = math.abs(wheelPhys:getInertia():dot(alocal)) / (U * U)
                                 local mx = (I > 0) and (1 / (1 / m + (1 - (wheelData.held or 0)) * (rs * rs) / I)) or m
                                 local jxMax = RELAX * math.abs(wheelSpinLinear - fwdGroundVel) * mx
-                                if math.abs(wheelSpinLinear) < V_HOLD then
-                                    local gf = cornerMass * gravTick * WORLD_DOWN:dot(fP)
-                                    jxMax = RELAX * math.abs(wheelSpinLinear - fwdGroundVel) * cornerMass + math.abs(gf)
-                                end
                                 
                                 -- Damping & Smoothing for Lateral Force (Reset on zero-crossing to prevent phase-lag wiggle)
                                 local prevForces = lastAppliedForces[name] or { fx = 0, fy = 0 }
@@ -1327,6 +1407,8 @@ else -- SERVER
                             wheelData.RollDragForce = 0
                             wheelData.IsStatic = false
                             wheelData.OnGround = false
+                            wheelData.HitEntity = nil
+                            wheelData.HitNormal = nil
                             wheelData.RawFx = 0
                             wheelData.RawFy = 0
                             wheelData.wPrev = nil
@@ -1335,11 +1417,19 @@ else -- SERVER
                             wheelData.LatAnchorPos = nil
                         end
                         
-                        -- Zero artificial damping (PropTire handles resting & rolling natively via impulses)
-                        if wheelData.LastDampAng ~= 0 or wheelData.LastDampPos ~= 0 then
-                            wheelData.PhysObj:setDamping(0, 0)
+                        -- Rotational parking brake / BaseRollingResistance via angular-only damping (0 linear damping preserves susp_lib balance)
+                        local targetDampAng = 0
+                        if wheelData.OnGround then
+                            if wheelData.slow and not hasThrottleNow and chassisSpeed < 15 then
+                                targetDampAng = 500
+                            else
+                                targetDampAng = rollingResistance
+                            end
+                        end
+                        if wheelData.LastDampAng ~= targetDampAng or wheelData.LastDampPos ~= 0 then
+                            wheelData.PhysObj:setDamping(0, targetDampAng)
                             wheelData.LastDampPos = 0
-                            wheelData.LastDampAng = 0
+                            wheelData.LastDampAng = targetDampAng
                         end
                         
                         lastAppliedForces[name] = { fx = longForceFinal, fy = latForceFinal, mag = totalCombinedMag }
@@ -1367,18 +1457,22 @@ else -- SERVER
                 end
                 
                 local anyForces = false
+                local groundedMask = 0
                 for j, name in ipairs(OrderedWheelNames) do
                     local wData = Wheels[name]
                     local comps = wData and wData.LastComponents
                     if wData and wData.OnGround then
                         anyForces = true
-                        break
+                        groundedMask = groundedMask + bit.lshift(1, (j - 1) % 30)
                     elseif comps and (comps.Mag > 0.05 or math.abs(comps.RawFx or 0) > 0.05 or math.abs(comps.RawFy or 0) > 0.05 or math.abs(comps.Fy or 0) > 0.05 or (comps.YawMag and math.abs(comps.YawMag) > 0.05)) then
                         anyForces = true
-                        break
                     end
                 end
                 hasActiveForces = anyForces
+                if groundedMask ~= lastGroundedMask then
+                    lastGroundedMask = groundedMask
+                    telemetryDirty = true
+                end
                 
                 wire.ports.Loads = loads_t
                 wire.ports.GripPcts = grip_pcts_t
@@ -1394,7 +1488,7 @@ else -- SERVER
                 -- Telemetry Sync to Client HUD (Includes Separate Lat & Long Grip & Peak Capacities)
                 if Config.ShowTelemetry3D or Config.ShowPacejkaGraph then
                     local now = timer.systime()
-                    if now - lastTelemetrySend >= 0.03 then
+                    if telemetryDirty or (now - lastTelemetrySend >= 0.03) then
                         if net.getBytesLeft and net.getBytesLeft() > 384 then
                             net.start("telemetryUpdateV2")
                             net.writeUInt(NumWheels, 8)
@@ -1423,49 +1517,48 @@ else -- SERVER
                             end
                             net.send(owner())
                             lastTelemetrySend = now
+                            telemetryDirty = false
                         end
                     end
                 end
             end 
             
             -- ========================================================================
-            -- FORCE APPLICATION (Exact PropTire Per-Wheel Impulses + Center-of-Mass Slope Hold)
+            -- FORCE APPLICATION (Per-Wheel PropTire Impulses + Steep-Curb Horizontal Hold)
             -- ========================================================================
-            if hasActiveForces then
-                local latMult = math.max(1.0, Config.LateralGripMultiplier or 1.0)
-                local activeThrottle = math.abs(throttleVal) > Config.InputDeadzone
+            if hasActiveForces and isBaseMoveable then
+                local maxThrottleNow = math.max(Config.ThrottleMaxValue or 1, math.abs(throttleVal))
+                local activeThrottle = (maxThrottleNow > 0) and ((math.abs(throttleVal) / maxThrottleNow) > Config.InputDeadzone) or false
                 local maxWheelImpulse = effectiveVehicleMass * Config.Gravity * 2.0
-                local maxChassisImpulse = effectiveVehicleMass * Config.Gravity * 3.0
-                
-                local numHeldWheels = 0
-                local numGroundedWheels = 0
-                local totalWheelMass = 0
-                local totalMaxLongCap = 0
-                local totalMaxLatCap = 0
-                local avgNormal = Vector(0, 0, 0)
-                local primaryGroundEnt = nil
 
                 for i, name in ipairs(OrderedWheelNames) do
                     local wheelData = Wheels[name]
                     if wheelData and wheelData.Entity and wheelData.Entity:isValid() and wheelData.PhysObj and wheelData.PhysObj:isValid() then
                         local comps = wheelData.LastComponents
                         local wheelPhys = wheelData.PhysObj
+                        local compoundPreset = (Config.CompoundPresets and wheelData.Preset and Config.CompoundPresets[wheelData.Preset]) or {}
+                        local wheelLatMult = math.max(1.0, compoundPreset.LateralGripMultiplier or Config.LateralGripMultiplier or 1.0)
+                        local holdDeadzone = math.max(1.0, compoundPreset.LowSpeedLateralHoldDeadzone or Config.LowSpeedLateralHoldDeadzone or 2.0)
+                        local holdScale = math.max(0.0, compoundPreset.LowSpeedHoldScale or Config.LowSpeedHoldScale or 1.0)
                         local wPrev, dwOurs = wheelData.wPrev, wheelData.dwOurs or 0
                         wheelData.wPrev, wheelData.dwOurs = nil, 0
 
                         if comps then
                             local centerForceVec = Vector(0, 0, 0)
                             local wheelMassCenter = wheelPhys:localToWorld(wheelPhys:getMassCenter())
+                            local m = math.max(1, wheelPhys:getMass())
                             
-                            -- 1. PropTire Longitudinal & Lateral Ground Impulses (proptire.lua lines 1179-1257)
+                            -- 1. PropTire Longitudinal & Lateral Ground Impulses (susp_lib-invariant velocity)
                             if wheelData.OnGround then
                                 local alocal = wheelData.alocal or Vector(0, 1, 0)
-                                local rs = wheelData.EffectiveRadius or wheelData.Radius or Config.TireRadius or 16
+                                local rs = wheelData.Radius or Config.TireRadius or 16
                                 local hitNormal = wheelData.HitNormal or vehicleUp
                                 
                                 -- Recompute live wheel basis every tick so force vectors & lever arm never lag or induce steering torque
                                 local aRaw = wheelPhys:localToWorldVector(alocal)
                                 local a = (aRaw:getLengthSqr() > 0.0001) and aRaw:getNormalized() or vehicleRight
+                                local wheelRight = a
+                                if wheelRight:dot(vehicleRight) < 0 then wheelRight = -wheelRight end
                                 local f = a:cross(hitNormal)
                                 if f:getLengthSqr() > 0.0001 then
                                     f = f:getNormalized()
@@ -1474,7 +1567,7 @@ else -- SERVER
                                 end
                                 local rawLat = hitNormal:cross(f)
                                 local wheelLat = (rawLat:getLengthSqr() > 0.0001) and rawLat:getNormalized() or vehicleRight
-                                if wheelLat:dot(vehicleRight) < 0 then wheelLat = -wheelLat end
+                                if wheelLat:dot(wheelRight) < 0 then wheelLat = -wheelLat end
                                 
                                 -- Contact point strictly in wheel radial plane from mass center: (p - wheelMassCenter) x f = -rs * a (zero steering torque!)
                                 local rawRadial = a:cross(f)
@@ -1482,36 +1575,18 @@ else -- SERVER
                                 local p = wheelMassCenter + radialDown * rs
                                 
                                 local linvel = math.rad(wheelPhys:getAngleVelocity():dot(alocal)) * rs
-                                local vP = wheelPhys:getVelocity()
-                                local vCorner = basePhys:getVelocityAtPoint(wheelMassCenter)
+                                local rawVel = wheelPhys:getVelocity()
+                                local vP = rawVel + vehicleUp * (sysUpVel - rawVel:dot(vehicleUp))
                                 local hitEnt = wheelData.HitEntity
                                 local gp = (hitEnt and hitEnt:isValid()) and hitEnt:getPhysicsObject() or nil
                                 if gp and gp:isValid() then
                                     local vGround = gp:getVelocityAtPoint(p)
                                     vP = vP - vGround
-                                    vCorner = vCorner - vGround
-                                    if not primaryGroundEnt then primaryGroundEnt = hitEnt end
                                 end
                                 local fv = vP:dot(f)
                                 local lvWheel = vP:dot(wheelLat)
-                                local lvCorner = vCorner:dot(wheelLat)
                                 
-                                local m = math.max(1, wheelPhys:getMass())
-                                local maxLongCap = math.max(0, (wheelData.PeakLongForce or 0) * massRatio)
                                 local maxLatCap = math.max(0, (wheelData.PeakLatForce or 0) * massRatio)
-                                
-                                numGroundedWheels = numGroundedWheels + 1
-                                totalWheelMass = totalWheelMass + m
-                                totalMaxLatCap = totalMaxLatCap + maxLatCap
-                                avgNormal = avgNormal + hitNormal
-                                if math.abs(linvel) < 3.5 and math.abs(linvel) <= math.abs(fv) + 1.5 then
-                                    numHeldWheels = numHeldWheels + 1
-                                    totalMaxLongCap = totalMaxLongCap + maxLongCap
-                                end
-                                
-                                -- Single-wheel downhill gravity impulses along WORLD_DOWN
-                                local gfWheel = m * gravTick * WORLD_DOWN:dot(f)
-                                local glWheel = m * gravTick * WORLD_DOWN:dot(wheelLat)
                                 
                                 local I = math.abs(wheelPhys:getInertia():dot(alocal)) / (U * U)
                                 local w = linvel / rs
@@ -1526,33 +1601,22 @@ else -- SERVER
                                 local spin = (I > 0.001) and (-rs / I) or 0
                                 
                                 if wheelData.slow then
-                                    -- Exact PropTire passive single-wheel resting state (cannot fight suspension or spin chassis on flat ground)
-                                    local fvClean = (math.abs(fv) < V_NOISE) and 0 or fv
-                                    local lvClean = (math.abs(lvWheel) < V_NOISE) and 0 or lvWheel
-                                    if math.abs(linvel) < V_HOLD then
-                                        local jxWheel = math.clamp(-RELAX * fvClean * m - gfWheel, -maxLongCap, maxLongCap)
-                                        if isSafeNumber(jxWheel) then
-                                            centerForceVec = centerForceVec + (f * jxWheel)
+                                    -- Zero linear forces on flat/gentle ground; pure horizontal damping only on steep curbs
+                                    if hitNormal:dot(vehicleUp) < 0.95 and not activeThrottle and chassisSpeed < 15 then
+                                        local vHoriz = vP - vehicleUp * vP:dot(vehicleUp)
+                                        if vHoriz:getLengthSqr() > 0.01 and maxLatCap > 0 then
+                                            local holdCap = maxLatCap * math.max(0.25, holdScale)
+                                            local holdImpulse = -vHoriz * (RELAX * m * holdScale)
+                                            local holdLenSqr = holdImpulse:getLengthSqr()
+                                            if holdLenSqr > (holdCap * holdCap) then
+                                                holdImpulse = holdImpulse:getNormalized() * holdCap
+                                            end
+                                            centerForceVec = centerForceVec + holdImpulse
                                         end
-                                    else
-                                        local jx = math.clamp(RELAX * (linvel - fv) * mx, -maxLongCap, maxLongCap)
-                                        if isSafeNumber(jx) and math.abs(jx) > 0.01 then
-                                            safeApplyForceOffset(wheelPhys, f * jx, p, maxWheelImpulse)
-                                            wheelData.dwOurs = jx * spin
-                                        end
-                                    end
-                                    local jyWheel = math.clamp(-RELAX * lvClean * m - glWheel, -maxLatCap, maxLatCap)
-                                    if isSafeNumber(jyWheel) then
-                                        centerForceVec = centerForceVec + (wheelLat * jyWheel)
                                     end
                                 else
                                     -- Longitudinal Active Impulse (Clamped by jxMax)
                                     local jxMax = RELAX * math.abs(linvel - fv) * mx
-                                    if math.abs(linvel) < V_HOLD then
-                                        if gfWheel * (linvel - fv) < 0 then
-                                            jxMax = jxMax + math.abs(gfWheel)
-                                        end
-                                    end
                                     local rawFx = comps.RawFx or 0
                                     if rawFx * (linvel - fv) < 0 then rawFx = 0 end
                                     local jx = math.clamp(rawFx * massRatio, -jxMax, jxMax)
@@ -1561,112 +1625,32 @@ else -- SERVER
                                         wheelData.dwOurs = jx * spin
                                     end
                                     
-                                    -- Full-Strength Lateral Grip Applied to Wheel (with live sign check & micro-drift ramp for Multiplier > 1)
+                                    -- Full-Strength Lateral Grip (Strictly Opposing Lateral Slip Velocity)
                                     local rawFy = comps.RawFy or comps.Fy or 0
-                                    if rawFy * lvCorner < 0 then rawFy = 0 end
-                                    if math.abs(rawFy) > 0.05 then
-                                        local microRamp = (latMult > 1.0) and math.clamp(math.abs(lvCorner) / 15, 1.0 / latMult, 1.0) or 1.0
-                                        local latImpulse = -(rawFy * massRatio * microRamp)
-                                        if isSafeNumber(latImpulse) then
-                                            centerForceVec = centerForceVec + (wheelLat * latImpulse)
-                                        end
+                                    if rawFy * lvWheel < 0 then rawFy = 0 end
+                                    local microRamp = (wheelLatMult > 1.0) and math.clamp(math.abs(lvWheel) / holdDeadzone, 1.0 / wheelLatMult, 1.0) or 1.0
+                                    local pacejkaLat = (math.abs(rawFy) > 0.05) and -(rawFy * massRatio * microRamp) or 0
+                                    local jyMax = RELAX * math.abs(lvWheel) * m
+                                    local latCap = math.min(jyMax, maxLatCap)
+                                    local latImpulse = math.clamp(pacejkaLat, -latCap, latCap)
+                                    if isSafeNumber(latImpulse) and math.abs(latImpulse) > 0.01 then
+                                        centerForceVec = centerForceVec + (wheelLat * latImpulse)
                                     end
                                 end
                             end
                             
                             -- 2. Yaw Stability Assist
-                            if comps.YawMag and math.abs(comps.YawMag) > 0.05 then
+                            if not wheelData.slow and comps.YawMag and math.abs(comps.YawMag) > 0.05 then
                                 local yawImpulse = comps.YawMag * massRatio
                                 if isSafeNumber(yawImpulse) then
                                     centerForceVec = centerForceVec + (vehicleRight * yawImpulse)
                                 end
                             end
                             
+                            -- Apply linear tire forces strictly to wheelPhys (no basePhys linear/offset force)
                             safeApplyForceCenter(wheelPhys, centerForceVec, maxWheelImpulse)
                         end
                     end
-                end
-
-                -- ====================================================================
-                -- 3. CHASSIS CENTER-OF-MASS SLOPE HOLD (Strictly applyForceCenter = ZERO Torque!)
-                -- Only active when surface is actually sloped (slopeSin >= 0.015, i.e. >= 0.85 deg).
-                -- On flat/near-flat ground this block applies 0 force, so it can NEVER slide or rotate the car!
-                -- ====================================================================
-                if numGroundedWheels > 0 and avgNormal:getLengthSqr() > 0.0001 then
-                    avgNormal = avgNormal:getNormalized()
-                    local gSlopeVec = WORLD_DOWN - avgNormal * WORLD_DOWN:dot(avgNormal)
-                    local slopeSin = gSlopeVec:getLength()
-                    
-                    if slopeSin >= 0.015 then
-                        local slopeBlend = math.clamp((slopeSin - 0.015) / 0.025, 0, 1)
-                        local slopeFwdRaw = vehicleForward - avgNormal * vehicleForward:dot(avgNormal)
-                        local slopeFwd = (slopeFwdRaw:getLengthSqr() > 0.0001) and slopeFwdRaw:getNormalized() or vehicleForward
-                        
-                        local rawSlopeLat = avgNormal:cross(slopeFwd)
-                        local slopeLat = (rawSlopeLat:getLengthSqr() > 0.0001) and rawSlopeLat:getNormalized() or vehicleRight
-                        if slopeLat:dot(vehicleRight) < 0 then slopeLat = -slopeLat end
-                        
-                        local baseMassCenter = basePhys:localToWorld(basePhys:getMassCenter())
-                        local vBaseRel = basePhys:getVelocity()
-                        local gp = (primaryGroundEnt and primaryGroundEnt:isValid()) and primaryGroundEnt:getPhysicsObject() or nil
-                        if gp and gp:isValid() then
-                            vBaseRel = vBaseRel - gp:getVelocityAtPoint(baseMassCenter)
-                        end
-                        local vBaseFwd = vBaseRel:dot(slopeFwd)
-                        local vBaseLat = vBaseRel:dot(slopeLat)
-                        
-                        local chassisMass = math.max(0, effectiveVehicleMass - totalWheelMass)
-                        local gfChassis = chassisMass * gravTick * WORLD_DOWN:dot(slopeFwd)
-                        local glChassis = chassisMass * gravTick * WORLD_DOWN:dot(slopeLat)
-                        local baseHoldVec = Vector(0, 0, 0)
-                        
-                        -- Center-of-mass static anchor when stopped on a slope (eliminates slow downhill creep with zero torque)
-                        local isStoppedOnSlope = (not activeThrottle) and (numHeldWheels > 0) and (math.abs(vBaseFwd) < 6) and (math.abs(vBaseLat) < 6)
-                        local driftFwd, driftLat = 0, 0
-                        if isStoppedOnSlope then
-                            if not baseSlopeAnchor or baseSlopeAnchorEnt ~= primaryGroundEnt then
-                                baseSlopeAnchor = (gp and gp:isValid()) and gp:worldToLocal(baseMassCenter) or baseMassCenter
-                                baseSlopeAnchorEnt = primaryGroundEnt
-                            end
-                            local anchorWorld = (gp and gp:isValid()) and gp:localToWorld(baseSlopeAnchor) or baseSlopeAnchor
-                            local disp = baseMassCenter - anchorWorld
-                            driftFwd = disp:dot(slopeFwd)
-                            driftLat = disp:dot(slopeLat)
-                            local maxDriftFwd = (chassisMass > 0) and (totalMaxLongCap / (0.35 * chassisMass)) or 0
-                            local maxDriftLat = (chassisMass > 0) and (totalMaxLatCap / (0.35 * chassisMass)) or 0
-                            driftFwd = math.clamp(driftFwd, -maxDriftFwd, maxDriftFwd)
-                            driftLat = math.clamp(driftLat, -maxDriftLat, maxDriftLat)
-                            -- Allow free vertical suspension travel along avgNormal while keeping slope tangent anchor
-                            anchorWorld = baseMassCenter - (slopeFwd * driftFwd) - (slopeLat * driftLat)
-                            baseSlopeAnchor = (gp and gp:isValid()) and gp:worldToLocal(anchorWorld) or anchorWorld
-                        else
-                            baseSlopeAnchor = nil
-                        end
-                        
-                        -- Longitudinal slope hold at Chassis Center of Mass
-                        if numHeldWheels > 0 and not activeThrottle and math.abs(vBaseFwd) < 30 then
-                            local longArrestBlend = slopeBlend * math.clamp(1.0 - math.max(0, math.abs(vBaseFwd) - 8) / 22, 0, 1)
-                            local jxBase = math.clamp((-0.50 * vBaseFwd * chassisMass - 0.35 * driftFwd * chassisMass - gfChassis) * longArrestBlend, -totalMaxLongCap, totalMaxLongCap)
-                            if isSafeNumber(jxBase) then
-                                baseHoldVec = baseHoldVec + (slopeFwd * jxBase)
-                            end
-                        end
-                        
-                        -- Lateral slope hold at Chassis Center of Mass
-                        if math.abs(vBaseLat) < 35 then
-                            local latArrestBlend = slopeBlend * math.clamp(1.0 - math.max(0, math.abs(vBaseLat) - 10) / 25, 0, 1)
-                            local jyBase = math.clamp((-0.50 * vBaseLat * chassisMass - 0.35 * driftLat * chassisMass - glChassis) * latArrestBlend, -totalMaxLatCap, totalMaxLatCap)
-                            if isSafeNumber(jyBase) then
-                                baseHoldVec = baseHoldVec + (slopeLat * jyBase)
-                            end
-                        end
-                        
-                        safeApplyForceCenter(basePhys, baseHoldVec, maxChassisImpulse)
-                    else
-                        baseSlopeAnchor = nil
-                    end
-                else
-                    baseSlopeAnchor = nil
                 end
             end
         end)

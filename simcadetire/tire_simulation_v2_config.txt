@@ -175,26 +175,27 @@ local UserConfig = {
     WeightRatioFront = 0.63,    -- Ratio of weight on front axle (0.0 - 1.0)
     WeightRatioRear = 0.37,     -- Ratio of weight on rear axle (0.0 - 1.0)
     CenterOfMassHeight = 25,    -- Virtual CG Height (Inches)
-    TireRadius = 16,            -- Inches (Used for trace distance & wheel surface speed)
+    TireRadius = 16,            -- Global fallback radius in inches if omitted per-axle (0 = auto-detect from wheel model)
     
     -- Simulation Quality
     UpdateRate = 66,            -- Target updates per second (Hz). Lower (e.g. 33) to save CPU.
     ConstraintRefreshInterval = 2.0, -- Re-scan base constraints this often (seconds)
     
     -- Tire Setup (Compound & Geometry)
+    -- Per-axle Radius overrides global TireRadius (omit to use TireRadius, set to 0 to auto-detect from wheel OBB).
     -- Examples:
-    --   Front = { Compound = "Sport", Preset = "Sport", Width = 155, AspectRatio = 70 }
-    --   Front = { Compound = "Sport", Preset = "Racing", Width = 245, AspectRatio = 45 }
-    --   Front = { Compound = "Comfort", Preset = "Rally", Width = 195, AspectRatio = 55 }
-    --   Front = { Compound = "Sport", Width = 155, AspectRatio = 70 }  -- no preset = global tuning used
+    --   Front = { Compound = "Sport", Preset = "Sport", Width = 155, AspectRatio = 70, Radius = 16 }
+    --   Front = { Compound = "Sport", Preset = "Racing", Width = 245, AspectRatio = 45, Radius = 18 }
+    --   Front = { Compound = "Comfort", Preset = "Rally", Width = 195, AspectRatio = 55, Radius = 15 }
+    --   Front = { Compound = "Sport", Width = 155, AspectRatio = 70, Radius = 16 }  -- no preset = global tuning used
     TireSetup = {
-        Front = { Compound = "Sport", Width = 155, AspectRatio = 70 },
-        Rear  = { Compound = "Sport", Width = 155, AspectRatio = 70 },
+        Front = { Compound = "Sport", Width = 155, AspectRatio = 70, Radius = 16 },
+        Rear  = { Compound = "Sport", Width = 155, AspectRatio = 70, Radius = 16 },
     },
     
 
     -- Wheel Physics Material
-    WheelPhysicsMaterial = "jeeptire",  -- Default: "jeeptire"
+    WheelPhysicsMaterial = "rubber",    -- Default: "rubber" (High static grip on curbs/slopes at rest)
     
     -- Tuning / Handling
     OverallGripMultiplier = 0.010,       -- Global Grip Scale
