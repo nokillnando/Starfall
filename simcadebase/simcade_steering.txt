@@ -1,0 +1,141 @@
+--@name Simcade Steering Module
+--@shared
+
+SimcadeSteering = SimcadeSteering or {}
+
+local abs, min, max = math.abs, math.min, math.max
+local atan2 = math.atan2
+local clamp = math.clamp or function(v, a, b) return v < a and a or (v > b and b or v) end
+local ceil, floor = math.ceil, math.floor
+local trunc = function(x) return x < 0 and ceil(x) or floor(x) end
+local PI = math.pi
+local U16_RAD = 9.587379924e-05
+
+function SimcadeSteering.updateInput(chassis, input, dt)
+    local sc = assert(chassis.steerCfg, "Steering configuration is required")
+    local D = chassis.drv
+    local R = chassis.R
+    local stepDt = clamp(dt or 0.015, 0.001, 0.05)
+    local dt66 = stepDt * 66.6666667
+
+    local maxAng = sc.Lock or sc.maxAngle or sc.maxSteerDeg or 38
+    maxAng = min(maxAng, sc.maxSteerDeg or maxAng)
+    local steerSpeed = sc.SteeringSpeed or 89
+    local returnSpeed = sc.ReturnSpeed or 200
+    local retAtten = max(1, sc.ReturnSpeedAttenuation or 40)
+    local speedEffect = max(10, sc.SpeedEffect or 950)
+    local slipThresh = sc.SlipCorrectionThreshold or 1.0
+    local slipCounter = sc.SlipCounterForce or 1.5
+    local corrStart = sc.CorrectionStart or 0.05
+    if corrStart > 1.5 then corrStart = corrStart * 0.0174532925 end
+    local corrFull = sc.CorrectionFull or 0.25
+    if corrFull > 1.5 then corrFull = corrFull * 0.0174532925 end
+    local highSlipThreshold = sc.HighSlipThreshold or 2.5
+    local stabThresh = max(1, sc.StabilityThreshold or 80)
+    local minStabScale = sc.MinStabilityScale or 0.2
+    local slipResistance = max(1, sc.SlipResistance or 50)
+    local gyroForce = sc.GyroCounterForce or 1.5
+    local gyroSpdTh = max(1, sc.GyroSpeedThreshold or 100)
+    local gyroMin = sc.GyroMinScale or 0
+    local gyroMax = sc.GyroMaxScale or 3
+    local latAlpha = clamp(sc.LateralSmoothAlpha or 0.25, 0.05, 1.0)
+    local linBlend = clamp(sc.LinearBlend or 0.3, 0.0, 1.0)
+
+    local fwdMs = chassis.v[0] * R[0] + chassis.v[1] * R[1] + chassis.v[2] * R[2]
+    local leftMs = chassis.v[0] * R[3] + chassis.v[1] * R[4] + chassis.v[2] * R[5]
+    local fwdSpd = fwdMs * (39.3700787 / 14.5)
+    local rawLat = -leftMs * (39.3700787 / 14.5)
+    local absFwd = abs(fwdSpd)
+    local spdDir = (fwdSpd >= 0) and 1 or -1
+
+    D.smoothedLat = (D.smoothedLat or 0) + (rawLat - (D.smoothedLat or 0)) * clamp(latAlpha * dt66, 0.05, 1.0)
+    local smLat = D.smoothedLat
+    local wUpRad = chassis.w[0] * R[6] + chassis.w[1] * R[7] + chassis.w[2] * R[8]
+    local yawVelDeg = wUpRad * 57.2957795
+    local slipAng = atan2(abs(smLat), max(absFwd, 0.01))
+    local span = max(0.001, corrFull - corrStart)
+    local st = clamp((slipAng - corrStart) / span, 0, 1)
+    local corrScale = st * st * (3 - 2 * st)
+    local stabFactor = clamp(abs(yawVelDeg) / stabThresh, minStabScale, 1.0)
+    local spdScale = clamp(absFwd / gyroSpdTh, 0, 1)
+    local gyroScale = gyroMin + (gyroMax - gyroMin) * spdScale
+    local isSlipping = (abs(smLat) > slipThresh) and (slipAng > corrStart)
+    local slipCorr = isSlipping and (-smLat * slipCounter * spdDir) or 0
+    local yawDamp = -yawVelDeg * stepDt * gyroForce * gyroScale * spdDir
+    -- A tight rolling turn gives the chassis sideways velocity even when the
+    -- rear tires track cleanly. Use rear contact slip to distinguish a slide.
+    local rearSlip, rearLoad = 0, 0
+    for i = 2, 3 do
+        local wheel = chassis.wheels and chassis.wheels[i]
+        if wheel and wheel.contact ~= 0 then
+            local load = max(0, wheel.load or 0)
+            rearSlip = rearSlip + abs(wheel.slipAngleRad or 0) * load
+            rearLoad = rearLoad + load
+        end
+    end
+    local rearAngle = rearLoad > 0 and rearSlip / rearLoad or 0
+    local rearBlend = clamp((rearAngle - corrStart) / span, 0, 1)
+    local speedKmh = math.sqrt(fwdMs * fwdMs + leftMs * leftMs) * 3.6
+    local speedBlend = clamp((speedKmh - 8) / 10, 0, 1)
+    local sideBlend = clamp((abs(smLat) - highSlipThreshold) / max(1, highSlipThreshold), 0, 1)
+    local driftBlend = corrScale * rearBlend * speedBlend * sideBlend
+    local countersteerCorrection = ((slipCorr / slipResistance) * dt66 + yawDamp) * driftBlend * stabFactor
+
+    local rawIn = clamp(input, -1, 1)
+    local curvedIn = rawIn * rawIn * rawIn * (1.0 - linBlend) + rawIn * linBlend
+    local curDeg = D.u16Deg or 0
+    -- Reserve directional key rates for an established slide. Rear slip alone
+    -- can also be substantial in ordinary cornering.
+    local manualBlend = clamp((rearAngle - math.rad(8)) / math.rad(8), 0, 1)
+    manualBlend = manualBlend * manualBlend * (3 - 2 * manualBlend) * driftBlend
+    -- A positive key steers left; positive smLat means travel to the right.
+    local countersteering = rawIn * smLat * spdDir < 0
+    local driftRate = countersteering and (sc.DriftCountersteerMultiplier or 1)
+        or (sc.DriftTurnInMultiplier or 1)
+    local keyRate = 1 + (max(0, driftRate) - 1) * manualBlend
+    local speedFraction = min(absFwd / speedEffect, 1)
+    local steerStep = curvedIn * steerSpeed * keyRate * stepDt
+    local angleT = clamp(curDeg + steerStep + countersteerCorrection * (1 - abs(rawIn)), -maxAng, maxAng)
+    if abs(rawIn) < 0.01 then
+        local retScale = clamp(absFwd / retAtten, 0, 1)
+        local retStep = returnSpeed * stepDt * retScale * (1 - driftBlend)
+        if angleT > 0 then
+            angleT = max(0, angleT - retStep)
+        elseif angleT < 0 then
+            angleT = min(0, angleT + retStep)
+        end
+    end
+
+    local decayAlpha = min(0.85, speedFraction * dt66)
+    -- SpeedEffect bleeds off accumulated angle every tick, including held input.
+    angleT = clamp(angleT * (1.0 - decayAlpha), -maxAng, maxAng)
+    D.u16Deg = angleT
+    chassis.steer.u16 = trunc(trunc(angleT * 65536) / 360) % 65536
+end
+
+function SimcadeSteering.applyWheelAngles(chassis, u16)
+    local v5 = u16 * U16_RAD
+    if v5 > PI then v5 = v5 - 2 * PI end
+    local positive = true
+    if v5 < 0 then positive = false; v5 = -v5 end
+
+    local v15
+    local steerCfg = chassis.steerCfg
+    if steerCfg and steerCfg.ackermann ~= nil then
+        v15 = v5 / (1 + max(0, steerCfg.ackermann) * abs(math.tan(min(v5, 1.2))))
+    else
+        local c = chassis.c
+        local v11, v14 = c[5] - c[17], c[4] - c[40]
+        v15 = v14 * v5 / (v5 * v11 + v14)
+    end
+
+    if positive then
+        chassis.steer.a1 = v15
+        chassis.steer.a0 = v5
+    else
+        chassis.steer.a1 = -v5
+        chassis.steer.a0 = -v15
+    end
+end
+
+return SimcadeSteering

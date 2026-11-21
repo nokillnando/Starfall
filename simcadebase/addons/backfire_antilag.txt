@@ -1,0 +1,212 @@
+--@name Simcade Backfire and Anti-Lag Addon
+--@shared
+
+local defaults = {
+    TriggerMode = 3, -- 1: Overrun only, 2: RevLimit only, 3: Both
+    MinRPMThreshold = 4000, -- Minimum RPM to trigger overrun backfire
+    OverrunThrottleDrop = 0.4, -- Throttle must drop below this to trigger Overrun backfire
+    OverrunPopChance = 0.35, -- Chance when throttle is released after load
+    OverrunSustainChance = 0.12, -- Chance per second for extra pops while coasting at high RPM
+    OverrunMinLoadTime = 0.25, -- Must be on throttle this long before lift-off can pop
+    OverrunWindow = 0.55, -- Seconds after lift-off where overrun pops are allowed
+    OverrunCooldownMin = 0.06,
+    OverrunCooldownMax = 0.25,
+    OverrunBurstChance = 0.35,
+    OverrunBurstMin = 2,
+    OverrunBurstMax = 4,
+    BurstIntervalMin = 0.04,
+    BurstIntervalMax = 0.12,
+    RPMChancePower = 1.35, -- Higher values make low-RPM pops rarer
+    EnableAntiLag = true,
+    AntiLagBoostThreshold = 1.05,
+    AntiLagThrottleMax = 0.35,
+    AntiLagMinRPM = 3500,
+    AntiLagPopChance = 0.45, -- Chance per second while off-throttle with boost
+    AntiLagCooldownMin = 0.10,
+    AntiLagCooldownMax = 0.24,
+    EnableDownshiftPops = true,
+    DownshiftPopChance = 0.65, -- Chance when gear drops under RPM/load
+    DownshiftSustainChance = 0.18, -- Chance per second for follow-up burbles after downshift
+    DownshiftMinRPM = 3200,
+    DownshiftThrottleMax = 0.55,
+    DownshiftWindow = 0.45,
+    DownshiftCooldownMin = 0.05,
+    DownshiftCooldownMax = 0.18,
+    DownshiftBurstChance = 0.45,
+
+    RevLimitPopChance = 10, -- Chance per second while on rev limiter
+    RevLimitRPMThreshold = 0.95, -- % of RevLimiter RPM required to start popping (0.95 = 95%)
+    RevLimitThrottle = 0.4, -- Minimum Throttle needed to trigger 2-Step / RevLimit popping
+    RevLimitCooldownMin = 0.01,
+    RevLimitCooldownMax = 0.05,
+    RevLimitBurstChance = 1,
+
+    -- Sounds
+    SoundVolume = 1,
+    SoundPitchMin = 85,
+    SoundPitchMax = 115,
+
+    -- Support for both Web URLs and standard paths
+    UseURLSounds = true,
+    URLSounds = {
+        -- Add URLs to raw .ogg or .mp3 files here
+        "https://raw.githubusercontent.com/nokillnando/forzaapexsounds/main/misc/burble/burble_oneshot_test1.ogg",
+        "https://raw.githubusercontent.com/nokillnando/forzaapexsounds/main/misc/burble/burble_oneshot_test2.ogg",
+        "https://raw.githubusercontent.com/nokillnando/forzaapexsounds/main/misc/burble/burble_oneshot_test3.ogg"
+    },
+    InGameSounds = {
+        "acf_thecrew/useful/backfire/backfire_drain_10.wav",
+        "acf_thecrew/useful/backfire/backfire_gargle_15.wav",
+        "acf_thecrew/useful/backfire/backfire_splutter_20.wav"
+    },
+
+    -- Effects: Multiple effects can play simultaneously
+    Effects = {
+        { effecttype = "effect", effectname = "MuzzleEffect", scale = 0.4 },
+        { effecttype = "effect", effectname = "AirboatMuzzleFlash", scale = 0.7 },
+    },
+}
+
+return function(options)
+    local cfg = {}
+    for key, value in pairs(defaults) do cfg[key] = value end
+    for key, value in pairs(options) do cfg[key] = value end
+
+    local name = "BackfireAntiLag"
+    if CLIENT then
+        local playSound, soundEntry, emitter, flashMat
+        local function flash(ent, spec)
+            local pos = ent:getPos()
+            local scale = spec.scale or 1
+            if spec.effecttype == "custom" then
+                flashMat = flashMat or material.load("effects/muzzleflash1")
+                emitter = emitter or particle.create(pos, false)
+                if emitter.setPos then emitter:setPos(pos) end
+                local puff = emitter:add(flashMat, pos, 20 * scale, 35 * scale, 0, 0, 255, 0, 0.08)
+                if puff then puff:setVelocity(ent:getForward() * -100) end
+            elseif spec.effecttype == "particle" then
+                particleEffect.attach(ent, spec.effectname, 1, {origin = pos, angles = ent:getAngles()})
+            elseif spec.effecttype == "effect" then
+                local fx = effect.create()
+                fx:setEntity(ent)
+                fx:setOrigin(pos)
+                fx:setAngles(ent:getAngles())
+                fx:setScale(scale)
+                if fx.play then fx:play(spec.effectname) else effect.play(spec.effectname, fx) end
+            end
+        end
+
+        local function play(ent)
+            for _, spec in ipairs(cfg.Effects) do pcall(flash, ent, spec) end
+            if playSound then playSound(ent, ent:getPos(), soundEntry) end
+        end
+
+        return {
+            name = name,
+            OnSoundReady = function(_, preload, oneShot)
+                local paths = cfg.UseURLSounds and cfg.URLSounds or cfg.InGameSounds
+                if #paths == 0 or cfg.SoundVolume <= 0 then return end
+                soundEntry = {
+                    variants = paths, volume = cfg.SoundVolume, loadMode = "stream",
+                    pitchMin = cfg.SoundPitchMin / 100, pitchMax = cfg.SoundPitchMax / 100,
+                }
+                preload(soundEntry)
+                playSound = oneShot
+            end,
+            OnClientEvent = function(_, eventName, exhausts)
+                if eventName ~= name then return end
+                if #exhausts == 0 then play(chip()) end
+                for _, id in ipairs(exhausts) do
+                    local ent = entity(id)
+                    if isValid(ent) then play(ent) end
+                end
+            end,
+            OnCleanup = function()
+                if emitter and emitter.destroy then emitter:destroy() end
+            end,
+        }
+    end
+
+    local function range(low, high)
+        return low + math.random() * (high - low)
+    end
+    local function chance(p)
+        return math.random() < p
+    end
+
+    local prevThrottle, prevRPM, prevGear, loaded = 0, 0, 0, 0
+    local overrunUntil, downshiftUntil, nextPop = 0, 0, 0
+    local burstSource, burstLeft, nextBurst = nil, 0, 0
+    return {
+        name = name,
+        OnInit = function(ctx)
+            ctx.addWireInput("Exhausts", "Array")
+        end,
+        OnPostPhysics = function(ctx, dt)
+            local s = ctx.state
+            if not s.running then
+                prevThrottle, prevRPM, prevGear, loaded = 0, 0, 0, 0
+                overrunUntil, downshiftUntil, nextPop, burstLeft = 0, 0, 0, 0
+                return
+            end
+            local now = timer.curtime()
+            local rpm, throttle, gear = s.rpm, s.throttle, s.gear
+            local limiter = s.limiterRPM
+            local factor = math.clamp((rpm - cfg.MinRPMThreshold) / math.max(1, limiter - cfg.MinRPMThreshold), 0, 1) ^ cfg.RPMChancePower
+            local lowThrottle = throttle <= cfg.OverrunThrottleDrop
+            local lift = lowThrottle and prevThrottle > cfg.OverrunThrottleDrop and loaded >= cfg.OverrunMinLoadTime
+            local drop = math.clamp((prevThrottle - throttle) / math.max(0.01, cfg.OverrunThrottleDrop), 0.25, 1)
+            local down = gear > 0 and rpm > cfg.DownshiftMinRPM and throttle <= cfg.DownshiftThrottleMax and cfg.EnableDownshiftPops
+            local shifted = down and prevGear > gear
+            local kick = math.clamp((rpm - prevRPM) / math.max(1, limiter * 0.18), 0.55, 1)
+            prevThrottle, prevRPM, prevGear = throttle, rpm, gear
+            loaded = lowThrottle and math.max(0, loaded - dt * 0.5) or loaded + dt
+            if lift and rpm > cfg.MinRPMThreshold then overrunUntil = now + cfg.OverrunWindow end
+            if shifted then downshiftUntil = now + cfg.DownshiftWindow end
+
+            local overrun = cfg.TriggerMode ~= 2 and lowThrottle and rpm > cfg.MinRPMThreshold and now < overrunUntil
+            down = cfg.TriggerMode ~= 2 and down and now < downshiftUntil
+            local limiting = cfg.TriggerMode ~= 1 and rpm > limiter * cfg.RevLimitRPMThreshold and throttle > cfg.RevLimitThrottle
+            local boosted = cfg.TriggerMode ~= 2 and cfg.EnableAntiLag and throttle <= cfg.AntiLagThrottleMax
+                and rpm > cfg.AntiLagMinRPM and s.turboBoostRatio >= cfg.AntiLagBoostThreshold
+
+            if (burstSource == "Overrun" and not overrun) or (burstSource == "Downshift" and not down)
+                or (burstSource == "RevLimit" and not limiting) then burstLeft = 0 end
+            if now < nextPop then return end
+
+            local source, startBurst
+            if burstLeft > 0 and now >= nextBurst then
+                source = burstSource
+                burstLeft = burstLeft - 1
+            elseif limiting and chance(cfg.RevLimitPopChance * math.max(0.5, factor) * dt) then
+                source, startBurst = "RevLimit", true
+            elseif down and shifted and chance(cfg.DownshiftPopChance * math.max(0.35, factor) * kick
+                * math.max(0.35, 1 - throttle / math.max(0.01, cfg.DownshiftThrottleMax))) then
+                source, startBurst = "Downshift", true
+            elseif overrun and lift and chance(cfg.OverrunPopChance * factor * drop) then
+                source, startBurst = "Overrun", true
+            elseif down and chance(cfg.DownshiftSustainChance * math.max(0.35, factor) * dt) then
+                source = "Downshift"
+            elseif overrun and chance(cfg.OverrunSustainChance * factor * dt) then
+                source = "Overrun"
+            elseif boosted and chance(cfg.AntiLagPopChance * math.max(0.35, factor)
+                * math.clamp((s.turboBoostRatio - cfg.AntiLagBoostThreshold) / 0.5, 0.25, 1) * dt) then
+                source = "AntiLag"
+            end
+            if not source then return end
+            if startBurst and chance(cfg[source .. "BurstChance"]) then
+                local low = source == "Overrun" and cfg.OverrunBurstMin or 2
+                local high = source == "Overrun" and cfg.OverrunBurstMax or 3
+                burstLeft = math.random(low, math.max(low, high)) - 1
+                burstSource = source
+            end
+            nextBurst = now + range(cfg.BurstIntervalMin, cfg.BurstIntervalMax)
+            nextPop = now + math.max(0.10, range(cfg[source .. "CooldownMin"], cfg[source .. "CooldownMax"]))
+            local exhausts = {}
+            for _, ent in ipairs(ctx.getWireInput("Exhausts") or {}) do
+                if isValid(ent) then exhausts[#exhausts + 1] = ent:entIndex() end
+            end
+            ctx.emitEvent(name, exhausts)
+        end,
+    }
+end
