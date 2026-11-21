@@ -1,3 +1,0 @@
-# Release byte counts and checksums depend on preserving the generated files.
-releases/**/core.bin binary
-releases/**/simcadebase/*.txt -text
