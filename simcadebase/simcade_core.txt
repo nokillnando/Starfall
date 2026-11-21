@@ -186,8 +186,9 @@ function SimcadeCore.init(CONFIG)
         addonHost.applyOverrides(nil, nil)
     end
 
+    local inputNames
     if SimcadeWire and SimcadeWire.initPorts then
-        SimcadeWire.initPorts(
+        inputNames = SimcadeWire.initPorts(
             VEHICLE_CFG, WHEELS,
             addonHost and addonHost.extraInputs or nil,
             addonHost and addonHost.extraOutputs or nil
@@ -710,7 +711,9 @@ function SimcadeCore.init(CONFIG)
         end
     end)
 
-    hook.add("input", "Simcade_WireInputs", function(name, value)
+    local startupInputs = inputNames and wire.isConnected and {}
+    local function onWireInput(name, value)
+        if startupInputs then startupInputs[name] = true end
         if name == "Pod" then
             Pod = isValid(value) and value or nil
             if isValid(Base) then setupWheels() end
@@ -757,7 +760,25 @@ function SimcadeCore.init(CONFIG)
                 addonHost.onWireInput(name, value)
             end
         end
-    end)
+    end
+    hook.add("input", "Simcade_WireInputs", onWireInput)
+
+    if startupInputs then
+        -- Update checks can finish after Wiremod restores the chip's input values.
+        timer.simple(0, function()
+            local self = chip()
+            local function readConnected(name)
+                if startupInputs[name] then return end
+                local ok, connected = pcall(wire.isConnected, self, name)
+                if ok and connected then onWireInput(name, wire.ports[name]) end
+            end
+            for _, name in ipairs(inputNames) do
+                if name ~= "Base" then readConnected(name) end
+            end
+            readConnected("Base")
+            startupInputs = nil
+        end)
+    end
 
     hook.add("think", "Simcade_PhysicsTick", function()
         if not isValid(Base) then return end

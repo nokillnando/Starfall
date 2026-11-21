@@ -92,6 +92,7 @@ function SimcadeWire.initPorts(VEHICLE_CFG, WHEELS, extraInputs, extraOutputs)
         end
     end
     wire.adjustOutputs(outNames, outTypes)
+    return inNames
 end
 
 function SimcadeWire.writeOutputs(data)
