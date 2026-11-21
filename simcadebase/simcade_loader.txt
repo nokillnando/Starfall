@@ -50,6 +50,12 @@ local modules = {
 -- Each record contains a decimal byte count, a newline and the exact source.
 -- Compile every module before installing any hooks or starting vehicle physics.
 local MAX_BYTES = 4 * 1024 * 1024
+local function parsePositiveInteger(value)
+    if not value or #value > 9 or value:find("[^0-9]") then return end
+    local number = tonumber(value)
+    if number and number > 0 then return number end
+end
+
 local function compileBundle(data, ready, fail)
     if type(data) ~= "string" or #data > MAX_BYTES then return fail("Invalid package size") end
     local compiled, pos = {}, 1
@@ -174,21 +180,26 @@ return function(config)
 
     print("[Simcade] Local core r" .. LOCAL_REVISION .. ", vehicle config v" .. schema .. ". Checking for updates...")
     fetch("latest.txt", 128, function(body)
-        local revision, digest, required = body:match("^%s*(%d+)%s+([0-9a-f]+)%s+(%d+)%s*$")
-        if not revision then
-            revision, digest = body:match("^%s*(%d+)%s+([0-9a-f]+)%s*$")
+        -- Starfall limits the number of repetition operators in a single pattern.
+        local fields = body:gmatch("%S+")
+        local revision, digest, required = fields(), fields(), fields()
+        local revisionNumber = parsePositiveInteger(revision)
+        if fields() or not revisionNumber or not digest or #digest ~= 64 or digest:find("[^0-9a-f]") then
+            return useLocal("Invalid release manifest")
+        end
+        if not required then
             -- The original published r2 package used the v1 config before manifests declared it.
             if revision == "2" and digest == "b63c6c0ce16d0eb47d698c59499dbd64166b88f2eb70db2c5d94a0e728a006fe" then
                 required = "1"
             end
         end
-        if not revision or #revision > 9 or #digest ~= 64 then return useLocal("Invalid release manifest") end
-        if tonumber(revision) == LOCAL_REVISION then return useLocal("Up to date.") end
-        if tonumber(revision) < LOCAL_REVISION then return useLocal("Release host is on r" .. revision .. ".") end
-        if not required or #required > 9 or tonumber(required) < 1 then
+        if revisionNumber == LOCAL_REVISION then return useLocal("Up to date.") end
+        if revisionNumber < LOCAL_REVISION then return useLocal("Release host is on r" .. revision .. ".") end
+        local requiredSchema = parsePositiveInteger(required)
+        if not requiredSchema then
             return useLocal("Skipped r" .. revision .. ". Its manifest has no valid config version.")
         end
-        if tonumber(required) ~= schema then
+        if requiredSchema ~= schema then
             return useLocal("Skipped r" .. revision .. ". It requires config v" .. required .. ", this vehicle uses v" .. schema .. ".")
         end
         print("[Simcade] New core r" .. revision .. " available. Downloading " .. opt.format)

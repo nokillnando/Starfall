@@ -19,8 +19,6 @@ CONFIG.CORE_UPDATE = {
 -- Chassis, wheels and suspension
 -- ============================================================================
 
-local CONFIG = {}
-
 CONFIG.VEHICLE_CFG = {
     DefaultMassKG               = 950,      -- Initial fallback for the vehicle solver until the Base prop mass is read.
     VirtualMassKG               = 950,      -- Solver mass override in kg. 0 uses the Base prop mass once available.
