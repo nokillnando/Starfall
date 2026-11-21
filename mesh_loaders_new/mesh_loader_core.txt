@@ -2056,42 +2056,10 @@ if CLIENT then
                 progressData.spawning = false
                 setName(namePrefix .. statsTag .. " - Complete")
                 
-                -- Reconciliation timer: handles AdvDupe2 timing where wires connect AFTER the chip boots
-                -- Periodically re-requests server state AND directly re-parents any mismatched holograms
-                local reconcileAttempts = 0
-                timer.create("meshParentReconcile", 1, 20, function()
-                    if not isValid(chip()) then timer.remove("meshParentReconcile") return end
-                    reconcileAttempts = reconcileAttempts + 1
-                    
-                    -- Re-request all states from server
-                    net.start("requestBase")
-                    net.send()
-                    
-                    -- Directly reconcile any holograms whose parent doesn't match networkedEntities
-                    local allResolved = true
-                    for _, holo in ipairs(spawnedHolograms) do
-                        if isValid(holo) and holo.MeshTargetParentName then
-                            local expectedParent = resolveParent(holo.MeshTargetParentName)
-                            if expectedParent and isValid(expectedParent) then
-                                local currentParent = holo:getParent()
-                                if currentParent ~= expectedParent then
-                                    holo:setParent(expectedParent)
-                                    local meshOffsetPos = (holo.MeshConfig and holo.MeshConfig.offsetPos) or activeConfig.offsetPos or offsetPos
-                                    local meshOffsetAng = (holo.MeshConfig and holo.MeshConfig.offsetAngle) or activeConfig.offsetAngle or offsetAngle
-                                    holo:setPos(expectedParent:localToWorld(meshOffsetPos))
-                                    holo:setAngles(expectedParent:localToWorldAngles(meshOffsetAng))
-                                end
-                            else
-                                allResolved = false
-                            end
-                        end
-                    end
-                    
-                    if allResolved and reconcileAttempts >= 5 then
-                        timer.remove("meshParentReconcile")
-                    end
-                end)
-                
+                -- Replay the latest state once after spawning. monitorBase pushes later Wire changes.
+                net.start("requestBase")
+                net.send()
+
                 -- Continuous local parent checker to handle PVS / dormancy / late join issues
                 -- Runs indefinitely with zero network overhead
                 timer.create("meshLocalParentReconcile", 2, 0, function()
@@ -2107,11 +2075,7 @@ if CLIENT then
                             if expectedParent and isValid(expectedParent) then
                                 local currentParent = holo:getParent()
                                 if currentParent ~= expectedParent then
-                                    holo:setParent(expectedParent)
-                                    local meshOffsetPos = (holo.MeshConfig and holo.MeshConfig.offsetPos) or activeConfig.offsetPos or offsetPos
-                                    local meshOffsetAng = (holo.MeshConfig and holo.MeshConfig.offsetAngle) or activeConfig.offsetAngle or offsetAngle
-                                    holo:setPos(expectedParent:localToWorld(meshOffsetPos))
-                                    holo:setAngles(expectedParent:localToWorldAngles(meshOffsetAng))
+                                    updateHoloTransforms(holo)
                                 end
                             end
                         end
@@ -2402,42 +2366,6 @@ if CLIENT then
                         mat:setFloat("$rimlightboost", v.RimLightBoost)
 
                         mat:setVector("$color2", v.Color2)
-                    end
-
-                    if v.UseEnvMapSpecularReflections == true then
-                        local cubemapUpdateInterval = 2
-                        local previousPosition = chip():getPos()
-                        local isInitialSpawn = true
-                        local function setCubeMap(force)
-                            local currentPosition = chip():getPos()
-                            if force or currentPosition ~= previousPosition or isInitialSpawn then
-                                local cmName = v.CubeMapTexture or (activeConfig and activeConfig.CubeMapTexture) or "models/shiny"
-                                local okM, Nmat = pcall(material.load, cmName)
-                                local newEnvMap = okM and Nmat and Nmat.getTexture and Nmat:getTexture("$envmap")
-                                if newEnvMap then
-                                    cachedResolvedCubemap = newEnvMap
-                                    for _, mesh_val in ipairs(meshes) do
-                                        if mesh_val.mat and mesh_val.mat.setTexture then
-                                            mesh_val.mat:setTexture("$envmap", newEnvMap)
-                                        end
-                                        if mesh_val.isolatedMat and mesh_val.isolatedMat.setTexture then
-                                            mesh_val.isolatedMat:setTexture("$envmap", newEnvMap)
-                                        end
-                                    end
-                                end
-                                previousPosition = currentPosition
-                                isInitialSpawn = false
-                            end
-                        end
-                        globalSetCubeMap = setCubeMap
-                        pcall(timer.simple, 1, setCubeMap)
-                        local function updateCubemap()
-                            if not isValid(chip()) then return end
-                            if not isValid(owner()) then return end
-                            setCubeMap()
-                            pcall(timer.simple, cubemapUpdateInterval, updateCubemap)
-                        end
-                        pcall(timer.simple, cubemapUpdateInterval, updateCubemap)
                     end
 
                     if isNewCustomMat then
@@ -2960,6 +2888,15 @@ if CLIENT then
             while chip():getQuotaAverage() < chip():getQuotaMax() / 4 do
                 local ok, texCounts, matCounts = buildThread()
                 if ok == true then
+                    for _, meshConfig in ipairs(meshes) do
+                        if meshConfig.UseEnvMapSpecularReflections then
+                            globalSetCubeMap()
+                            timer.create("meshCubemaps", 2, 0, function()
+                                globalSetCubeMap(false)
+                            end)
+                            break
+                        end
+                    end
                     doneBuilding(meshName, debugPrints, meshSpawnDelay, showMeshSpawnProgress, meshes, offsetPos, offsetAngle, globalScale, triangles, W, R, G, progressData, texCounts, matCounts)
                     hook.remove("think", "build")
                     return
@@ -3257,28 +3194,37 @@ if CLIENT then
         downloadQueue = {}
         isPumping = false
         totalDownloads = 0
-        globalSetCubeMap = nil
-        local function forceUpdateAllCubemaps()
-            if globalSetCubeMap then
-                globalSetCubeMap(true)
+        local lastCubemapPosition
+        local function forceUpdateAllCubemaps(force)
+            if force == false and chip():getPos() == lastCubemapPosition then return end
+            local sources = {}
+            local visited = {}
+            local resolved = true
+            local function apply(mat, texture)
+                if mat and mat.setTexture and not visited[mat] then
+                    visited[mat] = true
+                    if mat:getTexture("$envmap") ~= texture then mat:setTexture("$envmap", texture) end
+                end
             end
-            local cmName = (activeConfig and activeConfig.CubeMapTexture) or "models/shiny"
-            local okM, Nmat = pcall(material.load, cmName)
-            local newEnvMap = okM and Nmat and Nmat.getTexture and Nmat:getTexture("$envmap")
-            if newEnvMap then
-                cachedResolvedCubemap = newEnvMap
-                for _, mesh_val in ipairs((activeConfig and activeConfig.meshes) or {}) do
-                    if mesh_val.mat and mesh_val.mat.setTexture then
-                        mesh_val.mat:setTexture("$envmap", newEnvMap)
+            for _, meshConfig in ipairs(config.meshes) do
+                if meshConfig.UseEnvMapSpecularReflections then
+                    local source = meshConfig.CubeMapTexture or config.CubeMapTexture or "models/shiny"
+                    if sources[source] == nil then
+                        sources[source] = material.getTexture(source, "$envmap") or false
                     end
-                    if mesh_val.isolatedMat and mesh_val.isolatedMat.setTexture then
-                        mesh_val.isolatedMat:setTexture("$envmap", newEnvMap)
+                    local texture = sources[source]
+                    if texture then
+                        cachedResolvedCubemap = texture
+                        apply(meshConfig.mat, texture)
+                        apply(meshConfig.SharedMaterial, texture)
+                    else
+                        resolved = false
                     end
                 end
             end
-            return newEnvMap
+            lastCubemapPosition = resolved and chip():getPos() or nil
         end
-        
+        globalSetCubeMap = forceUpdateAllCubemaps
         -- Initialize color commands and dynamic bodykit parts from chip configuration
         registeredColorCommands = {}
         defaultCommandColors = {}
@@ -4213,16 +4159,7 @@ if CLIENT then
                         -- Apply shader overrides on the new material instance
                         applyMeshMaterialOverrides(v)
 
-                        -- Force update cubemaps across all materials
-                        if globalSetCubeMap then
-                            globalSetCubeMap(true)
-                        end
-                        pcall(timer.simple, 0.1, function()
-                            if globalSetCubeMap then globalSetCubeMap(true) end
-                        end)
-                        pcall(timer.simple, 1, function()
-                            if globalSetCubeMap then globalSetCubeMap(true) end
-                        end)
+                        forceUpdateAllCubemaps()
 
                         print(G, "[MeshLoader] Decoupled material instance for submesh #" .. meshIdx .. " (1 unique slot allocated)")
                     end
@@ -4485,71 +4422,11 @@ if CLIENT then
                         resetSingleChipSettings()
                     end)
 
-                    local function getRootEntity(ent)
-                        if not isValid(ent) then return nil end
-                        local curr = ent
-                        local visited = {}
-                        while isValid(curr) and not visited[curr] do
-                            visited[curr] = true
-                            local p = curr:getParent()
-                            if isValid(p) then
-                                curr = p
-                            else
-                                break
-                            end
-                        end
-                        return curr
-                    end
-
-                    _G.MeshLoaderRegistry = _G.MeshLoaderRegistry or {}
-                    local myModuleName = activeConfig and activeConfig.meshName or ("Module #" .. currentChipId)
-                    local currentVehicleId = nil
-                    local function saveModuleRegistration()
-                        _G.MeshLoaderRegistry[currentChipId] = {
-                            id = currentChipId,
-                            name = myModuleName,
-                            meshName = myModuleName,
-                            chip = chip(),
-                            base = base,
-                            isBoothEnabled = isBoothEnabled,
-                            vehicleId = currentVehicleId,
-                            config = activeConfig or {},
-                            registeredColorCommands = registeredColorCommands or {},
-                            currentCommandColors = currentCommandColors or {},
-                            defaultCommandColors = defaultCommandColors or {},
-                            spawnedHolograms = spawnedHolograms or {},
-                            activeWireSwaps = activeWireSwaps or {},
-                            registeredParts = registeredParts or {},
-                            activePartVariants = activePartVariants or {},
-                            setPartVariant = setPartVariant,
-                            updatePartVisibility = updatePartVisibility,
-                            sendColorUpdate = sendColorUpdate,
-                            applyMeshMaterialOverrides = applyMeshMaterialOverrides,
-                            applyColorCommandUpdate = applyColorCommandUpdate,
-                            applyHoloSwaps = applyHoloSwaps,
-                            decoupleSubmeshMaterial = decoupleSubmeshMaterial,
-                            relinkSubmeshMaterial = relinkSubmeshMaterial,
-                            resetSingleChipSettings = resetSingleChipSettings,
-                            resetAllSettings = resetAllSettings,
-                            savePreset = savePreset,
-                            loadPreset = loadPreset,
-                            deletePreset = deletePreset,
-                            refreshPresetList = refreshPresetList,
-                            sendSubmeshUpdate = sendSubmeshUpdate,
-                            updateHoloTransforms = updateHoloTransforms
-                        }
-                        pcall(function()
-                            file.createDir("mesh_presets")
-                            local myVehId = currentVehicleId or (isValid(base) and getRootEntity(base) and getRootEntity(base):entIndex()) or (isValid(chip():getParent()) and getRootEntity(chip()) and getRootEntity(chip()):entIndex()) or 0
-                            local myBaseId = (isValid(base) and base ~= chip()) and base:entIndex() or 0
-                            file.write("mesh_presets/module_" .. currentChipId .. ".txt", currentChipId .. ":" .. myModuleName .. ":" .. myVehId .. ":" .. myBaseId)
-                        end)
-                    end
-                    saveModuleRegistration()
+                    local myModuleName = activeConfig.meshName or ("Module #" .. currentChipId)
 
                     -- Handover and initialize UI module
                     if not _G.MeshLoaderUI or not _G.MeshLoaderUI.init then
-                        pcall(dofile, "mesh_loaders_new/mesh_loader_ui.txt")
+                        dofile("mesh_loaders_new/mesh_loader_ui.txt")
                     end
 
                     if _G.MeshLoaderUI and _G.MeshLoaderUI.init then
@@ -4557,6 +4434,7 @@ if CLIENT then
                             currentChipId = currentChipId,
                             activeConfig = activeConfig,
                             myModuleName = myModuleName,
+                            getBase = function() return base end,
                             base = base,
                             isBoothEnabled = isBoothEnabled,
                             registeredColorCommands = registeredColorCommands,
@@ -4607,7 +4485,6 @@ else -- SERVER
     local trackedNormalInputs = {}
     local lastParentEntities = {}
     local lastNormalInputs = {}
-    local serverConfig = nil
     local serverUpdateRate = 0.1
     local lastChipsCount = 0
     
@@ -4681,22 +4558,17 @@ else -- SERVER
             end
         end
 
-        -- Fast BFS constraint tree traversal (pattern from tire_simulation_core)
-        local queue = {}
-        for _, ent in ipairs(entityList) do
-            table.insert(queue, ent)
-        end
-
+        -- addEnt appends newly discovered entities, so the result list also serves as the BFS queue.
         local maxQueue = 500
         local processed = 0
-        while #queue > 0 and processed < maxQueue do
+        local scannedConstraints = {}
+        while processed < #entityList and processed < maxQueue do
             processed = processed + 1
-            local current = table.remove(queue, 1)
+            local current = entityList[processed]
             if isValid(current) then
                 local parent = current:getParent()
                 if isValid(parent) and not vehicleSet[parent] then
                     addEnt(parent)
-                    table.insert(queue, parent)
                 end
                 
                 local okChildren, children = pcall(function() return current:getChildren() end)
@@ -4704,7 +4576,6 @@ else -- SERVER
                     for _, child in ipairs(children) do
                         if isValid(child) and not vehicleSet[child] then
                             addEnt(child)
-                            table.insert(queue, child)
                         end
                     end
                 end
@@ -4717,17 +4588,17 @@ else -- SERVER
                             local other = (c.Ent1 == current) and c.Ent2 or c.Ent1
                             if isValid(other) and not vehicleSet[other] then
                                 addEnt(other)
-                                table.insert(queue, other)
                             end
                         end
                     end
-                elseif current.getAllConstrained then
+                elseif current.getAllConstrained and not scannedConstraints[current] then
                     local constrained = current:getAllConstrained()
                     if type(constrained) == "table" then
-                        for _, ent in ipairs(constrained) do
-                            if isValid(ent) and not vehicleSet[ent] then
+                        scannedConstraints[current] = true
+                        for _, ent in pairs(constrained) do
+                            if isValid(ent) then
+                                scannedConstraints[ent] = true
                                 addEnt(ent)
-                                table.insert(queue, ent)
                             end
                         end
                     end
@@ -4771,21 +4642,6 @@ else -- SERVER
                 net.writeUInt(ent:entIndex(), 16)
             end
         end
-        if isValid(ply) then
-            net.send(ply)
-        elseif not ply then
-            net.send(find.allPlayers())
-        end
-    end
-
-    local function syncModuleInfo(ply)
-        if not isValid(chip()) then return end
-        local _, _, vId = getVehicleEntities()
-        net.start("broadcastModuleInfo")
-        net.writeEntity(chip())
-        net.writeUInt(chip():entIndex(), 16)
-        net.writeUInt(tonumber(vId) or 0, 16)
-        net.writeString(serverConfig and serverConfig.meshName or ("Module #" .. chip():entIndex()))
         if isValid(ply) then
             net.send(ply)
         elseif not ply then
@@ -4987,7 +4843,6 @@ else -- SERVER
     
 
     local function initServer(config)
-        serverConfig = config
         trackedParentEntities = {}
         trackedNormalInputs = {}
         lastParentEntities = {}
@@ -5060,7 +4915,6 @@ else -- SERVER
             lastChips = nil
             lastMarker = nil
             sendVehicleConstrainedEntities()
-            syncModuleInfo()
         end
         
         timer.simple(0.2, forceRebroadcast)
@@ -5128,8 +4982,7 @@ else -- SERVER
                 if serverBoothEnabled and isLookingAtVehicle(ply) then
                     local rest = text:sub(start_idx + #cmd):match("^%s*(.-)%s*$") or ""
                     pcall(function()
-                        sendVehicleConstrainedEntities(ply, true)
-                        syncModuleInfo(ply)
+                        sendVehicleConstrainedEntities(ply)
                     end)
                     net.start("openBoothOnSpecificChip")
                     net.writeString(rest)
@@ -5468,18 +5321,6 @@ else -- SERVER
         net.send(ply)
     end)
 
-    net.receive("clientAnnounceModule", function(_, ply)
-        if ply ~= owner() then return end
-        local mName = net.readString()
-        local _, _, vId = getVehicleEntities()
-        net.start("broadcastModuleInfo")
-        net.writeEntity(chip())
-        net.writeUInt(chip():entIndex(), 16)
-        net.writeUInt(vId or 0, 16)
-        net.writeString(mName)
-        net.send(find.allPlayers())
-    end)
-
     net.receive("requestOpenBoothOnChip", function(_, ply)
         if ply ~= owner() then return end
         local targetName = net.readString()
@@ -5524,15 +5365,12 @@ else -- SERVER
 
     net.receive("requestBase", function(_, ply)
         local currentBase = wire.ports.Base
-        if not isValid(currentBase) then 
-            return 
-        end
+        if not isValid(currentBase) then currentBase = chip() end
         net.start("sendBase")
         net.writeEntity(currentBase)
         net.send(ply)
         
         sendVehicleConstrainedEntities(ply)
-        syncModuleInfo(ply)
         
         for _, parentName in ipairs(trackedParentEntities) do
             local parentEnt = wire.ports[parentName]
@@ -5701,7 +5539,6 @@ else -- SERVER
             net.writeEntity(isValid(currentBase) and currentBase or chip())
             net.send(find.allPlayers())
             sendVehicleConstrainedEntities(nil, true)
-            syncModuleInfo()
         end
         
         for _, parentName in ipairs(trackedParentEntities) do
@@ -5756,11 +5593,6 @@ else -- SERVER
             end
         end
 
-        local lastVehiclePeriodicSync = lastVehiclePeriodicSync or 0
-        if (now - lastVehiclePeriodicSync >= 2.5) then
-            lastVehiclePeriodicSync = now
-            sendVehicleConstrainedEntities(nil, false)
-        end
     end)
 
     _G.MeshLoaderCore = {
@@ -5780,11 +5612,6 @@ hook.add("removed", "stopStreams", function()
         end
         if isValid(chip()) then
             local cId = chip():entIndex()
-            pcall(function()
-                if file.exists("mesh_presets/module_" .. cId .. ".txt") then
-                    file.delete("mesh_presets/module_" .. cId .. ".txt")
-                end
-            end)
             if _G.MeshLoaderRegistry then
                 _G.MeshLoaderRegistry[cId] = nil
             end

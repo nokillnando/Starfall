@@ -163,9 +163,7 @@ function _G.MeshLoaderUI.init(ctx)
     local vehicleEntities = {}
     local vehicleEntityIndices = {}
     local currentVehicleId = nil
-    local discoveredNetworkModules = {}
     local cachedDiscoveredMods = nil
-    local lastModScanTime = 0
 
     -- 3D Workshop Showroom Camera State
     _G.MeshLoaderBoothViewMode = _G.MeshLoaderBoothViewMode or "workshop"
@@ -194,6 +192,7 @@ function _G.MeshLoaderUI.init(ctx)
     end
 
     local function getVehicleId()
+        if currentVehicleId and currentVehicleId > 0 then return currentVehicleId end
         local root = (isValid(base) and getRootEntity(base)) or (isValid(chip()) and getRootEntity(chip())) or (isValid(base) and base) or chip()
         return isValid(root) and root:entIndex() or 0
     end
@@ -245,6 +244,7 @@ function _G.MeshLoaderUI.init(ctx)
                 curTab,
                 pvx, pvy, pvz
             )
+            file.createDir("mesh_presets")
             file.write("mesh_presets/booth_state.txt", data)
             file.write("mesh_presets/booth_pos.txt", string.format("%d,%d", math.floor(wx), math.floor(wy)))
         end)
@@ -336,11 +336,12 @@ function _G.MeshLoaderUI.init(ctx)
         end)
     end
 
-    local function setBoothState(active, isModuleSwitch)
+    local focusWorkshopCamera
+    local function setBoothState(active)
         if isBoothActiveOnMe == (active == true) then return end
         isBoothActiveOnMe = (active == true)
+        _G.MeshLoaderBoothOpen = isBoothActiveOnMe
         if isBoothActiveOnMe then
-            _G.MeshLoaderBoothOpen = true
             _G.MeshLoaderActiveBoothChip = currentChipId
             pcall(function() enableHud(nil, true) end)
             loadSavedBoothPos()
@@ -352,14 +353,8 @@ function _G.MeshLoaderUI.init(ctx)
             if _G.MeshLoaderActiveBoothChip == currentChipId then
                 _G.MeshLoaderActiveBoothChip = nil
             end
-            if not isModuleSwitch then
-                _G.MeshLoaderBoothOpen = false
-                pcall(function() input.enableCursor(false) end)
-                pcall(function() input.lockControls(false) end)
-                setPresetInputActive(false)
-            else
-                pcall(function() input.lockControls(false) end)
-            end
+            pcall(input.enableCursor, false)
+            setPresetInputActive(false)
             boothDraggingSlider = nil
             boothSliderInputId = nil
             boothHexInputActive = false
@@ -401,24 +396,11 @@ function _G.MeshLoaderUI.init(ctx)
             sendSubmeshUpdate = sendSubmeshUpdate,
             updateHoloTransforms = updateHoloTransforms
         }
-        pcall(function()
-            file.createDir("mesh_presets")
-            local myVehId = currentVehicleId or (isValid(base) and getRootEntity(base) and getRootEntity(base):entIndex()) or (isValid(chip():getParent()) and getRootEntity(chip()) and getRootEntity(chip()):entIndex()) or 0
-            local myBaseId = (isValid(base) and base ~= chip()) and base:entIndex() or 0
-            file.write("mesh_presets/module_" .. currentChipId .. ".txt", currentChipId .. ":" .. myModuleName .. ":" .. myVehId .. ":" .. myBaseId)
-        end)
     end
     saveModuleRegistration()
 
-    timer.create("MeshLoader_ModuleKeepAlive_" .. currentChipId, 3.0, 0, function()
-        if not isValid(chip()) then
-            timer.remove("MeshLoader_ModuleKeepAlive_" .. currentChipId)
-            return
-        end
-        saveModuleRegistration()
-    end)
-
     net.receive("sendVehicleConstrainedEntities", function()
+        base = ctx.getBase()
         currentVehicleId = net.readUInt(16)
         local count = net.readUInt(16)
         vehicleEntities = {}
@@ -435,18 +417,6 @@ function _G.MeshLoaderUI.init(ctx)
         end
         cachedDiscoveredMods = nil
         saveModuleRegistration()
-    end)
-
-    net.receive("broadcastModuleInfo", function()
-        local cEnt = net.readEntity()
-        local cId = net.readUInt(16)
-        local vId = net.readUInt(16)
-        local mName = net.readString()
-        local id = (cId and cId > 0) and cId or (isValid(cEnt) and cEnt:entIndex())
-        if id then
-            discoveredNetworkModules[id] = { id = id, name = mName, vehicleId = vId, ent = cEnt }
-            cachedDiscoveredMods = nil
-        end
     end)
 
     local toggleBooth
@@ -469,66 +439,11 @@ function _G.MeshLoaderUI.init(ctx)
     end
 
     hook.add("removed", "MeshLoader_CleanupRegistry_" .. currentChipId, function()
-        timer.remove("meshBoothModuleSwitchWatch_" .. currentChipId)
-        timer.remove("MeshLoader_ModuleKeepAlive_" .. currentChipId)
-        pcall(function()
-            if file.exists("mesh_presets/module_" .. currentChipId .. ".txt") then
-                file.delete("mesh_presets/module_" .. currentChipId .. ".txt")
-            end
-        end)
-        if _G.MeshLoaderRegistry then
-            _G.MeshLoaderRegistry[currentChipId] = nil
+        _G.MeshLoaderRegistry[currentChipId] = nil
+        if isBoothActiveOnMe then
+            pcall(input.enableCursor, false)
+            pcall(input.lockControls, false)
         end
-        if isBoothActiveOnMe or _G.MeshLoaderActiveBoothChip == currentChipId then
-            _G.MeshLoaderBoothOpen = false
-            _G.MeshLoaderActiveBoothChip = nil
-            pcall(function()
-                file.write("mesh_presets/active_booth.txt", "0:CLOSED:" .. tostring(timer.realtime()))
-            end)
-        end
-        pcall(function() input.enableCursor(false) end)
-        pcall(function() input.lockControls(false) end)
-    end)
-
-    -- Multi-Chip Booth IPC Switch Watcher
-    local lastActiveBoothFileContent = nil
-    timer.create("meshBoothModuleSwitchWatch_" .. currentChipId, 0.05, 0, function()
-        if not isValid(chip()) then timer.remove("meshBoothModuleSwitchWatch_" .. currentChipId) return end
-        if not isBoothEnabled then return end
-        
-        pcall(function()
-            if file.exists("mesh_presets/active_booth.txt") then
-                local raw = file.read("mesh_presets/active_booth.txt")
-                if raw and raw ~= "" and raw ~= lastActiveBoothFileContent then
-                    lastActiveBoothFileContent = raw
-                    local colon = raw:find(":")
-                    if colon then
-                        local targetIdStr = raw:sub(1, colon - 1)
-                        local targetId = tonumber(targetIdStr)
-                        
-                        if targetId == 0 or targetIdStr == "0" or raw:find("CLOSED") then
-                            _G.MeshLoaderBoothOpen = false
-                            _G.MeshLoaderActiveBoothChip = nil
-                            if isBoothActiveOnMe then
-                                setBoothState(false, false)
-                            end
-                        elseif targetId == currentChipId then
-                            _G.MeshLoaderBoothOpen = true
-                            _G.MeshLoaderActiveBoothChip = currentChipId
-                            if not isBoothActiveOnMe then
-                                setBoothState(true, true)
-                            end
-                        else
-                            _G.MeshLoaderBoothOpen = true
-                            _G.MeshLoaderActiveBoothChip = targetId
-                            if isBoothActiveOnMe then
-                                setBoothState(false, true)
-                            end
-                        end
-                    end
-                end
-            end
-        end)
     end)
 
     local function belongsToVehicle(ent, entIdx)
@@ -546,218 +461,63 @@ function _G.MeshLoaderUI.init(ctx)
         return false
     end
 
-    local persistentDiscoveredModules = {}
-    local lastDiskScanTime = 0
-    local function scanDiskForModules()
-        pcall(function()
-            local files = (file.find and (file.find("mesh_presets/module_*.txt") or file.find("mesh_presets/*.txt"))) or {}
-            for _, fname in ipairs(files) do
-                if fname:sub(1, 7) == "module_" and fname:sub(-4) == ".txt" then
-                    local raw = file.read("mesh_presets/" .. fname)
-                    if raw and raw ~= "" then
-                        local parts = string.split(raw, ":")
-                        local fId = tonumber(parts[1])
-                        local fName = parts[2] or ("Module #" .. tostring(fId))
-                        local fVehId = tonumber(parts[3]) or 0
-                        local fBaseId = tonumber(parts[4]) or 0
-                        if fId and fId > 0 and fId ~= currentChipId then
-                            local ent = (entity and entity(fId)) or (find and find.byIndex and find.byIndex(fId))
-                            persistentDiscoveredModules[fId] = {
-                                id = fId,
-                                name = fName,
-                                ent = ent,
-                                vehicleId = fVehId,
-                                baseId = fBaseId,
-                                lastSeen = timer.curtime()
-                            }
-                        end
-                    end
-                end
-            end
-        end)
-    end
-    pcall(scanDiskForModules)
-
-    local function isModuleOnSameVehicle(pId, ent)
-        if not pId or pId == currentChipId then return true end
-        
-        if isValid(ent) and (vehicleEntities[ent] or (ent.entIndex and vehicleEntityIndices[ent:entIndex()])) then
-            return true
-        end
-        if pId and vehicleEntityIndices[pId] then
-            return true
-        end
-        
-        local netMod = discoveredNetworkModules[pId]
-        if netMod and currentVehicleId and netMod.vehicleId == currentVehicleId and netMod.vehicleId > 0 then
-            return true
-        end
-        
-        local diskMod = persistentDiscoveredModules and persistentDiscoveredModules[pId]
-        if diskMod and currentVehicleId and diskMod.vehicleId and diskMod.vehicleId == currentVehicleId and diskMod.vehicleId > 0 then
-            return true
-        end
-        
-        local otherReg = _G.MeshLoaderRegistry and _G.MeshLoaderRegistry[pId]
-        if otherReg and currentVehicleId and otherReg.vehicleId == currentVehicleId and otherReg.vehicleId > 0 then
-            return true
-        end
-
-        local otherChip = (otherReg and isValid(otherReg.chip)) and otherReg.chip or (isValid(ent) and ent or nil)
-        if not isValid(otherChip) and pId then
-            otherChip = (entity and entity(pId)) or (find and find.byIndex and find.byIndex(pId))
-        end
-        local otherBase = (otherReg and isValid(otherReg.base)) and otherReg.base or otherChip
-
-        local myBase = isValid(base) and base or chip()
-        if isValid(myBase) and isValid(otherChip) then
-            if otherChip == myBase or otherBase == myBase then return true end
-            if isValid(chip()) and (otherChip == chip() or otherBase == chip()) then return true end
-            if isValid(otherChip:getParent()) and otherChip:getParent() == myBase then return true end
-            if isValid(otherBase) and isValid(otherBase:getParent()) and otherBase:getParent() == myBase then return true end
-            
-            local myRoot = getRootEntity(myBase) or myBase
-            local otherRoot = getRootEntity(otherBase) or otherBase
-            if isValid(myRoot) and isValid(otherRoot) and myRoot == otherRoot then return true end
-        end
-        
-        -- Vehicle tree check via getChildren(): walk down from our root to find the other chip/base
-        local myRoot = getRootEntity(isValid(base) and base or chip()) or (isValid(base) and base or chip())
-        if isValid(myRoot) then
-            local function isInChildTree(parent, target, depth)
-                if depth > 12 or not isValid(parent) then return false end
-                if parent == target then return true end
-                local ok, children = pcall(function() return parent:getChildren() end)
-                if ok and type(children) == "table" then
-                    for _, child in ipairs(children) do
-                        if child == target then return true end
-                        if isInChildTree(child, target, depth + 1) then return true end
-                    end
-                end
-                return false
-            end
-            if isValid(otherChip) and isInChildTree(myRoot, otherChip, 0) then return true end
-            if isValid(otherBase) and otherBase ~= otherChip and isInChildTree(myRoot, otherBase, 0) then return true end
-            -- Also check from the other module's root down to find us
-            if isValid(otherBase) then
-                local otherRoot = getRootEntity(otherBase) or otherBase
-                if isValid(otherRoot) and otherRoot ~= myRoot then
-                    if isInChildTree(otherRoot, chip(), 0) then return true end
-                    if isValid(base) and base ~= chip() and isInChildTree(otherRoot, base, 0) then return true end
-                end
-            end
-        end
-
-        if isValid(otherChip) and otherChip.getAllConstrained then
-            local ok, cons = pcall(otherChip.getAllConstrained, otherChip)
-            if ok and type(cons) == "table" then
-                for _, c in ipairs(cons) do
-                    if c == myBase or c == chip() or (vehicleEntities and vehicleEntities[c]) then return true end
-                end
-            end
-        end
-        
-        return false
-    end
-
-    local function cleanupDeadModuleFiles()
-        pcall(function()
-            local files = (file.find and (file.find("mesh_presets/module_*.txt") or file.find("mesh_presets/*.txt"))) or {}
-            for _, fname in ipairs(files) do
-                if fname:sub(1, 7) == "module_" and fname:sub(-4) == ".txt" then
-                    local idStr = fname:sub(8, -5)
-                    local fId = tonumber(idStr)
-                    local shouldDelete = false
-                    if not fId or fId <= 0 then
-                        shouldDelete = true
-                    elseif fId ~= currentChipId then
-                        local ent = (entity and entity(fId)) or (find and find.byIndex and find.byIndex(fId))
-                        if isValid(ent) then
-                            local okClass, cls = pcall(function() return ent:getClass() end)
-                            if okClass and cls ~= "starfall_processor" then
-                                shouldDelete = true
-                            end
-                        end
-                    end
-                    if shouldDelete then
-                        pcall(function() file.delete("mesh_presets/" .. fname) end)
-                    end
-                end
-            end
-        end)
-    end
-
+    -- Query live owner-side modules only when opening the menu or changing modules.
     local function getDiscoveredModules()
-        local now = timer.curtime()
-        if cachedDiscoveredMods and (now - lastModScanTime < 1.0) then
-            return cachedDiscoveredMods
-        end
-        lastModScanTime = now
-
-        if now - lastDiskScanTime >= 2.0 then
-            lastDiskScanTime = now
-            scanDiskForModules()
-        end
-
-        local list = {}
-        local seenIds = {}
-        local seenNames = {}
-        
-        local function tryAddModule(fId, fName, fEnt)
-            if not fId or fId <= 0 or seenIds[fId] then return end
-            if not isModuleOnSameVehicle(fId, fEnt) then return end
-            
-            local nameKey = (fName or ("Module #" .. fId)):lower()
-            if seenNames[nameKey] then return end
-            
-            seenIds[fId] = true
-            seenNames[nameKey] = true
-            table.insert(list, {
-                id = fId,
-                name = fName or ("Module #" .. fId),
-                isSelf = (fId == currentChipId)
-            })
-        end
-
-        if isBoothEnabled then
-            tryAddModule(currentChipId, myModuleName, chip())
-        end
-        
-        if _G.MeshLoaderRegistry then
-            for rId, rData in pairs(_G.MeshLoaderRegistry) do
-                if rData and (rData.isBoothEnabled ~= false) then
-                    if isValid(rData.chip) then
-                        tryAddModule(rData.id or rId, rData.name, rData.chip)
-                    end
-                end
+        if cachedDiscoveredMods then return cachedDiscoveredMods end
+        local modules = {}
+        for _, reply in ipairs(hook.runRemote(nil, "MeshLoader.BoothInfo")) do
+            local ent, name, vehicleId = reply[1], reply[2], reply[3]
+            if isValid(ent) and type(name) == "string" and
+                (ent == chip() or vehicleId == getVehicleId() or belongsToVehicle(ent)) then
+                table.insert(modules, {id = ent:entIndex(), name = name, ent = ent, isSelf = ent == chip()})
             end
         end
-
-        if discoveredNetworkModules then
-            for nId, nData in pairs(discoveredNetworkModules) do
-                if nData then
-                    local ent = isValid(nData.ent) and nData.ent or ((entity and entity(nId)) or (find and find.byIndex and find.byIndex(nId)))
-                    tryAddModule(nData.id or nId, nData.name, ent)
-                end
-            end
-        end
-
-        if persistentDiscoveredModules then
-            for pId, pData in pairs(persistentDiscoveredModules) do
-                if pData then
-                    local ent = isValid(pData.ent) and pData.ent or ((entity and entity(pId)) or (find and find.byIndex and find.byIndex(pId)))
-                    pData.ent = ent
-                    tryAddModule(pData.id or pId, pData.name, ent)
-                end
-            end
-        end
-        
-        table.sort(list, function(a, b) return a.id < b.id end)
-        cachedDiscoveredMods = list
-        return list
+        table.sort(modules, function(a, b) return a.id < b.id end)
+        cachedDiscoveredMods = modules
+        return modules
     end
-    pcall(timer.simple, 0.5, cleanupDeadModuleFiles)
-    pcall(timer.simple, 2.0, cleanupDeadModuleFiles)
+
+    local lastCommandTime = -1
+    hook.add("remote", "MeshLoaderBoothControl", function(sender, senderOwner, action)
+        if senderOwner ~= owner() or player() ~= owner() or not isBoothEnabled then return end
+        if action == "MeshLoader.BoothInfo" then
+            return chip(), myModuleName, getVehicleId()
+        elseif action == "MeshLoader.BoothChanged" then
+            cachedDiscoveredMods = nil
+        elseif action == "MeshLoader.BoothClose" then
+            if isBoothActiveOnMe then setBoothState(false) end
+        elseif action == "MeshLoader.BoothOpen" then
+            cachedDiscoveredMods = nil
+            setBoothState(true)
+            return true
+        elseif action == "MeshLoader.BoothToggle" then
+            local now = timer.realtime()
+            if now - lastCommandTime < 0.25 then return true end
+            lastCommandTime = now
+            if not isBoothActiveOnMe then
+                hook.runRemote(nil, "MeshLoader.BoothClose")
+            end
+            cachedDiscoveredMods = nil
+            setBoothState(not isBoothActiveOnMe)
+            if isBoothActiveOnMe then focusWorkshopCamera("overview", nil, true) end
+            return true
+        elseif action == "MeshLoader.BoothActive" and isBoothActiveOnMe then
+            return chip()
+        end
+    end)
+    if player() == owner() and isBoothEnabled then
+        hook.runRemote(nil, "MeshLoader.BoothChanged")
+        hook.add("removed", "MeshLoaderBoothChanged", function()
+            hook.runRemote(nil, "MeshLoader.BoothChanged")
+        end)
+    end
+
+    local function switchBooth(mod)
+        if not isValid(mod.ent) then cachedDiscoveredMods = nil return end
+        setBoothState(false)
+        local ok, replies = pcall(hook.runRemote, mod.ent, "MeshLoader.BoothOpen")
+        if not ok or not replies[1] then setBoothState(true) end
+    end
 
     hook.add("think", "MeshLoader_BoothInputLock_" .. currentChipId, function()
         if not isBoothActiveOnMe or not _G.MeshLoaderBoothOpen then return end
@@ -964,7 +724,7 @@ function _G.MeshLoaderUI.init(ctx)
         return nil
     end
 
-    local function focusWorkshopCamera(targetSlot, targetData, instantReset)
+    focusWorkshopCamera = function(targetSlot, targetData, instantReset)
         local geo = getVehicleVisualGeometry()
         local rootBase = geo.rootBase
         if not isValid(rootBase) then return end
@@ -3423,13 +3183,7 @@ function _G.MeshLoaderUI.init(ctx)
         
         -- ESCAPE KEY (Key 70 or 27 or KEY.ESCAPE)
         if key == 70 or key == 27 or (KEY and key == KEY.ESCAPE) then
-            _G.MeshLoaderBoothOpen = false
-            _G.MeshLoaderActiveBoothChip = nil
-            input.enableCursor(false)
-            setPresetInputActive(false)
-            pcall(function()
-                file.write("mesh_presets/active_booth.txt", "CLOSED:" .. tostring(timer.realtime()))
-            end)
+            setBoothState(false)
             return
         end
 
@@ -3652,13 +3406,7 @@ function _G.MeshLoaderUI.init(ctx)
                     local btnW = math.max(75, #mod.name * 7 + 20)
                     if inRect(modX, modY, btnW, 26) then
                         if not mod.isSelf then
-                            saveGlobalBoothState()
-                            setPresetInputActive(false)
-                            _G.MeshLoaderActiveBoothChip = mod.id
-                            setBoothState(false, true)
-                            pcall(function()
-                                file.write("mesh_presets/active_booth.txt", mod.id .. ":" .. mod.name .. ":" .. tostring(timer.realtime()))
-                            end)
+                            switchBooth(mod)
                             return
                         end
                     end
@@ -3693,9 +3441,6 @@ function _G.MeshLoaderUI.init(ctx)
                 local closeX = scrW - closeW - 24
                 if inRect(closeX, rBtnY, closeW, rBtnH) then
                     setBoothState(false)
-                    pcall(function()
-                        file.write("mesh_presets/active_booth.txt", "0:CLOSED:" .. tostring(timer.realtime()))
-                    end)
                     return
                 end
                 
@@ -3751,9 +3496,6 @@ function _G.MeshLoaderUI.init(ctx)
                 -- Close Button [ X ]
                 if inRect(winX + winW - 40, winY + 8, 30, 30) then
                     setBoothState(false)
-                    pcall(function()
-                        file.write("mesh_presets/active_booth.txt", "0:CLOSED:" .. tostring(timer.realtime()))
-                    end)
                     return
                 end
                 
@@ -3786,13 +3528,7 @@ function _G.MeshLoaderUI.init(ctx)
                         local btnW = math.max(90, #mod.name * 8 + 24)
                         if inRect(modX, navY, btnW, 26) then
                             if not mod.isSelf then
-                                saveGlobalBoothState()
-                                setPresetInputActive(false)
-                                _G.MeshLoaderActiveBoothChip = mod.id
-                                setBoothState(false, true)
-                                pcall(function()
-                                    file.write("mesh_presets/active_booth.txt", mod.id .. ":" .. mod.name .. ":" .. tostring(timer.realtime()))
-                                end)
+                                switchBooth(mod)
                                 return
                             end
                         end
@@ -4998,95 +4734,24 @@ RimLightExp = %d,
         end
     end)
 
-    local lastBoothToggleTime = 0
     toggleBooth = function(targetArg)
-        if activeConfig.EnableBooth == false or activeConfig.enableBooth == false or isBoothEnabled == false then return end
-        
-        local now = timer.realtime()
-        if now - lastBoothToggleTime < 0.25 then return end
-        lastBoothToggleTime = now
-        
-        if _G.MeshLoaderBoothOpen and (isBoothActiveOnMe or _G.MeshLoaderActiveBoothChip == currentChipId) then
-            _G.MeshLoaderBoothOpen = false
-            _G.MeshLoaderActiveBoothChip = nil
-            pcall(function()
-                file.write("mesh_presets/active_booth.txt", "0:CLOSED:" .. tostring(now))
-            end)
-            setBoothState(false, false)
-            pcall(function() input.enableCursor(false) end)
-            pcall(function() input.lockControls(false) end)
-            return true
-        end
-        
-        local priorOpenChipId = 0
-        local lastWriteTime = 0
-        pcall(function()
-            if file.exists("mesh_presets/active_booth.txt") then
-                local raw = file.read("mesh_presets/active_booth.txt")
-                if raw and raw ~= "" then
-                    local colon = raw:find(":")
-                    if colon then
-                        local tId = tonumber(raw:sub(1, colon - 1))
-                        local rest = raw:sub(colon + 1)
-                        local colon2 = rest:find(":")
-                        local tName = colon2 and rest:sub(1, colon2 - 1) or rest
-                        local tTime = colon2 and tonumber(rest:sub(colon2 + 1)) or 0
-                        if tName ~= "CLOSED" and tId and tId > 0 then
-                            priorOpenChipId = tId
-                            lastWriteTime = tTime or 0
-                        end
-                    end
-                end
-            end
-        end)
-        
-        if priorOpenChipId > 0 and (now - lastWriteTime > 0.25) then
-            _G.MeshLoaderBoothOpen = false
-            _G.MeshLoaderActiveBoothChip = nil
-            pcall(function()
-                file.write("mesh_presets/active_booth.txt", "0:CLOSED:" .. tostring(now))
-            end)
-            setBoothState(false, false)
-            pcall(function() input.enableCursor(false) end)
-            pcall(function() input.lockControls(false) end)
-            return true
-        end
-        
-        if priorOpenChipId > 0 and (now - lastWriteTime <= 0.25) then
-            return true
-        end
-        
-        local myNameLower = (activeConfig.meshName or "module"):lower()
-        local argLower = (targetArg or ""):lower():match("^%s*(.-)%s*$") or ""
-        
-        if argLower ~= "" then
-            if myNameLower:find(argLower, 1, true) then
-                pcall(function()
-                    file.write("mesh_presets/active_booth.txt", currentChipId .. ":" .. myModuleName .. ":" .. tostring(now))
-                end)
-                setBoothState(true)
-                focusWorkshopCamera("overview", nil, true)
-            end
-        else
-            if scanDiskForModules then scanDiskForModules() end
-            local isPrimary = true
-            local allMods = getDiscoveredModules()
-            for _, m in ipairs(allMods) do
-                if m.id < currentChipId then
-                    isPrimary = false
-                    break
-                end
-            end
-            
-            if isPrimary then
-                pcall(function()
-                    file.write("mesh_presets/active_booth.txt", currentChipId .. ":" .. myModuleName .. ":" .. tostring(now))
-                end)
-                setBoothState(true)
-                focusWorkshopCamera("overview", nil, true)
+        if player() ~= owner() or not isBoothEnabled then return end
+        local query = (targetArg or ""):lower():match("^%s*(.-)%s*$")
+        cachedDiscoveredMods = nil
+        local modules = getDiscoveredModules()
+        local active = hook.runRemote(nil, "MeshLoader.BoothActive")
+        for _, mod in ipairs(modules) do
+            if active[1] and active[1][1] == mod.ent and query == "" then
+                hook.runRemote(mod.ent, "MeshLoader.BoothToggle")
+                return true
             end
         end
-        return true
+        for _, mod in ipairs(modules) do
+            if mod.name:lower():find(query, 1, true) then
+                hook.runRemote(mod.ent, "MeshLoader.BoothToggle")
+                return true
+            end
+        end
     end
 
     -- Unified Chat Trigger (Owner Only, Fast & Regex-Free)
