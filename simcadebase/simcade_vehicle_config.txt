@@ -10,8 +10,8 @@ local CONFIG = {}
 CONFIG.SCHEMA_VERSION = 1
 
 CONFIG.CORE_UPDATE = {
-    enabled = false,
-    baseURL = "", -- HTTPS directory containing latest.txt from build_release.py
+    enabled = true,
+    baseURL = "https://raw.githubusercontent.com/nokillnando/Starfall/main/simcadebase/releases", -- The loader appends /latest.txt
     format = "bundle", -- "bundle" or "source"
 }
 
