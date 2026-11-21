@@ -1,0 +1,106 @@
+--@name Simcade Lights Addon
+--@shared
+
+return function(L, cfg)
+    if L.enabled == false then return nil end
+
+    local state = {
+        headlightMode = 0, -- 0 = Off, 1 = Low Beam, 2 = High Beam
+        holdStart = nil,
+        holdOffHandled = false,
+    }
+
+    local function bindHeadlights(ctx)
+        local defaultKey = (cfg.CONTROLS_CFG and cfg.CONTROLS_CFG.Headlights) or (KEY and KEY.H) or 18
+        ctx.bindKey("Headlights", defaultKey,
+            function(_c, _drv)
+                state.holdStart = timer.curtime and timer.curtime() or 0
+                state.holdOffHandled = false
+            end,
+            function(c, drv)
+                if state.holdStart and not state.holdOffHandled then
+                    if state.headlightMode == 0 then
+                        state.headlightMode = 1
+                    else
+                        state.headlightMode = (state.headlightMode == 1) and 2 or 1
+                    end
+                    local msg = (state.headlightMode == 1) and "Headlights: Low Beam" or "Headlights: High Beam"
+                    if c.notifyDriver and isValid(drv) then c.notifyDriver(drv, msg) end
+                end
+                state.holdStart = nil
+                state.holdOffHandled = false
+            end
+        )
+    end
+
+    return {
+        name = "SimcadeLights",
+        OnClientInit = bindHeadlights,
+        OnInit = function(ctx)
+            bindHeadlights(ctx)
+            ctx.addWireOutput("HeadlightsOn", "Number")
+            ctx.addWireOutput("LowBeam", "Number")
+            ctx.addWireOutput("LowBeamFOV", "Number")
+            ctx.addWireOutput("LowBeamBrightness", "Number")
+            ctx.addWireOutput("HighBeam", "Number")
+            ctx.addWireOutput("HighBeamFOV", "Number")
+            ctx.addWireOutput("HighBeamBrightness", "Number")
+            ctx.addWireOutput("HeadlightFOV", "Number")
+            ctx.addWireOutput("HeadlightBrightness", "Number")
+            ctx.addWireOutput("HeadlightColor", "Vector")
+            ctx.addWireOutput("ReverseLight", "Number")
+            ctx.addWireOutput("ReverseLightColor", "Vector")
+            ctx.addWireOutput("BrakeLight", "Number")
+            ctx.addWireOutput("BrakeLightColor", "Vector")
+        end,
+        OnPostPhysics = function(ctx, _dt, out)
+            if state.holdStart and not state.holdOffHandled then
+                local now = timer.curtime and timer.curtime() or 0
+                if (now - state.holdStart) >= (L.HoldOffTime or 0.40) then
+                    state.headlightMode = 0
+                    state.holdOffHandled = true
+                    if ctx.notifyDriver and isValid(ctx.driver) then
+                        ctx.notifyDriver(ctx.driver, "Headlights: OFF")
+                    end
+                end
+            end
+
+            local mode = state.headlightMode
+            local on = mode > 0
+            local sep = (L.SeparateBulbs ~= false)
+            local excl = (L.ExclusiveLowHigh == true)
+
+            local lowOn = (mode == 1) or (mode == 2 and (not sep or not excl))
+            local highOn = (mode == 2)
+
+            local lowFov  = L.LowBeamFov or 65
+            local lowBri  = L.LowBeamBrightness or 1
+            local highFov = L.HighBeamFov or 80
+            local highBri = L.HighBeamBrightness or 2
+
+            local fov = highOn and highFov or (lowOn and lowFov or 0)
+            local bri = highOn and highBri or (lowOn and lowBri or 0)
+            local col = on and (L.WireLColor or Vector(255, 255, 255)) or Vector(0, 0, 0)
+
+            ctx.setWireOutput("HeadlightsOn", on and 1 or 0)
+            ctx.setWireOutput("LowBeam", lowOn and 1 or 0)
+            ctx.setWireOutput("LowBeamFOV", lowOn and lowFov or 0)
+            ctx.setWireOutput("LowBeamBrightness", lowOn and lowBri or 0)
+            ctx.setWireOutput("HighBeam", highOn and 1 or 0)
+            ctx.setWireOutput("HighBeamFOV", highOn and highFov or 0)
+            ctx.setWireOutput("HighBeamBrightness", highOn and highBri or 0)
+            ctx.setWireOutput("HeadlightFOV", fov)
+            ctx.setWireOutput("HeadlightBrightness", bri)
+            ctx.setWireOutput("HeadlightColor", col)
+
+            local st = ctx.state or {}
+            local isRev = (out and out.gearShown == 0) or st.reversing or false
+            local isBrk = (not isRev) and ((st.brake or 0) > 0.05)
+
+            ctx.setWireOutput("ReverseLight", isRev and 1 or 0)
+            ctx.setWireOutput("ReverseLightColor", isRev and (L.ReverseWireLightColor or Vector(255, 255, 255)) or Vector(0, 0, 0))
+            ctx.setWireOutput("BrakeLight", isBrk and 1 or 0)
+            ctx.setWireOutput("BrakeLightColor", isBrk and (L.BrakeWireLightColor or Vector(255, 0, 0)) or Vector(0, 0, 0))
+        end,
+    }
+end

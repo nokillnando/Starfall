@@ -1,0 +1,69 @@
+--@name Simcade Controls & Input Module
+--@shared
+
+SimcadeControls = SimcadeControls or {}
+
+local clamp = math.clamp or function(v, a, b) return v < a and a or (v > b and b or v) end
+
+-- Poll driver/wire controls: W = half throttle (0.5), W+Shift = full throttle (1.0)
+function SimcadeControls.pollInputs(Driver, hasDriver, wireInputs, physicsCar, prevState, controlsCfg)
+    controlsCfg = controlsCfg or {}
+    local kFullThr  = controlsCfg.FullThrottle or IN_KEY.SPEED
+    local kHbk      = controlsCfg.Handbrake    or IN_KEY.JUMP
+    local kClutch   = controlsCfg.Clutch       or IN_KEY.WALK
+    local kGearUp   = controlsCfg.GearUp       or IN_KEY.ATTACK
+    local kGearDown = controlsCfg.GearDown     or IN_KEY.ATTACK2
+
+    local wKey, sKey, aKey, dKey, spaceKey, shiftKey, altKey, rKey, fKey = 0, 0, 0, 0, 0, 0, 0, 0, 0
+    local m1Key, m2Key = 0, 0
+
+    if hasDriver and isValid(Driver) then
+        wKey     = Driver:keyDown(IN_KEY.FORWARD)   and 1 or 0
+        sKey     = Driver:keyDown(IN_KEY.BACK)      and 1 or 0
+        aKey     = Driver:keyDown(IN_KEY.MOVELEFT)  and 1 or 0
+        dKey     = Driver:keyDown(IN_KEY.MOVERIGHT) and 1 or 0
+        spaceKey = Driver:keyDown(kHbk)             and 1 or 0
+        shiftKey = Driver:keyDown(kFullThr)         and 1 or 0
+        altKey   = Driver:keyDown(kClutch)          and 1 or 0
+        rKey     = Driver:keyDown(IN_KEY.RELOAD)    and 1 or 0
+        fKey     = (IN_KEY and IN_KEY.FLASHLIGHT and Driver:keyDown(IN_KEY.FLASHLIGHT)) and 1 or 0
+        m1Key    = Driver:keyDown(kGearUp)          and 1 or 0
+        m2Key    = Driver:keyDown(kGearDown)        and 1 or 0
+    end
+
+    local isActive = (wireInputs and wireInputs.Active and wireInputs.Active > 0) or hasDriver
+    local driverThrottle = (wKey == 1) and ((shiftKey == 1) and 1.0 or 0.5) or 0
+    local driverReverseThrottle = (sKey == 1) and ((shiftKey == 1) and 1.0 or 0.5) or 0
+    local rawThrottle = (wireInputs and wireInputs.EngineThrottle and wireInputs.EngineThrottle > 0) and wireInputs.EngineThrottle or driverThrottle
+    local rawReverseThrottle = (wireInputs and wireInputs.EngineBrake and wireInputs.EngineBrake > 0) and wireInputs.EngineBrake or driverReverseThrottle
+    local halfThrottleActive = (wKey == 1 and shiftKey ~= 1)
+    local reverseHalfThrottleActive = (sKey == 1 and shiftKey ~= 1)
+
+    local rawBrake     = (wireInputs and wireInputs.EngineBrake and wireInputs.EngineBrake > 0) and wireInputs.EngineBrake or sKey
+    local rawHandbrake = (wireInputs and wireInputs.Handbrake and wireInputs.Handbrake > 0) and wireInputs.Handbrake or spaceKey
+    local clutchDown   = ((wireInputs and wireInputs.Clutch and wireInputs.Clutch > 0.5) or (altKey == 1))
+    local gearUpIn     = ((wireInputs and wireInputs.GearUp and wireInputs.GearUp > 0) or (m1Key == 1))
+    local gearDownIn   = ((wireInputs and wireInputs.GearDown and wireInputs.GearDown > 0) or (m2Key == 1))
+
+    if physicsCar then
+        if gearUpIn and not prevState.gearUp then physicsCar:shiftKey(true) end
+        if gearDownIn and not prevState.gearDown then physicsCar:shiftKey(false) end
+    end
+    prevState.gearUp   = gearUpIn
+    prevState.gearDown = gearDownIn
+
+    return {
+        wKey = wKey, sKey = sKey, aKey = aKey, dKey = dKey,
+        spaceKey = spaceKey, shiftKey = shiftKey, altKey = altKey, rKey = rKey, fKey = fKey,
+        isActive = isActive,
+        rawThrottle = clamp(rawThrottle, 0, 1),
+        rawReverseThrottle = clamp(rawReverseThrottle, 0, 1),
+        halfThrottleActive = halfThrottleActive,
+        reverseHalfThrottleActive = reverseHalfThrottleActive,
+        rawBrake = clamp(rawBrake, 0, 1),
+        rawHandbrake = clamp(rawHandbrake, 0, 1),
+        clutchDown = clutchDown,
+        steerTarget = aKey - dKey,
+    }
+end
+

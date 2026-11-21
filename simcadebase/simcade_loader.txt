@@ -1,0 +1,305 @@
+--@name Simcade Core Loader
+--@shared
+--@include simcadebase/simcade_engine.txt
+--@include simcadebase/simcade_aero.txt
+--@include simcadebase/simcade_tires.txt
+--@include simcadebase/simcade_gearbox.txt
+--@include simcadebase/simcade_suspension.txt
+--@include simcadebase/simcade_controls.txt
+--@include simcadebase/simcade_camera.txt
+--@include simcadebase/simcade_sounds.txt
+--@include simcadebase/simcade_skidmarks.txt
+--@include simcadebase/simcade_effects.txt
+--@include simcadebase/simcade_hud.txt
+--@include simcadebase/simcade_wire.txt
+--@include simcadebase/simcade_addons.txt
+--@include simcadebase/simcade_braking.txt
+--@include simcadebase/simcade_steering.txt
+--@include simcadebase/simcade_vehicle_builder.txt
+--@include simcadebase/simcade_vehicle_physics.txt
+--@include simcadebase/simcade_core.txt
+--@include simcadebase/simcade_prediction.txt
+
+-- Updated automatically when build_release.py builds to simcadebase/releases.
+local LOCAL_REVISION = 2
+-- Bump when the cores require a new setting or change an existing setting's meaning.
+-- Optional settings with backwards-compatible defaults can keep the same schema.
+local LOCAL_CONFIG_SCHEMA = 1
+local modules = {
+    "simcadebase/simcade_engine.txt",
+    "simcadebase/simcade_aero.txt",
+    "simcadebase/simcade_tires.txt",
+    "simcadebase/simcade_gearbox.txt",
+    "simcadebase/simcade_suspension.txt",
+    "simcadebase/simcade_controls.txt",
+    "simcadebase/simcade_camera.txt",
+    "simcadebase/simcade_sounds.txt",
+    "simcadebase/simcade_skidmarks.txt",
+    "simcadebase/simcade_effects.txt",
+    "simcadebase/simcade_hud.txt",
+    "simcadebase/simcade_wire.txt",
+    "simcadebase/simcade_addons.txt",
+    "simcadebase/simcade_braking.txt",
+    "simcadebase/simcade_steering.txt",
+    "simcadebase/simcade_vehicle_builder.txt",
+    "simcadebase/simcade_vehicle_physics.txt",
+    "simcadebase/simcade_core.txt",
+    "simcadebase/simcade_prediction.txt",
+}
+local bundledAddons = {
+    "simcadebase/addons/lights.txt",
+    "simcadebase/addons/brake_temperature.txt",
+    "simcadebase/addons/backfire_antilag.txt",
+}
+
+-- Each record contains a decimal byte count, a newline and the exact source.
+-- Compile every module before installing any hooks or starting vehicle physics.
+local MAX_BYTES = 4 * 1024 * 1024
+local function parsePositiveInteger(value)
+    if not value or #value > 9 or value:find("[^0-9]") then return end
+    local number = tonumber(value)
+    if number and number > 0 then return number end
+end
+
+local function validDigest(value)
+    return value and #value == 64 and not value:find("[^0-9a-f]")
+end
+
+local function compileBundle(data, includesAddons, ready, fail)
+    if type(data) ~= "string" or #data > MAX_BYTES then return fail("Invalid package size") end
+    local compiled, pos, index = {}, 1, 1
+    local function compileNext()
+        local path = modules[index] or (includesAddons and bundledAddons[index - #modules])
+        if not path then
+            if pos ~= #data + 1 then return fail("Unexpected modules in package") end
+            return ready(compiled)
+        end
+        local stop = data:find("\n", pos, true)
+        if not stop or stop - pos > 7 then return fail("Invalid module header") end
+        local size = tonumber(data:sub(pos, stop - 1):match("^%d+$") or "")
+        if not size or size < 1 or stop + size > #data then return fail("Incomplete " .. path) end
+        local source = data:sub(stop + 1, stop + size)
+        if path == "simcadebase/simcade_addons.txt" then
+            source = "local require = ...\n" .. source
+        end
+        local fn, err = loadstring(source, path)
+        if not fn then return fail(tostring(err)) end
+        compiled[path], pos, index = fn, stop + size + 1, index + 1
+        timer.simple(0, compileNext)
+    end
+    compileNext()
+end
+
+local function boot(config, localBundle)
+    local schema = config.SCHEMA_VERSION
+    if schema == nil then schema = 1 end -- Original vehicle configs predate versioning.
+    if type(schema) ~= "number" or schema < 1 or schema > 999999999 or schema ~= math.floor(schema) then
+        if SERVER then print("[Simcade] Vehicle stopped. CONFIG.SCHEMA_VERSION must be a positive integer of at most nine digits.") end
+        return
+    end
+    local loadedAddons = {}
+    local function requireAddon(path)
+        local addon = localBundle and localBundle[path]
+        if not addon then return require(path) end
+        if loadedAddons[path] == nil then loadedAddons[path] = addon() end
+        return loadedAddons[path]
+    end
+    local function start(compiled)
+        for _, path in ipairs(modules) do
+            if compiled then compiled[path](requireAddon) else dofile(path) end
+        end
+        SimcadeCore.init(config)
+    end
+
+    local function startLocal(reason)
+        if schema ~= LOCAL_CONFIG_SCHEMA then
+            if SERVER then
+                print("[Simcade] " .. reason .. " Vehicle stopped. Local core r" .. LOCAL_REVISION
+                    .. " requires config v" .. LOCAL_CONFIG_SCHEMA .. ", this vehicle uses v" .. schema .. ".")
+            end
+            return
+        end
+        start(localBundle)
+        if SERVER then print("[Simcade] Running local core r" .. LOCAL_REVISION .. " with config v" .. schema .. ". " .. reason) end
+    end
+
+    local opt = config.CORE_UPDATE or {}
+    if not opt.enabled then
+        return startLocal("Auto-update is off.")
+    end
+    local request, reply = "simcade_core_request", "simcade_core_reply"
+    if CLIENT then
+        local busy, started = false, false
+        net.receive(reply, function()
+            if started or busy then return end
+            if not net.readBool() then
+                started = true
+                timer.remove(request)
+                return startLocal("")
+            end
+            busy = true
+            local ok = pcall(net.readStream, function(data)
+                if not data then busy = false return end -- Retry an interrupted stream.
+                compileBundle(data, false, function(compiled)
+                    started = true
+                    timer.remove(request)
+                    start(compiled)
+                end, error)
+            end)
+            if not ok then busy = false end
+        end)
+        timer.create(request, 2, 0, function()
+            if busy or started then return end
+            net.start(request)
+            if net.getBytesLeft() < 0 then return net.abort() end
+            net.send()
+        end)
+        return
+    end
+
+    local selected, package
+    local lastSent = setmetatable({}, {__mode = "k"})
+    net.receive(request, function(_, ply)
+        if not selected or (lastSent[ply] or -10) + 3 > timer.curtime() then return end
+        if package and not net.canWriteStream() then return end
+        net.start(reply)
+        net.writeBool(package ~= nil)
+        if package then net.writeStream(package, false) end
+        if net.getBytesLeft() < 0 then return net.abort() end
+        net.send(ply)
+        lastSent[ply] = timer.curtime()
+    end)
+
+    local timeout = "simcade_core_timeout"
+    local function useLocal(reason)
+        if selected then return end
+        selected = true
+        timer.remove(timeout)
+        startLocal(reason)
+    end
+
+    local base = (opt.baseURL or ""):gsub("/+$", "")
+    if not base:match("^https://[^/]+") then return useLocal("Set CORE_UPDATE.baseURL to a release directory") end
+    if opt.format ~= "source" and opt.format ~= "bundle" then return useLocal("Unknown release format") end
+    local function fetch(path, limit, accept, onMissing)
+        if selected then return end
+        timer.create(timeout, 15, 1, function() useLocal("Timed out fetching " .. path) end)
+        local function send()
+            if selected then return end
+            if not http.canRequest() then return timer.simple(0.25, send) end
+            local ok, err = pcall(http.get, base .. "/" .. path, function(body, _, _, code)
+                if selected then return end
+                if code == 404 and onMissing then
+                    timer.remove(timeout)
+                    return onMissing()
+                end
+                if code ~= 200 or not body or #body > limit then return useLocal("Invalid response for " .. path) end
+                timer.remove(timeout)
+                local accepted, reason = pcall(accept, body)
+                if not accepted then
+                    if selected then error(reason) end
+                    useLocal("Could not process " .. path .. ". " .. tostring(reason))
+                end
+            end, function(reason)
+                useLocal("Could not fetch " .. path .. (reason and (". " .. tostring(reason)) or ""))
+            end)
+            if not ok then useLocal(tostring(err)) end
+        end
+        send()
+    end
+
+    print("[Simcade] Local core r" .. LOCAL_REVISION .. ", vehicle config v" .. schema .. ". Checking for updates...")
+    fetch("latest.txt", 128, function(body)
+        -- Starfall limits the number of repetition operators in a single pattern.
+        local fields = body:gmatch("%S+")
+        local revision, digest, required = fields(), fields(), fields()
+        local revisionNumber = parsePositiveInteger(revision)
+        if fields() or not revisionNumber or not validDigest(digest) then
+            return useLocal("Invalid release manifest")
+        end
+        if not required then
+            -- The original published r2 package used the v1 config before manifests declared it.
+            if revision == "2" and digest == "b63c6c0ce16d0eb47d698c59499dbd64166b88f2eb70db2c5d94a0e728a006fe" then
+                required = "1"
+            end
+        end
+        if revisionNumber == LOCAL_REVISION then return useLocal("Up to date.") end
+        if revisionNumber < LOCAL_REVISION then return useLocal("Release host is on r" .. revision .. ".") end
+        local requiredSchema = parsePositiveInteger(required)
+        if not requiredSchema then
+            return useLocal("Skipped r" .. revision .. ". Its manifest has no valid config version.")
+        end
+        if requiredSchema ~= schema then
+            return useLocal("Skipped r" .. revision .. ". It requires config v" .. required .. ", this vehicle uses v" .. schema .. ".")
+        end
+        print("[Simcade] New core r" .. revision .. " available. Downloading " .. opt.format)
+        local function activate(data, detail)
+            if bit.sha256(data) ~= digest then return useLocal("Release checksum mismatch") end
+            compileBundle(data, false, function(compiled)
+                selected, package = true, data
+                start(compiled)
+                print("[Simcade] Running downloaded core r" .. revision .. " with config v" .. schema .. ". " .. detail)
+            end, useLocal)
+        end
+        local function fetchBundle()
+            fetch(revision .. "/core.bin", MAX_BYTES, function(data) activate(data, "Bundle loaded.") end)
+        end
+        if opt.format == "bundle" then return fetchBundle() end
+
+        local function fetchSources(hashes)
+            local records, total, downloaded = {}, 0, 0
+            local function fetchModule(i)
+                local path = modules[i]
+                if not path then
+                    return activate(table.concat(records), "Reused " .. (#modules - downloaded) .. " local files, downloaded " .. downloaded .. ".")
+                end
+                local function append(source)
+                    local record = tostring(#source) .. "\n" .. source
+                    total = total + #record
+                    if total > MAX_BYTES then return useLocal("Release exceeds size limit") end
+                    records[i] = record
+                    timer.simple(0, function() fetchModule(i + 1) end)
+                end
+                local hash = hashes and hashes[i]
+                local localSource = hash and getScript(path)
+                if localSource then
+                    localSource = localSource:gsub("\r\n", "\n")
+                    if bit.sha256(localSource) == hash then return append(localSource) end
+                end
+                local url = hash and ("source/" .. hash .. ".txt") or (revision .. "/" .. path)
+                local missing = not hashes and i == 1 and fetchBundle or nil
+                fetch(url, MAX_BYTES - total, function(source)
+                    if hash and bit.sha256(source) ~= hash then return useLocal("Checksum mismatch for " .. path) end
+                    downloaded = downloaded + 1
+                    append(source)
+                end, missing)
+            end
+            fetchModule(1)
+        end
+        fetch(revision .. "/sources.txt", #modules * 120, function(index)
+            local tokens = index:gmatch("%S+")
+            local hashes = {}
+            for i, path in ipairs(modules) do
+                local indexedPath, hash = tokens(), tokens()
+                if indexedPath ~= path or not validDigest(hash) then return useLocal("Invalid source index") end
+                hashes[i] = hash
+            end
+            if tokens() then return useLocal("Unexpected files in source index") end
+            fetchSources(hashes)
+        end, function()
+            -- Older hosts publish either a numbered source directory or a bundle.
+            fetchSources()
+        end)
+    end)
+end
+
+return function(config, bundlePath)
+    if not bundlePath then return boot(config) end
+    local data = getScript(bundlePath)
+    if data then data = data:gsub("\r\n", "\n") end
+    compileBundle(data, true, function(compiled)
+        boot(config, compiled)
+    end, function(reason)
+        if SERVER then print("[Simcade] Vehicle stopped. Offline bundle could not load. " .. reason) end
+    end)
+end
