@@ -1457,8 +1457,6 @@ function SimcadeCore.init(CONFIG)
                 local airStr = VEHICLE_CFG.airControlStrength or Vector(85, 75, 55)
                 deltaAngVel = deltaAngVel + Vector((dKey - aKey) * airStr.x * dt, (wKey - sKey) * airStr.y * dt, 0)
             end
-            Phys:addAngleVelocity(deltaAngVel)
-
             local inPark = physicsCar.classicAuto and not physicsCar.manualBox and physicsCar.autoRange == 0
             local canHold = groundedCount >= 2 and (inPark or rawThrottle < 0.05) and (physicsCar.drv.thr or 0) < 0.05
             local supportedLoad, brakedLoad = 0, 0
@@ -1467,13 +1465,27 @@ function SimcadeCore.init(CONFIG)
                 supportedLoad = supportedLoad + w.normalLoad
                 brakedLoad = brakedLoad + w.normalLoad * w.holdBrake
             end
+            local restImpulse, restYawImpulse = Vector(), 0
+            local yawOrigin = comWorld + driverFwd * ((physicsCar.comShiftX_m or 0) * M_TO_IN)
             for _, w in ipairs(runtimeWheels) do
                 local massShare = physMass * w.normalLoad / math.max(0.001, supportedLoad)
                 local brakeShare = physMass * w.normalLoad * (w.holdBrake or 0) / math.max(0.001, brakedLoad)
-                SimcadeSuspension.applyStaticGrip(Phys, w, physicsCar.wheels[w.physicsIndex],
+                local impulse, point = SimcadeSuspension.staticGripImpulse(w, physicsCar.wheels[w.physicsIndex],
                     canHold, w.holdBrake or 0, driverFwd, driverLeft, comWorld, velWorld, angVelWorldRad,
                     massShare, brakeShare, vphysScale, gravity, dt, Base)
+                if impulse then
+                    restImpulse = restImpulse + impulse
+                    restYawImpulse = restYawImpulse + (point - yawOrigin):cross(impulse):dot(driverUp) * IN_TO_M
+                end
             end
+            -- Dynamic tire forces use a center impulse and the solver's yaw inertia.
+            -- Replace them through the same paths when a contact settles.
+            if restImpulse:getLengthSqr() > 0 then
+                Phys:applyForceCenter(restImpulse * (1000 * M_TO_IN * vphysScale))
+            end
+            local inverseInertia = physicsCar.mode344 ~= 0 and physicsCar.Iinv2 or physicsCar.Iinv
+            deltaAngVel = deltaAngVel + resolvedLocalUp * math.deg(restYawImpulse * inverseInertia[2])
+            Phys:addAngleVelocity(deltaAngVel)
 
             local waterLvl = (Base.getWaterLevel and Base:getWaterLevel()) or (Base.waterLevel and Base:waterLevel()) or 0
             local wheelWaterFrac = waterWheelsCount / numWheels

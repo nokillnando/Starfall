@@ -146,7 +146,7 @@ end
 
 -- Tangential contact impulses in Source units. Store anchors on the support so a
 -- stationary tire can ride a moving prop. Forces at the patches also resist yaw.
-function SimcadeSuspension.applyStaticGrip(phys, w, tire, canPark, brake, forward, left, com, vel, omega, mass, brakeMass, scale, gravity, dt, base)
+function SimcadeSuspension.staticGripImpulse(w, tire, canPark, brake, forward, left, com, vel, omega, mass, brakeMass, scale, gravity, dt, base)
     if not w.isGrounded or w.normalLoad <= 0 or not tire or (tire.load or 0) <= 0 then
         w.restAnchor = nil
         return
@@ -161,7 +161,7 @@ function SimcadeSuspension.applyStaticGrip(phys, w, tire, canPark, brake, forwar
     local anchor = anchored and (supportValid and support:localToWorld(w.restAnchor) or w.restAnchor) or patch
     local supportVel = supportValid and support:getVelocity() or Vector()
     if anchored and supportValid then supportVel = (anchor - w.lastRestWorld) / dt end
-    local velocity = vel + omega:cross(patch - com) - supportVel
+    local velocity = vel + omega:cross(tracked - com) - supportVel
     velocity = velocity - n * velocity:dot(n)
     local heading = forward * (tire.axleY or 1) - left * (tire.axleX or 0)
     local lateral = n:cross(heading):getNormalized()
@@ -170,8 +170,9 @@ function SimcadeSuspension.applyStaticGrip(phys, w, tire, canPark, brake, forwar
     -- A patch can catch a small slide if its remaining friction impulse can
     -- arrest the slip over roughly one tire contact length.
     local knImpulse = 1000 * scale * dt / 0.0254
-    local fx = tire.Fx or 0
-    local fy = tire.Fy or 0
+    -- Replace the dynamic impulse already delivered over the whole tick.
+    local fx = tire.tickFx or 0
+    local fy = tire.tickFy or 0
     local peakX, peakY = tire.peakLongKN or 0, tire.peakLatKN or 0
     if peakX <= 0 or peakY <= 0 then
         w.restAnchor = nil
@@ -220,7 +221,6 @@ function SimcadeSuspension.applyStaticGrip(phys, w, tire, canPark, brake, forwar
     local requestedY = demand:dot(lateral) / knImpulse
     local targetY = clamp(requestedY, -sideLimit, sideLimit)
     local correction = rolling * (targetX - fx) + lateral * (targetY - fy)
-    phys:applyForceOffset(correction * (adhesion * knImpulse), patch)
 
     if adhesion > 0 and math.abs(requestedY) <= sideLimit
         and (not parked or math.abs(requestedX) <= peakX * brake) then
@@ -230,6 +230,7 @@ function SimcadeSuspension.applyStaticGrip(phys, w, tire, canPark, brake, forwar
     else
         w.restAnchor = nil
     end
+    return correction * (adhesion * dt), tracked -- kN s, world-space point in Source units
 end
 
 -- Sweep the leading tread and sidewall independently. A glancing scrape can

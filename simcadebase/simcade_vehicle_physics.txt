@@ -1219,7 +1219,8 @@ function Chassis:solve()
     M, m = W3.M, W3.su.mount
     local a3, b3, c3, d3, p3, q3, y3, r3, I3, free3 = M[0], M[1], M[2], M[3], m[0], m[1], W3.Fy, W3.radius, W3.I, W3.contact ~= 0 and W3.sliding == 0 and W3.locked == 0
     local d, c, E = self.dt, self.c, self.eng
-    local lock = d.state == 3
+    -- Gear selection can persist while the automatic clutch is open at a stop.
+    local lock = d.state == 3 and (self.simClutch or 0) < 1
     local c127, v7 = c[127], nil
     if lock then
         v7 = 1 / c127
@@ -1461,7 +1462,7 @@ function Chassis:afterSolve()
     if self._vphysMode and d.gear ~= 1 and self.grounded > 0 then
         local dw = self:shaftW() - E.w
         local lim = abs(self:torque())
-        if d.state == 3 then
+        if d.state == 3 and (self.simClutch or 0) < 1 then
             E.tload = E.tload + clamp(dw * self.c[113] * 0.65, -lim, lim)
         end
         if E.T > 0.1 then
@@ -2361,7 +2362,6 @@ local function initializeVehiclePhysicsBridge(PhysicsApi)
         local n = min(maxSub, max(1, math.ceil(dt / 0.010)))
         local h = dt / n
         self.substepDt = h
-        self:forces()
 
         -- 5. Record start-of-substeps rigid-body velocities & run bounded substeps (2 max by default)
         local vx0, vy0, vz0 = self.v[0], self.v[1], self.v[2]
@@ -2373,7 +2373,9 @@ local function initializeVehiclePhysicsBridge(PhysicsApi)
 
 
         for i = 0, 3 do
-            self.wheels[i].absActiveTick = false
+            local W = self.wheels[i]
+            W.absActiveTick = false
+            W.tickFx, W.tickFy = 0, 0
         end
 
         -- Red Fox Engine Master Clutch Control (0 = engaged/driving, 1 = disengaged)
@@ -2422,7 +2424,14 @@ local function initializeVehiclePhysicsBridge(PhysicsApi)
         self.simClutch = clamp(simClutch, 0, 1)
 
         self:computeActiveDiff(controls)
+        self:forces()
         for _ = 1, n do
+            -- integrate consumes these forces, then solves new ones for the next substep.
+            for i = 0, 3 do
+                local W = self.wheels[i]
+                W.tickFx = W.tickFx + W.Fx / n
+                W.tickFy = W.tickFy + W.Fy / n
+            end
             self:integrate(h)
             self.now = self.now + h
             self:orthonormalize()
