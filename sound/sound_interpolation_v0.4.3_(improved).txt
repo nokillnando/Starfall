@@ -14,6 +14,9 @@ if SERVER then
 else
     local maxThrottle = 1 --For ACF engines, this is 100.
     local redline = 7000 --Redline of your engine.
+    local bassMinDist = 200 --Distance where BASS volume stays at 100%
+    local bassMaxDist = 1500 --Distance where BASS volume fades to 0%
+    local bassAnchorRadius = 950 --Overhead offset from listener (within setFade min=1000) to minimize BASS 3D Doppler
     -- local additionalCurveWidth = 0 -- Removed, as equal power crossfade handles blending directly
 
     --Define sound banks inside here, each bank is encompassed by { }
@@ -71,49 +74,52 @@ else
         local snd = {}
         onCreated = onCreated or function() end
         snd.web = string.find(path, "https://") and true or false
+        snd.lastVol = -1
 
         function snd:play()
-            if not snd.obj then return end
+            if not isValid(snd.obj) then return end
             snd.obj:play()
-
-            if snd.web then
-                hook.add("think", tostring(snd), function()
-                    snd.obj:setPos(ent:getPos())
-                end)
-            end
         end
 
         function snd:stop()
-            if not snd.obj then return end
+            if not isValid(snd.obj) then return end
 
             if snd.web then
                 snd.obj:pause()
                 snd.obj:setTime(0)
-                hook.remove("think", tostring(snd))
             else
                 snd.obj:stop()
             end
+            snd.lastVol = -1
         end
 
         function snd:isValid()
-            return snd.obj and true or false
+            return isValid(snd.obj)
+        end
+
+        function snd:setPos(pos)
+            if not snd.web or not isValid(snd.obj) then return end
+            snd.obj:setPos(pos)
         end
 
         function snd:setPitch(pitch)
-            if not snd.obj then return end
+            if not isValid(snd.obj) then return end
             pitch = pitch * (snd.web and 1 or 100)
             snd.obj:setPitch(pitch)
         end
 
         function snd:setVolume(volume)
-            if not snd.obj then return end
+            if not isValid(snd.obj) then return end
+            if volume == 0 and snd.lastVol == 0 then return end
+            snd.lastVol = volume
             snd.obj:setVolume(volume)
         end
 
         if snd.web then
             bass.loadURL(path, "3d noblock noplay", function(s)
-                if not s then return end
+                if not isValid(s) then return end
                 s:setLooping(true)
+                s:setFade(1000, 100000) --Keep BASS native attenuation flat within bassAnchorRadius; distance is handled manually
                 snd.obj = s
                 onCreated(snd)
             end)
@@ -128,6 +134,14 @@ else
     --Maps a value, X, from a range A-B, to a new range C-D
     local function map(x, a, b, c, d)
         return (x - a) / (b - a) * (d - c) + c
+    end
+
+    --Smooth distance attenuation for Semi-3D BASS sounds
+    local function getDistanceAttenuation(dist)
+        if dist <= bassMinDist then return 1 end
+        if dist >= bassMaxDist then return 0 end
+        local t = (dist - bassMinDist) / (bassMaxDist - bassMinDist)
+        return (1 - t) * (1 - t)
     end
 
     -- Original fade function removed, replaced by direct equal power crossfade logic
@@ -276,7 +290,7 @@ else
                 for _, snd in pairs(bank.soundObjects) do
                     snd:play()
                     snd:setVolume(0)
-                    snd:setPitch(0)
+                    snd:setPitch(1)
                 end
             end
         else
@@ -309,9 +323,19 @@ else
         smoothRPM = smoothRPM * (1 - 0.08) + engineRPM * 0.1
         smoothThrottle = smoothThrottle * (1 - 0.1) + throttle * 0.1
 
+        local listenerPos = eyePos()
+        local dt = timer.frametime()
+
         for _, bank in pairs(banks) do
             if not bank.sounds or table.count(bank.sounds) == 0 then continue end
-            if not bank.partEntity then continue end
+            if not isValid(bank.partEntity) then continue end
+
+            local entPos = bank.partEntity:getPos()
+            local dist = entPos:getDistance(listenerPos)
+            local distAtten = getDistanceAttenuation(dist)
+            -- Compensate 1-frame think-to-render lag when riding with the vehicle
+            local lead = dist < 400 and (bank.partEntity:getVelocity() * dt) or Vector()
+            local anchorPos = listenerPos + lead + Vector(0, 0, bassAnchorRadius)
 
             local currentRPM = smoothRPM
             local soundRpms = bank.soundRpms -- This is already sorted
@@ -334,25 +358,30 @@ else
                 end
             end
 
-            -- Ensure all sounds are initially zeroed out to prevent lingering volumes
+            -- Only zero out inactive sounds so active BASS channels don't get muted mid-frame
             for _, rpm_key in pairs(soundRpms) do
-                bank.soundObjects[rpm_key]:setVolume(0)
+                local snd = bank.soundObjects[rpm_key]
+                if snd ~= lowerSound and snd ~= upperSound then
+                    snd:setVolume(0)
+                end
             end
+
+            local baseVol = map(smoothThrottle, 0, maxThrottle, bank.offVolume, bank.onVolume)
 
             -- Handle edge cases and interpolation
             if lowerRPM and not upperRPM then -- currentRPM is above the highest defined RPM
-                -- Only the highest RPM sound plays
                 local soundObject = lowerSound
-                local vol = map(smoothThrottle, 0, maxThrottle, bank.offVolume, bank.onVolume)
+                local vol = baseVol * (soundObject.web and distAtten or 1)
                 local pitch = (currentRPM / lowerRPM)
+                soundObject:setPos(anchorPos)
                 soundObject:setVolume(vol)
                 soundObject:setPitch(pitch)
 
             elseif not lowerRPM and upperRPM then -- currentRPM is below the lowest defined RPM
-                -- Only the lowest RPM sound plays
                 local soundObject = upperSound
-                local vol = map(smoothThrottle, 0, maxThrottle, bank.offVolume, bank.onVolume)
+                local vol = baseVol * (soundObject.web and distAtten or 1)
                 local pitch = (currentRPM / upperRPM)
+                soundObject:setPos(anchorPos)
                 soundObject:setVolume(vol)
                 soundObject:setPitch(pitch)
 
@@ -364,9 +393,11 @@ else
                 local vol1_curve = math.cos(alpha * math.pi / 2) -- Volume for lower RPM sound
                 local vol2_curve = math.sin(alpha * math.pi / 2) -- Volume for upper RPM sound
 
-                local vol1 = vol1_curve * map(smoothThrottle, 0, maxThrottle, bank.offVolume, bank.onVolume)
-                local vol2 = vol2_curve * map(smoothThrottle, 0, maxThrottle, bank.offVolume, bank.onVolume)
+                local vol1 = vol1_curve * baseVol * (lowerSound.web and distAtten or 1)
+                local vol2 = vol2_curve * baseVol * (upperSound.web and distAtten or 1)
 
+                lowerSound:setPos(anchorPos)
+                upperSound:setPos(anchorPos)
                 lowerSound:setVolume(vol1)
                 upperSound:setVolume(vol2)
 

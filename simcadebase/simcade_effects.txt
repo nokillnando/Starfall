@@ -240,7 +240,7 @@ function SimcadeEffects.initClient(cfg)
         local anchorPos = nil
         for i = 1, #wheels do
             local w = wheels[i]
-            if w and w.grounded and (now - w.time) <= 0.25 and (w.skid >= fxThresh or w.rimSpeed >= 40) then
+            if w and w.grounded and (now - w.time) <= 0.40 and (w.skid >= fxThresh or w.rimSpeed >= 40) then
                 anchorPos = w.pos
                 break
             end
@@ -254,7 +254,7 @@ function SimcadeEffects.initClient(cfg)
         for i = 1, #wheels do
             if emitted >= maxPerBatch then break end
             local item = wheels[i]
-            if item and item.grounded and (now - item.time) <= 0.25 then
+            if item and item.grounded and (now - item.time) <= 0.40 then
                 local sCfg = resolveSurfaceCfg(item.matType)
                 if sCfg.enabled ~= false then
                     local skidLayer = sCfg.skid or (sCfg.path and sCfg) or ((not sCfg.roll) and DEFAULT_SKID_SMOKE) or nil

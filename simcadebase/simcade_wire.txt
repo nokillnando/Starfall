@@ -8,8 +8,8 @@ local solverSlotsInWireOrder = { 0, 1, 3, 2 } -- FL, FR, RL, RR
 local detailedWheelOutputs = false
 
 function SimcadeWire.initPorts(VEHICLE_CFG, WHEELS, extraInputs, extraOutputs)
-    local inNames = { "Pod", "Base", "ExtraFilterStatic", "ExtraFilterSemiDynamic" }
-    local inTypes = { "Entity", "Entity", "Array", "Array" }
+    local inNames = { "Pod", "Base", "EngineSound", "ExtraFilterStatic", "ExtraFilterSemiDynamic" }
+    local inTypes = { "Entity", "Entity", "Entity", "Array", "Array" }
 
     if VEHICLE_CFG and VEHICLE_CFG.enableExternalWireOverrides then
         local extNames = { "Active", "FrontWheels", "RearWheels", "EngineThrottle", "EngineBrake", "Handbrake", "Clutch", "GearUp", "GearDown", "Ignition", "TrailerMode" }

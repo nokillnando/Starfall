@@ -1,0 +1,481 @@
+--@name Simcade Skidmarks Module (Pooled 3D Quad Mesh Skidmarks)
+--@shared
+
+SimcadeSkidmarks = SimcadeSkidmarks or {}
+
+if SERVER then return end
+
+local clamp = math.clamp or function(v, a, b) return v < a and a or (v > b and b or v) end
+
+function SimcadeSkidmarks.initClient(cfg)
+    local SKID = cfg.SKID_CFG or {}
+    local TIRE = cfg.TIRE_CFG or {}
+    if TIRE.EnableSkidmarks == false or SKID.enabled == false then return end
+
+    local matCfg = SKID.MaterialConfig or {}
+    local surfacesCfg = SKID.Surfaces or {}
+
+    local Materials = {}
+    local MaterialUsesCustomTexture = {}
+
+    local function buildMaterialCacheKey(sCfg, axle)
+        local useModTexture = sCfg and sCfg.UseModTexture
+        if useModTexture == nil then
+            useModTexture = matCfg.UseModTexture
+        end
+        local shader = (sCfg and sCfg.Shader) or matCfg.Shader or "VertexLitGeneric"
+        local materialPath = (sCfg and sCfg.Material) or matCfg.Material or ""
+        local baseTexture
+        if axle == "front" then
+            baseTexture = (sCfg and sCfg.FrontTexture) or matCfg.FrontTexture or (sCfg and sCfg.Texture) or matCfg.Texture or SKID.Texture or "vgui/white"
+        elseif axle == "rear" then
+            baseTexture = (sCfg and sCfg.RearTexture) or matCfg.RearTexture or (sCfg and sCfg.Texture) or matCfg.Texture or SKID.Texture or "vgui/white"
+        else
+            baseTexture = (sCfg and sCfg.Texture) or matCfg.Texture or SKID.Texture or "vgui/white"
+        end
+        local alphaTest = tostring((sCfg and sCfg.AlphaTest) or matCfg.AlphaTest or false)
+        local alphaRef = tostring((sCfg and sCfg.AlphaTestReference) or matCfg.AlphaTestReference or "")
+        local scaleU = tostring((sCfg and sCfg.TextureScaleU) or matCfg.TextureScaleU or 1)
+        local scaleV = tostring((sCfg and sCfg.TextureScaleV) or matCfg.TextureScaleV or 1)
+        local tint = tostring((sCfg and sCfg.TintTexture) or matCfg.TintTexture or false)
+
+        return table.concat({
+            tostring(useModTexture),
+            axle or "generic",
+            shader,
+            materialPath,
+            baseTexture,
+            alphaTest,
+            alphaRef,
+            scaleU,
+            scaleV,
+            tint
+        }, "|"), baseTexture, materialPath, shader, useModTexture
+    end
+
+    local function loadMaterial(surfaceId, sCfg, axle)
+        local cacheKey, baseTexture, materialPath, shader, useModTexture = buildMaterialCacheKey(sCfg, axle)
+        if Materials[cacheKey] then
+            MaterialUsesCustomTexture[surfaceId] = MaterialUsesCustomTexture[cacheKey]
+            return Materials[cacheKey], cacheKey
+        end
+
+        if useModTexture == false and materialPath ~= "" then
+            local ok, m = pcall(function() return material.load(materialPath) end)
+            Materials[cacheKey] = ok and m or nil
+            MaterialUsesCustomTexture[cacheKey] = false
+            MaterialUsesCustomTexture[surfaceId] = false
+            return Materials[cacheKey], cacheKey
+        end
+
+        local okMat, mat = pcall(function() return material.create(shader) end)
+        if not okMat or not mat then return nil, cacheKey end
+
+        mat:setInt("$model", 1)
+        mat:setInt("$ignorez", 0)
+        mat:setInt("$vertexcolor", 1)
+        mat:setInt("$vertexalpha", 1)
+        mat:setInt("$translucent", 1)
+        local useAlphaTest = (sCfg and sCfg.AlphaTest) or matCfg.AlphaTest
+        mat:setInt("$alphatest", useAlphaTest and 1 or 0)
+        local alphaRef = (sCfg and sCfg.AlphaTestReference) or matCfg.AlphaTestReference
+        if alphaRef then
+            mat:setFloat("$alphatestreference", alphaRef)
+        end
+
+        if string.find(baseTexture, "https://", 1, true) or string.find(baseTexture, "http://", 1, true) then
+            if string.find(baseTexture, "github.com/", 1, true) then
+                baseTexture = string.gsub(baseTexture, "https://github.com/", "https://raw.githubusercontent.com/", 1)
+                baseTexture = string.gsub(baseTexture, "http://github.com/", "https://raw.githubusercontent.com/", 1)
+                baseTexture = string.gsub(baseTexture, "/blob/", "/", 1)
+                baseTexture = string.gsub(baseTexture, "/raw/", "/", 1)
+            end
+            mat:setTexture("$basetexture", "vgui/white")
+            local webMode = (sCfg and sCfg.WebLoadMode) or matCfg.WebLoadMode or "stream"
+            local function applyStreamURL()
+                if mat.setTextureURL then
+                    mat:setTextureURL("$basetexture", baseTexture, function(_, _, w, h, layout)
+                        if not w or not h then
+                            print("[SimcadeSkid] Failed to load texture URL: " .. baseTexture)
+                            return
+                        end
+                        local sx, sy = 1024 / w, 1024 / h
+                        layout(0, 0, w * sx, h * sy)
+                    end)
+                end
+            end
+            local canTemp = (webMode == "download") and http and http.get and file and file.writeTemp
+            if canTemp and hasPermission then
+                local okP, resP = pcall(hasPermission, "file.writeTemp")
+                if okP and not resP then canTemp = false end
+            end
+            if canTemp then
+                local ext = string.match(baseTexture, "%.([a-zA-Z0-9]+)%?") or string.match(baseTexture, "%.([a-zA-Z0-9]+)$") or "png"
+                local fname = "simcade_skid_" .. tostring(math.abs(#baseTexture * 131 + (string.byte(baseTexture, 1) or 1))) .. "." .. ext
+                pcall(http.get, baseTexture, function(data)
+                    if data and data ~= "" then
+                        local okW, tempPath = pcall(file.writeTemp, fname, data)
+                        if okW and tempPath then
+                            pcall(function() mat:setTexture("$basetexture", "../data/" .. tempPath) end)
+                            return
+                        end
+                    end
+                    applyStreamURL()
+                end, applyStreamURL)
+            else
+                applyStreamURL()
+            end
+            MaterialUsesCustomTexture[cacheKey] = true
+            MaterialUsesCustomTexture[surfaceId] = true
+        else
+            local sourceMaterial = material.load and material.load(baseTexture) or nil
+            if sourceMaterial and sourceMaterial.getTexture and sourceMaterial:getTexture("$basetexture") then
+                mat:setTexture("$basetexture", sourceMaterial:getTexture("$basetexture"))
+                MaterialUsesCustomTexture[cacheKey] = false
+                MaterialUsesCustomTexture[surfaceId] = false
+            else
+                mat:setTexture("$basetexture", baseTexture)
+                MaterialUsesCustomTexture[cacheKey] = (baseTexture ~= "vgui/white" and baseTexture ~= "models/debug/debugwhite")
+                MaterialUsesCustomTexture[surfaceId] = MaterialUsesCustomTexture[cacheKey]
+            end
+        end
+
+        if Matrix and mat.setMatrix then
+            local texMatrix = Matrix()
+            texMatrix:setScale(Vector(
+                (sCfg and sCfg.TextureScaleU) or matCfg.TextureScaleU or 1,
+                (sCfg and sCfg.TextureScaleV) or matCfg.TextureScaleV or 1,
+                1
+            ))
+            mat:setMatrix("$basetexturetransform", texMatrix)
+        end
+
+        Materials[cacheKey] = mat
+        return mat, cacheKey
+    end
+
+    local function shouldTintTexture(sCfg)
+        if sCfg and sCfg.TintTexture ~= nil then return sCfg.TintTexture end
+        if matCfg.TintTexture ~= nil then return matCfg.TintTexture end
+        return true
+    end
+
+    local function mapSegmentUV(u, v, sCfg)
+        local rot = ((sCfg and sCfg.TextureRotationDeg) or matCfg.TextureRotationDeg or 0) % 360
+        if rot < 0 then rot = rot + 360 end
+
+        local outU, outV = u, v
+        if rot == 90 then
+            outU, outV = v, 1 - u
+        elseif rot == 180 then
+            outU, outV = 1 - u, 1 - v
+        elseif rot == 270 then
+            outU, outV = 1 - v, u
+        end
+
+        if (sCfg and sCfg.FlipTextureU) or matCfg.FlipTextureU then
+            outU = 1 - outU
+        end
+        if (sCfg and sCfg.FlipTextureV) or matCfg.FlipTextureV then
+            outV = 1 - outV
+        end
+
+        return outU, outV
+    end
+
+    local function baseSurfaceCfg(surfId)
+        local sCfg = surfacesCfg[surfId] or surfacesCfg[0] or surfacesCfg[88]
+        if sCfg then return sCfg end
+        if surfId == 68 or surfId == 78 then
+            return { CreateMarks = true, SkidColor = Color(85, 62, 42, 180) }
+        elseif surfId == 85 then
+            return { CreateMarks = true, SkidColor = Color(52, 74, 34, 150) }
+        elseif surfId == 71 then
+            return { CreateMarks = false }
+        end
+        return { CreateMarks = true, SkidColor = Color(18, 18, 20, 200) }
+    end
+
+    local axleSurfaces = { front = {}, rear = {} }
+    local function resolveSurfaceCfg(surfId, axle)
+        local overrides = axle == "rear" and SKID.Rear or nil
+        if axle == "front" then overrides = SKID.Front end
+        if not overrides then return baseSurfaceCfg(surfId) end
+        local cached = axleSurfaces[axle][surfId]
+        if cached then return cached end
+        local settings = {}
+        for k, v in pairs(baseSurfaceCfg(surfId)) do settings[k] = v end
+        for k, v in pairs(overrides) do settings[k] = v end
+        if overrides.Texture then settings[axle == "rear" and "RearTexture" or "FrontTexture"] = overrides.Texture end
+        axleSurfaces[axle][surfId] = settings
+        return settings
+    end
+
+    local holoPool = {}
+    local activeQuads = {}
+    local prevWheelState = {}
+    local maxQuads     = math.min(SKID.MaxQuads or SKID.maxSegments or TIRE.MaxSkidQuads or 96, SKID.HologramLimit or 180)
+    local quadLifetime = SKID.Lifetime or SKID.lifetime or TIRE.SkidLifetime or 10.0
+    local skidThresh   = SKID.SkidThreshold or SKID.threshold or TIRE.SkidThreshold or 0.16
+    local opacityExp = math.max(0.05, SKID.OpacityExp or 1)
+    local skidRelease  = SKID.SkidReleaseThreshold or (skidThresh * 0.55)
+    local minSegLen    = SKID.MinSegmentLength or 8.0
+    local worldUVScale = SKID.TextureWorldScale or 64.0
+    local surfaceLift  = SKID.SurfaceLift or 0.08
+    local widthMult    = SKID.WidthMult or 1.0
+    local frontWMult   = SKID.FrontWheelWidthMul or 1.0
+    local rearWMult    = SKID.RearWheelWidthMul or 1.0
+
+    local function acquireHolo()
+        if #holoPool > 0 then
+            return table.remove(holoPool)
+        end
+        if #activeQuads >= maxQuads then
+            local old = table.remove(activeQuads, 1)
+            if old then
+                if old.mesh and old.mesh.destroy then pcall(function() old.mesh:destroy() end) end
+                if old.holo and old.holo:isValid() then return old.holo end
+            end
+        end
+        if hologram and hologram.create then
+            local ok, h = pcall(function()
+                return hologram.create(Vector(), Angle(), "models/Combine_Helicopter/helicopter_bomb01.mdl")
+            end)
+            return ok and h or nil
+        end
+        return nil
+    end
+
+    local function addSkidQuad(pStart, pEnd, normal, halfWidth, col, sCfg, axle, surfId, prevEdge, uStart, uEnd)
+        if not (mesh and mesh.createFromTable) then return nil end
+        if mesh.trianglesLeft and mesh.trianglesLeft() < 12 then return nil end
+
+        local mat, cacheKey = loadMaterial(surfId, sCfg, axle)
+        if not mat then return nil end
+
+        local delta = pEnd - pStart
+        local len = delta:getLength()
+        if len < 1.5 or len > 350 then return nil end
+
+        local fwd = delta / len
+        local right = normal:cross(fwd):getNormalized()
+        if right:getLengthSqr() < 0.01 then return nil end
+
+        local lift = normal * surfaceLift
+        local useCustomTex = MaterialUsesCustomTexture[cacheKey] == true
+        local overlapMul = useCustomTex and (SKID.TexturedSegmentOverlapMul or 0.0) or (SKID.SegmentOverlapMul or 0.0)
+
+        local p1, p2
+        if prevEdge then
+            -- Continuous edge-stitching: reuse previous end vertices so segments join with zero gap and zero overlap!
+            p1 = prevEdge.left
+            p2 = prevEdge.right
+        else
+            local sPos = pStart - fwd * (halfWidth * overlapMul) + lift
+            p1 = sPos + right * halfWidth
+            p2 = sPos - right * halfWidth
+        end
+
+        local ePos = pEnd + fwd * (halfWidth * overlapMul) + lift
+        local p4 = ePos + right * halfWidth
+        local p3 = ePos - right * halfWidth
+
+        local center = (p1 + p2 + p3 + p4) * 0.25
+        local lp1, lp2, lp3, lp4 = p1 - center, p2 - center, p3 - center, p4 - center
+
+        local u1, v1 = mapSegmentUV(uStart, 0, sCfg)
+        local u2, v2 = mapSegmentUV(uStart, 1, sCfg)
+        local u3, v3 = mapSegmentUV(uEnd, 1, sCfg)
+        local u4, v4 = mapSegmentUV(uEnd, 0, sCfg)
+
+        local vCol = Color(255, 255, 255, 255)
+        local okMesh, qMesh = pcall(function()
+            return mesh.createFromTable({
+                { pos = lp1, normal = normal, u = u1, v = v1, color = vCol },
+                { pos = lp2, normal = normal, u = u2, v = v2, color = vCol },
+                { pos = lp3, normal = normal, u = u3, v = v3, color = vCol },
+                { pos = lp3, normal = normal, u = u3, v = v3, color = vCol },
+                { pos = lp4, normal = normal, u = u4, v = v4, color = vCol },
+                { pos = lp1, normal = normal, u = u1, v = v1, color = vCol },
+                { pos = lp1, normal = -normal, u = u1, v = v1, color = vCol },
+                { pos = lp4, normal = -normal, u = u4, v = v4, color = vCol },
+                { pos = lp3, normal = -normal, u = u3, v = v3, color = vCol },
+                { pos = lp3, normal = -normal, u = u3, v = v3, color = vCol },
+                { pos = lp2, normal = -normal, u = u2, v = v2, color = vCol },
+                { pos = lp1, normal = -normal, u = u1, v = v1, color = vCol },
+            })
+        end)
+        if not okMesh or not qMesh then return nil end
+
+        local holo = acquireHolo()
+        if not (holo and holo:isValid()) then
+            pcall(function() qMesh:destroy() end)
+            return nil
+        end
+
+        local minB = Vector(math.min(lp1.x, lp2.x, lp3.x, lp4.x), math.min(lp1.y, lp2.y, lp3.y, lp4.y), math.min(lp1.z, lp2.z, lp3.z, lp4.z)) - Vector(1, 1, 1)
+        local maxB = Vector(math.max(lp1.x, lp2.x, lp3.x, lp4.x), math.max(lp1.y, lp2.y, lp3.y, lp4.y), math.max(lp1.z, lp2.z, lp3.z, lp4.z)) + Vector(1, 1, 1)
+
+        holo:setPos(center)
+        holo:setAngles(Angle(0, 0, 0))
+        holo:setScale(Vector(1, 1, 1))
+        holo:setMesh(qMesh)
+        holo:setMeshMaterial(mat)
+        holo:setRenderBounds(minB, maxB)
+        if shouldTintTexture(sCfg) then
+            holo:setColor(col)
+        else
+            holo:setColor(Color(255, 255, 255, col.a))
+        end
+        holo:suppressEngineLighting(true)
+        holo:setNoDraw(false)
+
+        activeQuads[#activeQuads + 1] = {
+            holo = holo,
+            mesh = qMesh,
+            born = timer.curtime(),
+        }
+
+        return { left = p4, right = p3 }
+    end
+
+    local pendingSkids = {}
+    local nextSkidTick = 0
+    local skidInterval = math.min(0.015, SimcadeCore.networkInterval(cfg.VEHICLE_CFG))
+
+    local function isCpuHot(limit)
+        local qMax = quotaMax and quotaMax() or 0
+        if qMax <= 0 then return false end
+        if quotaUsed and (quotaUsed() / qMax) > limit then return true end
+        if quotaAverage and (quotaAverage() / qMax) > limit then return true end
+        return false
+    end
+
+    local predictedSample
+    local usingPrediction = false
+    local function trackWheel(i, pos, norm, skid, surfId, width, isRear)
+        local axle = isRear and "rear" or "front"
+        local sCfg = resolveSurfaceCfg(surfId, axle)
+        if surfId == 0 or sCfg.CreateMarks == false then
+            prevWheelState[i] = nil
+            return
+        end
+
+        local st = prevWheelState[i]
+        local entry = sCfg.SkidThreshold or skidThresh
+        local release = math.min(entry, sCfg.SkidReleaseThreshold or skidRelease)
+        local active = skid >= (st and release or entry)
+        if active then
+            if not st then
+                prevWheelState[i] = { pos = pos, u = 0, edge = nil, surfId = surfId }
+            else
+                local dist = pos:getDistance(st.pos)
+                if dist >= minSegLen and dist <= 350 then
+                    local uStart = st.u or 0
+                    local uEnd = uStart + (dist / worldUVScale)
+                    if #pendingSkids < 32 then
+                        pendingSkids[#pendingSkids + 1] = {
+                            wheelIdx = i,
+                            prev     = st.pos,
+                            pos      = pos,
+                            norm     = norm,
+                            skid     = skid,
+                            surfId   = surfId,
+                            width    = width,
+                            axle     = axle,
+                            uStart   = uStart,
+                            uEnd     = uEnd,
+                            resetEdge = (st.surfId ~= surfId),
+                        }
+                    end
+                    st.pos = pos
+                    st.u = uEnd
+                    st.surfId = surfId
+                elseif dist > 350 then
+                    st.pos = pos
+                    st.u = 0
+                    st.edge = nil
+                    st.surfId = surfId
+                end
+            end
+        else
+            prevWheelState[i] = nil
+        end
+    end
+
+    function SimcadeSkidmarks.sampleWheel(i, pos, normal, skid, material, width, rear)
+        if not usingPrediction then trackWheel(i, pos, normal, skid, material, width, rear) end
+    end
+
+    hook.add("think", "SimcadeSkidmarks_Update", function()
+        local now = timer.curtime()
+        if now < nextSkidTick then return end
+        nextSkidTick = math.max(nextSkidTick + skidInterval, now)
+        if isCpuHot(0.78) then return end
+
+        local sample = SimcadePrediction and SimcadePrediction.getTireEffects and SimcadePrediction.getTireEffects()
+        if usingPrediction ~= (sample ~= nil)
+            or (sample and predictedSample and sample.base ~= predictedSample.base) then
+            usingPrediction = sample ~= nil
+            prevWheelState, pendingSkids = {}, {}
+        end
+        if sample and sample ~= predictedSample then
+            for i, wheel in ipairs(sample.wheels) do
+                trackWheel(i, wheel.pos, wheel.norm, wheel.skid, wheel.matType or 0, wheel.width, wheel.isRear)
+            end
+        end
+        predictedSample = sample
+
+        local cleaned = 0
+        for i = #activeQuads, 1, -1 do
+            local q = activeQuads[i]
+            if (now - q.born) > quadLifetime then
+                if q.mesh and q.mesh.destroy then pcall(function() q.mesh:destroy() end) end
+                if q.holo and q.holo:isValid() then
+                    q.holo:setNoDraw(true)
+                    holoPool[#holoPool + 1] = q.holo
+                end
+                table.remove(activeQuads, i)
+                cleaned = cleaned + 1
+                if cleaned >= 4 then break end
+            end
+        end
+
+        local spawned = 0
+        while #pendingSkids > 0 and spawned < 8 do
+            if isCpuHot(0.78) then break end
+            local item = table.remove(pendingSkids, 1)
+            local sCfg = resolveSurfaceCfg(item.surfId, item.axle)
+            local baseCol = sCfg.SkidColor or Color(18, 18, 20, 200)
+            local strength = (clamp(item.skid, 0, 1) ^ math.max(0.05, sCfg.OpacityExp or opacityExp)) * (sCfg.StrengthMul or 1.0)
+            local alpha = math.floor(clamp(strength, 0, 1) * (baseCol.a or 200))
+            local col = Color(baseCol.r, baseCol.g, baseCol.b, alpha)
+
+            local axleMul = (item.axle == "rear") and rearWMult or frontWMult
+            local halfW = math.max(3.0, (item.width or 9) * 0.5 * widthMult * axleMul * (sCfg.SkidWidthMul or 1.0))
+
+            local st = prevWheelState[item.wheelIdx]
+            local prevEdge = (st and not item.resetEdge) and st.edge or nil
+            local newEdge = addSkidQuad(item.prev, item.pos, item.norm, halfW, col, sCfg, item.axle, item.surfId, prevEdge, item.uStart, item.uEnd)
+            if st then
+                st.edge = newEdge
+            end
+            if SimcadeAddons and SimcadeAddons._clientHost then
+                SimcadeAddons._clientHost.runHook("OnSkidQuad", item, col, halfW)
+            end
+            spawned = spawned + 1
+        end
+    end)
+
+    hook.add("removed", "SimcadeSkidmarks_Cleanup", function()
+        for _, q in ipairs(activeQuads) do
+            if q.mesh and q.mesh.destroy then pcall(function() q.mesh:destroy() end) end
+            if q.holo and q.holo:isValid() then pcall(function() q.holo:remove() end) end
+        end
+        for _, h in ipairs(holoPool) do
+            if h and h:isValid() then pcall(function() h:remove() end) end
+        end
+        activeQuads = {}
+        holoPool = {}
+    end)
+end

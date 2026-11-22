@@ -38,7 +38,7 @@ CONFIG.VEHICLE_CFG = {
     DriverPrediction            = true,      -- Predict the driver's Simcade gauges, sounds and tire effects
     UpdateRate                  = 60,        -- Target physics rate (Hz); 30Hz prevents Starfall 6000us CPU spikes
     NetworkRate                 = 20,        -- Target active telemetry rate per stream (Hz), limited by physics ticks and available bytes
-    NetworkBudgetBytesPerSecond = 4300,      -- Server telemetry budget per chip (0-4300 bytes/s). 0 disables telemetry.
+    NetworkBudgetBytesPerSecond = 4300,      -- Server telemetry budget per chip (bytes/s; 4300 fits default 5 kB/s servers). 0 disables telemetry.
     MaxCPUPercent               = 75,        -- Above this %, reduce substeps & skip non-critical FX
 
     -- Wire integration
@@ -673,6 +673,10 @@ CONFIG.SOUND_CFG = {
         },
     },
     WebLoadMode            = "stream", -- "stream" (bass.loadURL) or "download" (http.get + file.writeTemp + bass.loadFile); overridable per entry via loadMode
+    BassAnchorMode         = "overhead", -- "overhead" (Fake-2D overhead anchor to reduce BASS 3D speed stutter) or "world" (raw 3D at vehicle)
+    BassMinDist            = 200,        -- Distance where overhead BASS sounds stay at 100% volume
+    BassMaxDist            = 1500,       -- Distance where overhead BASS sounds fade to 0% volume
+    BassAnchorRadius       = 950,        -- Overhead offset from listener (within Starfall setFade min=1000)
     SuspensionBump = { -- Upward compression limit hit (supports single sndsource or variants = { ... })
         enabled  = true,
         loadMode = "stream",

@@ -384,6 +384,29 @@ function SimcadeCore.init(CONFIG)
         return seed
     end
 
+    local function refreshContraptionMass(entList)
+        if not isValid(Base) or type(entList) ~= "table" then ctrlState._contraptionMass = nil return end
+        local ignore = {}
+        for _, e in ipairs(ExtraFilterStatic) do if isValid(e) then ignore[e] = true end end
+        if type(ExtraFilterSemiDynamic) == "table" then
+            for _, e in ipairs(ExtraFilterSemiDynamic) do if isValid(e) then ignore[e] = true end end
+        end
+        local total = 0
+        for i = 1, #entList do
+            local e = entList[i]
+            if isValid(e) and (e == Base or not ignore[e]) and not (e.isPlayer and e:isPlayer()) then
+                local isParented = e ~= Base and e.getParent and isValid(e:getParent())
+                if not isParented then
+                    local p = e.getPhysicsObject and e:getPhysicsObject()
+                    if isValid(p) and (e == Base or not p.isGravityEnabled or p:isGravityEnabled()) then
+                        total = total + (p:getMass() or 0)
+                    end
+                end
+            end
+        end
+        ctrlState._contraptionMass = total > 0 and total or nil
+    end
+
     local function rebuildStaticFilter(driverEnt)
         traceFilter = {}
         filterSeen = {}
@@ -395,6 +418,7 @@ function SimcadeCore.init(CONFIG)
             local cur = table.remove(queue, 1)
             expandFilterEntity(cur, filterSeen, queue, traceFilter)
         end
+        refreshContraptionMass(traceFilter)
         if find and find.allPlayers then
             local ok, plys = pcall(find.allPlayers)
             if ok and type(plys) == "table" then
@@ -440,6 +464,7 @@ function SimcadeCore.init(CONFIG)
             end
             traceFilter = FilterScan.Result
             filterSeen = FilterScan.Seen
+            refreshContraptionMass(traceFilter)
         end
     end
 
@@ -753,6 +778,8 @@ function SimcadeCore.init(CONFIG)
                 for port in pairs(axleAnchors) do clearAxleAnchor(port) end
                 physicsCar = nil
             end
+        elseif name == "EngineSound" then
+            ctrlState.engineSoundEnt = isValid(value) and value or nil
         elseif name == "FrontWheels" then
             FrontWheelEnts = type(value) == "table" and value or {}
             if isValid(Base) then setupWheels() end
@@ -797,10 +824,13 @@ function SimcadeCore.init(CONFIG)
         if not isValid(Phys) then return end
 
         local nowTick = timer.curtime()
+        local prevThink = ctrlState._lastThinkTime or 0
+        local tickDt = (prevThink > 0 and nowTick > prevThink) and (nowTick - prevThink) or (timer.frametime() or 0.015)
+        ctrlState._lastThinkTime = nowTick
         local targetInterval = 1.0 / math.clamp(VEHICLE_CFG.UpdateRate or 60, 15, 120)
         if lastPhysTickTime > 0 and (nowTick - lastPhysTickTime) < (targetInterval * 0.85) then
             if cachedLiftForcePerSec and not (Base.isPlayerHolding and Base:isPlayerHolding()) then
-                local fdt = math.clamp(timer.frametime() or 0.015, 0.002, 0.05)
+                local fdt = math.clamp(tickDt, 0.002, 0.05)
                 local imp = cachedLiftForcePerSec * fdt
                 Phys:applyForceCenter(imp)
                 skippedLiftApplied = skippedLiftApplied + imp
@@ -1194,19 +1224,25 @@ function SimcadeCore.init(CONFIG)
                 local curC    = w.compIn or 0
                 if not w.soundReadyAt then w.soundReadyAt = nowSuspSnd + 0.4 end
                 local armed = nowSuspSnd >= w.soundReadyAt and w.wasGrounded ~= nil
-                if armed and w.isGrounded then
-                    local bumpTrig = bumpLim * 0.94
-                    local compVel  = (curC - prevC) / dt
-                    if curC >= bumpTrig and prevC < bumpTrig and compVel >= minBumpV then
-                        if not w._lastBumpSnd or (nowSuspSnd - w._lastBumpSnd) > bumpCD then
-                            w._lastBumpSnd = nowSuspSnd
-                            local inten = math.clamp((compVel - minBumpV) / (maxBumpV - minBumpV), 0.15, 1.0)
-                            if inten > suspBumpInt then suspBumpInt = inten end
+                if armed then
+                    local cornerVelUp = (velWorld + angVelWorldRad:cross(w.mountPos - comWorld)):dot(driverUp)
+                    if w.isGrounded then
+                        local bumpTrig = bumpLim * 0.85
+                        local dC = curC - prevC
+                        local compVel = w.wasGrounded and (dC / dt) or (-cornerVelUp)
+                        local hitBumpstop = curC >= bumpTrig and prevC < bumpTrig and compVel >= minBumpV
+                        local hardStrike  = w.wasGrounded and curC >= (bumpLim * 0.55) and dC >= 1.2 and compVel >= math.max(minBumpV * 1.4, minBumpV + 30)
+                        if hitBumpstop or hardStrike then
+                            if not w._lastBumpSnd or (nowSuspSnd - w._lastBumpSnd) > bumpCD then
+                                w._lastBumpSnd = nowSuspSnd
+                                local inten = math.clamp((compVel - minBumpV) / (maxBumpV - minBumpV), 0.15, 1.0)
+                                if inten > suspBumpInt then suspBumpInt = inten end
+                            end
                         end
                     end
-                elseif armed then
-                    local extVel = (prevC - curC) / dt
-                    if airLim > 0.5 and w.wasGrounded and curC <= (-airLim + 0.5) and prevC > (-airLim + 0.5) and extVel >= minDroopV then
+                    local droopTrig = -airLim + 0.5
+                    local extVel = math.max((prevC - curC) / dt, cornerVelUp)
+                    if curC <= droopTrig and prevC > droopTrig and extVel >= minDroopV then
                         if not w._lastDroopSnd or (nowSuspSnd - w._lastDroopSnd) > droopCD then
                             w._lastDroopSnd = nowSuspSnd
                             local inten = math.clamp((extVel - minDroopV) / (maxDroopV - minDroopV), 0.15, 1.0)
@@ -1285,32 +1321,39 @@ function SimcadeCore.init(CONFIG)
         if SUSPENSION_CFG.invertRollTransfer then rollBias = -rollBias end
 
         if #subWheels > 0 then
-            local nSuspSub = math.clamp(math.ceil(dt * math.max(66, 8 * maxSpringFrequency)), 1, 12)
-            local hSub = dt / nSuspSub
             local iRoll, iPitch
-            if nSuspSub > 1 then
-                local inert = Phys.getInertia and Phys:getInertia() or nil
-                if inert then
-                    -- VPhysics reports kg m^2; the torque arms below use Source inches.
-                    inert = inert * (M_TO_IN * M_TO_IN)
-                    local f, r = resolvedLocalFwd, resolvedLocalRight
-                    iRoll  = inert.x * f.x * f.x + inert.y * f.y * f.y + inert.z * f.z * f.z
-                    iPitch = inert.x * r.x * r.x + inert.y * r.y * r.y + inert.z * r.z * r.z
-                end
-                local maxLy, maxLx = 1, 1
-                for _, w in ipairs(subWheels) do
-                    maxLy = math.max(maxLy, math.abs(w._ly))
-                    maxLx = math.max(maxLx, math.abs(w._lx))
-                end
-                -- Geometric estimate (box-like body), clamped so a bogus prop inertia can't destabilize prediction
-                local geoRoll  = physMass * maxLy * maxLy * 0.4
-                local geoPitch = physMass * maxLx * maxLx * 0.4
-                iRoll  = (iRoll and iRoll > 0) and math.clamp(iRoll, geoRoll * 0.5, geoRoll * 2.0) or geoRoll
-                iPitch = (iPitch and iPitch > 0) and math.clamp(iPitch, geoPitch * 0.5, geoPitch * 2.0) or geoPitch
-                -- Suspension forces are virtual (simMass); applied impulse is scaled by physMass/simMass
-                iRoll  = math.max(1, iRoll / vphysScale)
-                iPitch = math.max(1, iPitch / vphysScale)
+            local inert = Phys.getInertia and Phys:getInertia() or nil
+            if inert then
+                -- VPhysics reports kg m^2; the torque arms below use Source inches.
+                inert = inert * (M_TO_IN * M_TO_IN)
+                local f, r = resolvedLocalFwd, resolvedLocalRight
+                iRoll  = inert.x * f.x * f.x + inert.y * f.y * f.y + inert.z * f.z * f.z
+                iPitch = inert.x * r.x * r.x + inert.y * r.y * r.y + inert.z * r.z * r.z
             end
+            local maxLy, maxLx = 1, 1
+            local kRollSum, kPitchSum = 0, 0
+            local cornerMassSub = simMass / numWheels
+            for _, w in ipairs(subWheels) do
+                maxLy = math.max(maxLy, math.abs(w._ly))
+                maxLx = math.max(maxLx, math.abs(w._lx))
+                local axle = w._axleSusp
+                local deflection = math.max(1, w.rideHeight * math.clamp(axle.restCompression or 0.45, 0.15, 0.85))
+                local stiffness = math.max(0, axle.springStiffnessMult or axle.springStiffness or 1)
+                local kWheel = (cornerMassSub * gravity / deflection) * stiffness
+                kRollSum = kRollSum + kWheel * (w._ly * w._ly)
+                kPitchSum = kPitchSum + kWheel * (w._lx * w._lx)
+            end
+            -- Geometric estimate fallback; keep a low floor so small Base props still use their true inertia.
+            local geoRoll  = physMass * maxLy * maxLy * 0.4
+            local geoPitch = physMass * maxLx * maxLx * 0.4
+            iRoll  = (iRoll and iRoll > 0) and math.clamp(iRoll, geoRoll * 0.05, geoRoll * 2.0) or geoRoll
+            iPitch = (iPitch and iPitch > 0) and math.clamp(iPitch, geoPitch * 0.05, geoPitch * 2.0) or geoPitch
+            -- Suspension forces are virtual (simMass); applied impulse is scaled by physMass/simMass
+            iRoll  = math.max(1, iRoll / vphysScale)
+            iPitch = math.max(1, iPitch / vphysScale)
+            maxSpringFrequency = math.max(maxSpringFrequency, math.sqrt(kRollSum / iRoll), math.sqrt(kPitchSum / iPitch))
+            local nSuspSub = math.clamp(math.ceil(dt * math.max(66, 8 * maxSpringFrequency)), 1, 16)
+            local hSub = dt / nSuspSub
             local gFracSub    = #subWheels / numWheels
             local avgCWSub    = (simMass / numWheels) * gravity
             local transferTr  = 0
@@ -1321,6 +1364,7 @@ function SimcadeCore.init(CONFIG)
             end
 
             local gUp = gravity * driverUp.z
+            local subMass = simMass * math.max(1.0, (ctrlState._contraptionMass or physMass) / math.max(1, physMass))
             local dvz, dwr, dwp = 0, 0, 0
             for s = 1, nSuspSub do
                 local Fz, TrSpring, TpSpring = 0, 0, 0
@@ -1358,7 +1402,7 @@ function SimcadeCore.init(CONFIG)
                 end
                 if nSuspSub > 1 then
                     local Tr = TrSpring + transferTr
-                    dvz = dvz + (Fz / simMass - gUp) * hSub
+                    dvz = dvz + (Fz / subMass - gUp) * hSub
                     dwr = dwr + (Tr / iRoll) * hSub
                     dwp = dwp + (TpSpring / iPitch) * hSub
                     for _, w in ipairs(subWheels) do
@@ -1473,9 +1517,17 @@ function SimcadeCore.init(CONFIG)
             totalAppliedForce = totalGripImpulse:getLength()
             if #groundedSuspWheels > 0 and dt > 0 then
                 local liftPerSec = (rawCornerLiftSum * vphysScale) / dt
-                local maxCachedLift = physMass * gravity * 1.5
+                local gFrac = #groundedSuspWheels / numWheels
+                local maxCachedLift = physMass * gravity * 3.0
                 local liftLen = liftPerSec:getLength()
-                cachedLiftForcePerSec = (liftLen > maxCachedLift) and (liftPerSec * (maxCachedLift / liftLen)) or liftPerSec
+                local clampedLift = (liftLen > maxCachedLift) and (liftPerSec * (maxCachedLift / liftLen)) or liftPerSec
+                if cachedLiftForcePerSec then
+                    local blend = math.clamp(dt * 3.0, 0, 1)
+                    cachedLiftForcePerSec = cachedLiftForcePerSec + (clampedLift - cachedLiftForcePerSec) * blend
+                else
+                    local staticSupport = physMass * gravity * gFrac * math.max(0, avgGroundNorm.z)
+                    cachedLiftForcePerSec = avgGroundNorm * math.min(staticSupport, liftLen)
+                end
             else
                 cachedLiftForcePerSec = nil
             end
@@ -1751,20 +1803,30 @@ function SimcadeCore.init(CONFIG)
         end
 
         -- Pace each stream by its measured packet cost under the shared byte budget.
-        local bytesPerSecond = math.clamp(tonumber(VEHICLE_CFG.NetworkBudgetBytesPerSecond) or 4300, 0, 4300)
+        local bytesPerSecond = math.max(0, tonumber(VEHICLE_CFG.NetworkBudgetBytesPerSecond) or 4300)
         if bytesPerSecond == 0 then return end
         local now = nowTick
         local netInterval = SimcadeCore.networkInterval(VEHICLE_CFG)
         local clock = timer.realtime()
         local elapsed = math.max(0, clock - (ctrlState.netClock or clock))
-        -- A one-second trailing estimate lets debug use bandwidth left idle by other streams.
-        ctrlState.otherTraffic = (ctrlState.otherTraffic or bytesPerSecond) * math.exp(-elapsed)
+        -- One-second trailing per-stream estimates let active streams use bandwidth left idle by others.
+        local decay = math.exp(-elapsed)
+        ctrlState.streamTraffic = ctrlState.streamTraffic or {}
+        local totalTraffic = 0
+        for name, rate in pairs(ctrlState.streamTraffic) do
+            local decayed = rate * decay
+            ctrlState.streamTraffic[name] = decayed
+            totalTraffic = totalTraffic + decayed
+        end
         local stream, lastCost
         local function nextDeadline(previous, interval)
-            local rate = bytesPerSecond * stream.share
-            if stream.name == "wheel" then
-                rate = math.max(rate, bytesPerSecond - ctrlState.otherTraffic)
+            local minRate = bytesPerSecond * stream.share
+            local otherRate = totalTraffic - (ctrlState.streamTraffic[stream.name] or 0)
+            if stream.name ~= "wheel" then
+                local wheelTraffic = ctrlState.streamTraffic.wheel or 0
+                otherRate = otherRate - math.max(0, wheelTraffic - bytesPerSecond * 0.08)
             end
+            local rate = math.max(minRate, bytesPerSecond - otherRate)
             interval = math.max(interval, lastCost / rate)
             if previous <= now and now - previous < interval then return previous + interval end
             return now + interval
@@ -1790,14 +1852,15 @@ function SimcadeCore.init(CONFIG)
                 return false
             end
             if not SimcadeCore.sendPacket(target, unreliable) then return false end
-            if stream.name ~= "wheel" then ctrlState.otherTraffic = ctrlState.otherTraffic + cost end
+            ctrlState.streamTraffic[stream.name] = (ctrlState.streamTraffic[stream.name] or 0) + cost
+            totalTraffic = totalTraffic + cost
             ctrlState.netCredit = ctrlState.netCredit - cost
             return true
         end
 
         -- Broadcast add-on snapshots within the same byte budget as vehicle telemetry.
         if aHost and next(aHost.ctx.syncedState) and now >= (ctrlState.nextAddonSync or 0) then
-            queue("addons", 0.05, ctrlState.nextAddonSync or 0, function()
+            queue("addons", 0.04, ctrlState.nextAddonSync or 0, function()
                 net.start("Simcade_AddonState")
                 net.writeTable(aHost.ctx.syncedState)
                 if not sendTelemetry(nil, true) then return false end
@@ -1828,7 +1891,7 @@ function SimcadeCore.init(CONFIG)
         local hudTargets = {}
         if VEHICLE_CFG.DriverPrediction and SimcadePrediction and hasDriver
             and now >= (ctrlState.nextPrediction or 0) then
-            queue("prediction", 0.36, ctrlState.nextPrediction or 0, function()
+            queue("prediction", 0.32, ctrlState.nextPrediction or 0, function()
                 if not SimcadePrediction.send(Driver, Base, Pod, physicsCar, comWorld, driverFwd, driverUp,
                     velWorld, angVelWorldRad, wheelGrounds, vphysLoadsKN, simMass, activeCompound, ignRes,
                     not isPhysgunHeld and (not Phys.isMoveable or Phys:isMoveable()) and
@@ -1856,7 +1919,7 @@ function SimcadeCore.init(CONFIG)
         local pBov   = ctrlState._pendingBovTrigger == true
 
         if (now >= nextAudioNetTime or pGear or pBov or pBump > 0 or pDroop > 0) then
-            queue("audio", 0.32, nextAudioNetTime, function()
+            queue("audio", 0.24, nextAudioNetTime, function()
                 local dominantMatType = 0
                 if groundedCount > 0 then
                     local surfCounts = {}
@@ -1890,6 +1953,9 @@ function SimcadeCore.init(CONFIG)
                 net.writeUInt(math.clamp(math.floor(pBump * 15 + 0.5), 0, 15), 4)
                 net.writeUInt(math.clamp(math.floor(pDroop * 15 + 0.5), 0, 15), 4)
                 net.writeUInt(math.clamp(dominantMatType, 0, 255), 8)
+                local hasEngSoundEnt = isValid(ctrlState.engineSoundEnt)
+                net.writeBool(hasEngSoundEnt)
+                if hasEngSoundEnt then net.writeEntity(ctrlState.engineSoundEnt) end
                 if not sendTelemetry() then return false end
                 nextAudioNetTime = nextDeadline(nextAudioNetTime, (ignRes.running or ignRes.cranking or kmh > 1) and netInterval or math.max(netInterval, 0.30))
                 ctrlState._pendingSuspBump = 0
@@ -1939,7 +2005,7 @@ function SimcadeCore.init(CONFIG)
         local shouldSendFx = anySlipping or maxSkidVal > 0.10 or (kmh > 3 and groundedCount > 0)
         local fxInterval = shouldSendFx and netInterval or math.max(netInterval, 0.75)
         if shouldSendFx ~= prevHadTireFx or now >= nextFxNetTime then
-            queue("fx", 0.10, nextFxNetTime, function()
+            queue("fx", 0.22, nextFxNetTime, function()
                 local first = ctrlState.fxPage <= #runtimeWheels and ctrlState.fxPage or 1
                 local sendCount = math.min(#runtimeWheels - first + 1, 8)
                 net.start("Simcade_TireEffects")
@@ -1961,7 +2027,7 @@ function SimcadeCore.init(CONFIG)
                     net.writeUInt(math.clamp(math.round(w.width or 9), 1, 255), 8)
                     net.writeBool(w.isFront == false)
                 end
-                if not sendTelemetry() then return false end
+                if not sendTelemetry(nil, true) then return false end
                 ctrlState.fxPage = first + sendCount
                 prevHadTireFx = shouldSendFx
                 nextFxNetTime = nextDeadline(nextFxNetTime, fxInterval)
@@ -1971,7 +2037,7 @@ function SimcadeCore.init(CONFIG)
 
         local wantsWheelDbg = (TIRE_CFG.ShowTireDebug == true or TIRE_CFG.ShowPacejkaGraph == true or TIRE_CFG.ShowTelemetry3D == true or (ctrlState._weightShiftCfg and ctrlState._weightShiftCfg.ShowDebug == true))
         if #hudTargets > 0 and (wantsWheelDbg or SUSPENSION_CFG.showAxleDebug or debugRaysEnabled) and now >= nextWheelDebugNetTime then
-            queue("wheel", 0.12, nextWheelDebugNetTime, function()
+            queue("wheel", 0.08, nextWheelDebugNetTime, function()
                 local first, sendCount = firstDebugWheel, debugCount
                 local full = resetWheelDebug or now >= (ctrlState.wheelKeyframes[first] or 0)
                 local pending = {}

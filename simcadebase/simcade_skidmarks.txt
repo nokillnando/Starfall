@@ -255,7 +255,7 @@ function SimcadeSkidmarks.initClient(cfg)
 
         local delta = pEnd - pStart
         local len = delta:getLength()
-        if len < 1.5 or len > 220 then return nil end
+        if len < 1.5 or len > 350 then return nil end
 
         local fwd = delta / len
         local right = normal:cross(fwd):getNormalized()
