@@ -190,7 +190,7 @@ return function(options)
 
                 net.receive(NET_REQ, function(_, ply)
                     if isValid(ply) then
-                        refreshSeats(false)
+                        if #seats == 0 then refreshSeats(false) end
                         sendSeatList(ply)
                     end
                 end)
@@ -221,11 +221,14 @@ return function(options)
                     end)
                 end
 
+                -- Scan once after wiring settles (and one fallback retry if still empty).
+                -- Avoid periodic getAllConstrained() polling, which causes server stutters.
                 timer.simple(1.0, function() refreshSeats(true) end)
-                timer.create("SimcadeSeatInd_Scan", 2.0, 0, function() refreshSeats(false) end)
+                timer.simple(3.0, function()
+                    if #seats == 0 then refreshSeats(true) end
+                end)
             end,
             OnCleanup = function()
-                timer.remove("SimcadeSeatInd_Scan")
             end,
         }
     end
@@ -439,25 +442,31 @@ return function(options)
         return p0 * (uu * u) + p1 * (3 * uu * t) + p2 * (3 * u * tt) + p3 * (tt * t)
     end
 
-    local function getSeatCenter(seat)
-        local ok, pos = pcall(function() return seat:localToWorld(seat:obbCenter()) end)
-        if ok and pos then return pos end
+    local function getSeatCenter(s)
+        local seat = s.ent
+        if s.obbCenter then
+            return seat:localToWorld(s.obbCenter)
+        end
         return seat:getPos()
     end
 
+    local cachedUseKey = nil
     local function getUseKeyName()
+        if cachedUseKey then return cachedUseKey end
+        local res = "E"
         if input and input.lookupBinding then
             local ok, key = pcall(input.lookupBinding, "+use")
             if ok and key then
                 if type(key) == "number" and input.getKeyName then
                     local okN, name = pcall(input.getKeyName, key)
-                    if okN and name and name ~= "" then return string.upper(name) end
+                    if okN and name and name ~= "" then res = string.upper(name) end
                 elseif type(key) == "string" and key ~= "" then
-                    return string.upper(key)
+                    res = string.upper(key)
                 end
             end
         end
-        return "E"
+        cachedUseKey = res
+        return res
     end
 
     local function drawLabelRT()
@@ -504,7 +513,13 @@ return function(options)
                     local isDrv = net.readBool()
                     local lbl = net.readString()
                     if isValid(ent) then
-                        seats[#seats + 1] = { ent = ent, isDriver = isDrv, label = lbl }
+                        local okC, obbC = pcall(function() return ent:obbCenter() end)
+                        seats[#seats + 1] = {
+                            ent = ent,
+                            isDriver = isDrv,
+                            label = lbl,
+                            obbCenter = (okC and obbC) or nil,
+                        }
                     end
                 end
             end)
@@ -549,11 +564,11 @@ return function(options)
                     local seat = s.ent
                     if not isValid(seat) then continue end
 
-                    local okDrv, drv = pcall(function() return seat:getDriver() end)
-                    local occupied = okDrv and isValid(drv)
+                    local drv = seat.getDriver and seat:getDriver() or nil
+                    local occupied = isValid(drv)
                     if occupied and not ShowOccupied then continue end
 
-                    local center = getSeatCenter(seat)
+                    local center = getSeatCenter(s)
                     local toSeat = center - eyePos
                     local dist = toSeat:getLength()
                     if dist > MaxDistance or dist < 1 then continue end
@@ -571,12 +586,7 @@ return function(options)
                             best = s
                             bestCenter = center
                             best._occupied = occupied
-                            local drvName = "Player"
-                            if occupied then
-                                local okN, n = pcall(function() return drv:getName() end)
-                                if okN and n and n ~= "" then drvName = n end
-                            end
-                            best._driverName = drvName
+                            best._driverName = (occupied and drv.getName) and drv:getName() or "Player"
                         end
                     end
                 end
