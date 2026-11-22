@@ -2,7 +2,7 @@
 --@name Starfall Mesh Loader UI Module
 --@author [C17] Red Fox
 
-local UIVersion = "2.23"
+local UIVersion = "2.24"
 
 if CLIENT then
 

@@ -3,7 +3,7 @@
 --@shared
 --@include mesh_loaders_new/mesh_loader_ui.txt
 
-local Version = "2.23"
+local Version = "2.24"
 
 --[[
 
