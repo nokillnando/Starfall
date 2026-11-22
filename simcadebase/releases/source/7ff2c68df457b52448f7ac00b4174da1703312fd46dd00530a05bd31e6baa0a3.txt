@@ -1,0 +1,303 @@
+--@name Simcade Tires Module
+--@shared
+
+SimcadeTires = SimcadeTires or {}
+
+local Aero = assert(SimcadeAero, "Load simcade_aero.txt before simcade_tires.txt")
+local clamp = math.clamp or function(v, a, b) return v < a and a or (v > b and b or v) end
+
+SimcadeTires.COMPOUNDS = {
+    Comfort = { CoF = 1.15, Lat_B =  8.0, Lat_C = 1.30, Lat_E = 0.10, Long_B = 10.0, Long_C = 1.50, Long_E = 0.40, LoadSens = 0.10, offroadRetain = 0.25 },
+    Sport   = { CoF = 1.72, Lat_B = 10.0, Lat_C = 1.35, Lat_E = 0.10, Long_B = 12.0, Long_C = 1.55, Long_E = 0.30, LoadSens = 0.10, offroadRetain = 0.15 },
+    Slick   = { CoF = 2.15, Lat_B = 12.0, Lat_C = 1.40, Lat_E = 0.10, Long_B = 14.0, Long_C = 1.60, Long_E = 0.60, LoadSens = 0.08, offroadRetain = 0.00 },
+    Rally   = { CoF = 1.52, Lat_B =  9.0, Lat_C = 1.45, Lat_E = 0.10, Long_B = 11.0, Long_C = 1.50, Long_E = 0.50, LoadSens = 0.08, offroadRetain = 0.95 },
+    Drift   = { CoF = 1.02, Lat_B =  8.5, Lat_C = 1.25, Lat_E = 0.25, Long_B = 11.0, Long_C = 1.45, Long_E = 0.50, LoadSens = 0.10, offroadRetain = 0.20 },
+}
+
+SimcadeTires.SURFACE_MAP = {
+    [67] = 1,   -- MAT_CONCRETE
+    [84] = 1,   -- MAT_TILE
+    [76] = 1,   -- MAT_PLASTIC
+    [80] = 1,   -- MAT_COMPUTER / hard brush
+    [83] = 13,  -- MAT_SLOSH -> wet puddle
+    [88] = 1,   -- MAT_DEFAULT
+    [73] = 1,   -- MAT_CLIP
+    [71] = 26,  -- MAT_GRATE
+    [86] = 26,  -- MAT_VENT
+    [68] = 8,   -- MAT_DIRT
+    [79] = 15,  -- MAT_FOLIAGE
+    [78] = 9,   -- MAT_SAND
+    [85] = 15,  -- MAT_GRASS
+    [74] = 13,  -- MAT_SNOW -> low grip
+    [77] = 26,  -- MAT_METAL
+    [87] = 17,  -- MAT_WOOD
+}
+
+SimcadeTires.SURFACE_GRIP_MULT = {
+    [0]  = { lat = 1.00, lon = 1.00 },
+    [1]  = { lat = 1.00, lon = 1.00 },
+    [8]  = { lat = 0.62, lon = 0.65, offroadLatFloor = 0.90, offroadLonFloor = 0.92 },
+    [9]  = { lat = 0.66, lon = 0.68, offroadLatFloor = 0.92, offroadLonFloor = 0.94 },
+    [13] = { lat = 0.54, lon = 0.58, offroadLatFloor = 0.80, offroadLonFloor = 0.82 },
+    [15] = { lat = 0.56, lon = 0.58, offroadLatFloor = 0.86, offroadLonFloor = 0.88 },
+    [17] = { lat = 0.88, lon = 0.88, offroadLatFloor = 0.92, offroadLonFloor = 0.92 },
+    [26] = { lat = 0.93, lon = 0.93, offroadLatFloor = 0.95, offroadLonFloor = 0.95 },
+}
+
+SimcadeTires.SURFACE_ROLLING_MULT = {
+    [67] = 1.0,  -- MAT_CONCRETE
+    [68] = 2.4,  -- MAT_DIRT
+    [71] = 1.2,  -- MAT_GRATE
+    [74] = 3.2,  -- MAT_SNOW
+    [77] = 1.0,  -- MAT_METAL
+    [78] = 12.0, -- MAT_SAND
+    [84] = 0.95, -- MAT_TILE
+    [85] = 2.8,  -- MAT_GRASS
+    [87] = 1.25, -- MAT_WOOD
+    [88] = 1.0,  -- MAT_DEFAULT
+}
+
+-- Compatibility for older configs that used the fixed ice key.
+SimcadeTires.ICE = 250
+SimcadeTires.SURFACE_MAP[SimcadeTires.ICE] = 14
+local namedMaterials = { ice = SimcadeTires.ICE, gmod_ice = SimcadeTires.ICE }
+local surfaceNames = {}
+
+function SimcadeTires.applySurfaceProfiles(cfg)
+    if not cfg.SURFACE_PROFILES then return end
+    local tire = cfg.TIRE_CFG or {}
+    cfg.TIRE_CFG = tire
+    tire.SurfacePropertyOverrides = tire.SurfacePropertyOverrides or {}
+    tire.SurfaceIndexOverrides = tire.SurfaceIndexOverrides or {}
+    tire.SurfaceTextureOverrides = tire.SurfaceTextureOverrides or {}
+    tire.SurfaceMultipliers = tire.SurfaceMultipliers or {}
+    tire.SurfaceRollingResistance = tire.SurfaceRollingResistance or {}
+
+    local function applySection(sectionName, key, base, settings)
+        local section = cfg[sectionName] or {}
+        cfg[sectionName] = section
+        section.Surfaces = section.Surfaces or {}
+        section.Surfaces[key] = settings or section.Surfaces[key] or section.Surfaces[base]
+    end
+
+    local function applyProfile(key, profile, defaultProperty)
+        for _, name in ipairs(profile.Properties or { defaultProperty }) do
+            tire.SurfacePropertyOverrides[name:lower()] = key
+        end
+        for index, matType in pairs(profile.IndexHints or {}) do
+            tire.SurfaceIndexOverrides[index] = { matType = matType, profile = key }
+        end
+        for _, texture in ipairs(profile.Textures or {}) do
+            tire.SurfaceTextureOverrides[texture:lower():gsub("\\", "/")] = key
+        end
+        if profile.Grip ~= nil then
+            local grip = profile.Grip
+            tire.SurfaceMultipliers[key] = type(grip) == "table" and grip or { lat = grip, lon = grip }
+        end
+        if profile.RollingResistance ~= nil then tire.SurfaceRollingResistance[key] = profile.RollingResistance end
+        applySection("SOUND_CFG", key, profile.BaseMaterial, profile.Audio)
+        applySection("SKID_CFG", key, profile.BaseMaterial, profile.Skidmarks)
+        applySection("EFFECT_CFG", key, profile.BaseMaterial, profile.Effects)
+    end
+
+    -- Both realms assign the same byte IDs, regardless of Lua's table order.
+    tire.SurfaceProfileIds = {}
+    local names = {}
+    local used = { [SimcadeTires.ICE] = true }
+    for key, profile in pairs(cfg.SURFACE_PROFILES) do
+        if type(key) == "string" then
+            names[#names + 1] = key
+        else
+            assert(type(key) == "number" and key >= 1 and key <= 255 and key % 1 == 0,
+                "Surface profiles use names or legacy integer keys from 1 to 255")
+            used[key] = true
+            applyProfile(key, profile)
+        end
+    end
+    table.sort(names)
+    local key = 255
+    for _, name in ipairs(names) do
+        while used[key] do key = key - 1 end
+        assert(key >= 128, "Too many named surface profiles")
+        tire.SurfaceProfileIds[name] = key
+        applyProfile(key, cfg.SURFACE_PROFILES[name], name)
+        key = key - 1
+    end
+end
+
+function SimcadeTires.resolveMaterial(hit, cfg)
+    local mat = hit.MatType or 67
+    local properties = cfg and cfg.SurfacePropertyOverrides or namedMaterials
+    local id = hit.SurfaceProps
+    local propName
+    if not hit.HitWorld and isValid(hit.Entity) and hit.Entity.getPhysMaterial then
+        local ok, name = pcall(hit.Entity.getPhysMaterial, hit.Entity)
+        if ok and type(name) == "string" and name ~= "" then
+            propName = name:lower()
+            if properties[propName] then return properties[propName] end
+        end
+    end
+    local name = id
+    if type(id) == "number" and id >= 0 and util and util.GetSurfaceData then
+        name = surfaceNames[id]
+        if name == nil then
+            local ok, data = pcall(util.GetSurfaceData, id)
+            name = ok and data and data.name or false
+            surfaceNames[id] = name
+        end
+    end
+    if type(name) == "string" and properties[name:lower()] then return properties[name:lower()] end
+    -- HitTexture identifies the struck brush face. Models can report generic
+    -- placeholders here, so only consider explicit brush texture mappings.
+    local textures = cfg and cfg.SurfaceTextureOverrides
+    if textures and type(hit.HitTexture) == "string" and hit.HitTexture:sub(1, 1) ~= "*" then
+        local key = hit.HitTexture:lower():gsub("\\", "/")
+        if textures[key] then return textures[key] end
+    end
+    -- Only consult index hints when neither lookup identified the surface.
+    if not propName and (type(name) ~= "string" or name == "") then
+        local indices = cfg and cfg.SurfaceIndexOverrides
+        local override = indices and indices[id]
+        if type(override) == "number" then return override end
+        if override and override.matType == mat then return override.profile end
+    end
+    return mat
+end
+
+function SimcadeTires.mapSurface(matType)
+    return SimcadeTires.SURFACE_MAP[matType] or 1
+end
+
+function SimcadeTires.evaluateMagicFormula(B, C, E, x)
+    local Bx = B * x
+    return math.sin(C * math.atan(Bx - E * (Bx - math.atan(Bx))))
+end
+
+function SimcadeTires.buildAxleSpec(axleCfg, compoundName, cornerLoadKN, tireCfg, axleName)
+    local cName = (axleCfg and axleCfg.Compound) or compoundName or "Sport"
+    local customComp = tireCfg and tireCfg.Compounds and tireCfg.Compounds[cName]
+    local compoundAxle = customComp and customComp[axleName]
+    local baseComp = SimcadeTires.COMPOUNDS[cName] or SimcadeTires.COMPOUNDS.Sport
+    local axFormula = axleCfg and axleCfg.Formula
+    local glFormula = tireCfg and tireCfg.Formula
+    local function pick(k, def)
+        if axleCfg and axleCfg[k] ~= nil then return axleCfg[k] end
+        if axFormula and axFormula[k] ~= nil then return axFormula[k] end
+        if compoundAxle and compoundAxle[k] ~= nil then return compoundAxle[k] end
+        if customComp and customComp[k] ~= nil then return customComp[k] end
+        if glFormula and glFormula[k] ~= nil then return glFormula[k] end
+        if baseComp and baseComp[k] ~= nil then return baseComp[k] end
+        return def
+    end
+
+    local function surfaceMap(field)
+        local merged = {}
+        local function overlay(settings)
+            for key, value in pairs(settings and settings[field] or {}) do
+                local ids = tireCfg and tireCfg.SurfaceProfileIds
+                merged[(ids and ids[key]) or key] = value
+            end
+        end
+        overlay(tireCfg)
+        overlay(customComp)
+        overlay(compoundAxle)
+        overlay(axleCfg)
+        return merged
+    end
+
+    local widthMm = (axleCfg and axleCfg.Width) or 245
+    local direct  = (tireCfg and tireCfg.UseDirectMultipliers) and true or false
+    local ovDef   = direct and 1.0 or 1.38
+    local laDef   = direct and 1.0 or 1.25
+    local loDef   = direct and 1.0 or 1.35
+    local glOv    = (tireCfg and (tireCfg.Grip or tireCfg.OverallGripMultiplier)) or 1.0
+    local glLa    = (tireCfg and (tireCfg.LateralGrip or tireCfg.LateralGripMultiplier)) or 1.0
+    local glLo    = (tireCfg and (tireCfg.LongitudinalGrip or tireCfg.LongitudinalGripMultiplier)) or 1.0
+    local ovMult  = (axleCfg and (axleCfg.Grip or axleCfg.OverallGripMultiplier)) or ovDef
+    local laMult  = (axleCfg and (axleCfg.LateralGrip or axleCfg.LateralGripMultiplier)) or laDef
+    local loMult  = (axleCfg and (axleCfg.LongitudinalGrip or axleCfg.LongitudinalGripMultiplier)) or loDef
+    local gBias   = (axleCfg and axleCfg.GripBias) or 1.0
+
+    local widthFactor = clamp((widthMm / 245) ^ 0.18, 0.88, 1.15)
+    local baseFactor  = widthFactor * gBias
+
+    return {
+        compoundName    = cName,
+        CoF             = pick("CoF", 1.72),
+        Lat_B           = pick("Lat_B", 10.0),
+        Lat_C           = pick("Lat_C", 1.35),
+        Lat_E           = pick("Lat_E", 0.10),
+        camberStiffness = math.max(0, pick("CamberStiffness", 0.65)),
+        Long_B          = pick("Long_B", 12.0),
+        Long_C          = pick("Long_C", 1.55),
+        Long_E          = pick("Long_E", 0.60),
+        LoadSens        = pick("LoadSens", 0.12),
+        offroadRetain   = pick("offroadRetain", 0.15),
+        rollingRes      = pick("RollingResistance", pick("BaseRollingResistance", (tireCfg and tireCfg.RollingResistance) or 0.015)),
+        rollingResMults = surfaceMap("SurfaceRollingResistance"),
+        surfaceMults    = surfaceMap("SurfaceMultipliers"),
+        nominalLoadKN   = math.max(0.5, cornerLoadKN or 3.68),
+        latScale        = baseFactor * glOv * glLa * (ovMult / ovDef) * (laMult / laDef),
+        longScale       = baseFactor * glOv * glLo * (ovMult / ovDef) * (loMult / loDef),
+        -- TireSimV2 low-speed stability & grip damping (prevents small-steer / 10km/h overload)
+        V0              = (tireCfg and tireCfg.V0) or 1.016, -- 40 in/s
+        lowSpeedDeadzone = (tireCfg and tireCfg.LowSpeedLateralHoldDeadzone) or 0.08,
+        lowSpeedHoldScale = (tireCfg and tireCfg.LowSpeedHoldScale) or 0.35,
+        gripDamping     = (tireCfg and tireCfg.GripDampingFactor) or 0.95,
+    }
+end
+
+function SimcadeTires.computeSurfaceMult(spec, surfaceId, matType)
+    local configured = spec and spec.surfaceMults and spec.surfaceMults[matType]
+    if type(configured) == "table" then
+        return configured.lat or 1, configured.lon or 1
+    end
+    if matType == SimcadeTires.ICE then
+        local grip = configured or 0.12
+        return grip, grip
+    end
+    if spec and spec.surfaceMults and matType ~= nil then
+        local custom = spec.surfaceMults[matType] or spec.surfaceMults.Default
+        if type(custom) == "number" then
+            local retain = spec.offroadRetain or 0
+            if custom < 0.90 then
+                if retain <= 0.02 and (surfaceId or 1) > 1 then
+                    local low = custom * 0.55
+                    return low, low
+                end
+                local effective = custom + (math.max(custom, 0.85) - custom) * retain * 0.5
+                return effective, effective
+            end
+            return custom, custom
+        end
+    end
+    local base = SimcadeTires.SURFACE_GRIP_MULT[surfaceId or 1] or SimcadeTires.SURFACE_GRIP_MULT[1]
+    local retain = spec and spec.offroadRetain or 0
+    if (surfaceId or 1) > 1 and retain <= 0.02 then
+        return base.lat * 0.35, base.lon * 0.35
+    end
+    local sLat = base.offroadLatFloor and (base.lat + (math.max(base.lat, base.offroadLatFloor) - base.lat) * retain) or base.lat
+    local sLon = base.offroadLonFloor and (base.lon + (math.max(base.lon, base.offroadLonFloor) - base.lon) * retain) or base.lon
+    return sLat, sLon
+end
+
+function SimcadeTires.computeRollingResistanceMult(spec, surfaceId, matType)
+    if matType == SimcadeTires.ICE then return spec and spec.rollingResMults and spec.rollingResMults[matType] or 1 end
+    if spec and spec.rollingResMults and matType ~= nil then
+        local custom = spec.rollingResMults[matType] or spec.rollingResMults.Default
+        if custom ~= nil then return math.max(0.1, tonumber(custom) or 1.0) end
+    end
+    if matType ~= nil and SimcadeTires.SURFACE_ROLLING_MULT[matType] then
+        return SimcadeTires.SURFACE_ROLLING_MULT[matType]
+    end
+    if surfaceId == 8 or surfaceId == 9 then return 2.4
+    elseif surfaceId == 15 then return 2.8
+    elseif surfaceId == 13 or surfaceId == 14 then return 2.5
+    end
+    return 1.0
+end
+
+function SimcadeTires.addAeroLoadKN(tireLoadKN, aeroCfg, totalMassKG, speedMs, isFront)
+    return Aero.addTireLoadKN(tireLoadKN, aeroCfg, totalMassKG, speedMs, isFront)
+end
+

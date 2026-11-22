@@ -231,7 +231,7 @@ function SimcadeTires.buildAxleSpec(axleCfg, compoundName, cornerLoadKN, tireCfg
         Long_B          = pick("Long_B", 12.0),
         Long_C          = pick("Long_C", 1.55),
         Long_E          = pick("Long_E", 0.60),
-        LoadSens        = pick("LoadSens", (tireCfg and tireCfg.LoadSensitivity) or 0.12),
+        LoadSens        = pick("LoadSens", 0.12),
         offroadRetain   = pick("offroadRetain", 0.15),
         rollingRes      = pick("RollingResistance", pick("BaseRollingResistance", (tireCfg and tireCfg.RollingResistance) or 0.015)),
         rollingResMults = surfaceMap("SurfaceRollingResistance"),

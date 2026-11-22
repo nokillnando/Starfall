@@ -227,7 +227,6 @@ CONFIG.TIRE_CFG = {
     LongitudinalGrip     = 1.00,      -- Acceleration/braking grip multiplier
     GripDampingFactor    = 1.18,
     SlipAnglePeak        = 9.5,       -- Peak lateral slip angle (deg)
-    LoadSensitivity        = 0.14,      -- Tire load sensitivity falloff
     BrakeTransferFactor    = 5.6,       -- Weight transfer % to front tires during braking
     ThrottleTransferFactor = 20.4,      -- Weight transfer % to rear tires during acceleration
     RollingResistance      = 0.015,     -- Rolling drag coefficient
