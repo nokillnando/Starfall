@@ -60,14 +60,37 @@ function SimcadeCore.init(CONFIG)
         return fallback or "?"
     end
 
-    local kManual   = CONTROLS_CFG.ManualToggle  or (KEY and KEY.M)
-    local kIgn      = CONTROLS_CFG.Ignition      or (KEY and KEY.F)
-    local kCam      = CONTROLS_CFG.CameraToggle  or CAMERA_CFG.toggleKey or (KEY and KEY.V)
-    local kGearRst  = CONTROLS_CFG.GearReset     or (KEY and KEY.R)
-    local kFrontLk  = CONTROLS_CFG.FrontLock     or (KEY and KEY.K)
-    local kRearLk   = CONTROLS_CFG.RearLock      or (KEY and KEY.L)
-    local kAllLk    = CONTROLS_CFG.AllLock       or (KEY and KEY.J)
-    local kParkBrk  = CONTROLS_CFG.ParkingBrake  or (KEY and KEY.P)
+    local function inKeyLabel(k, fallback)
+        if not k or type(IN_KEY) ~= "table" then return fallback or "?" end
+        if k == IN_KEY.SPEED then return "Shift"
+        elseif k == IN_KEY.WALK then return "Alt"
+        elseif k == IN_KEY.JUMP then return "Space"
+        elseif k == IN_KEY.DUCK then return "Ctrl"
+        elseif k == IN_KEY.ATTACK then return "M1"
+        elseif k == IN_KEY.ATTACK2 then return "M2"
+        elseif k == IN_KEY.RELOAD then return "R"
+        elseif k == IN_KEY.USE then return "E"
+        elseif k == IN_KEY.ZOOM then return "Zoom" end
+        for name, val in pairs(IN_KEY) do
+            if val == k then return name end
+        end
+        return fallback or "?"
+    end
+
+    local function resolveBind(val, defaultKey)
+        if val == false then return nil end
+        return val or defaultKey
+    end
+
+    local kManual   = resolveBind(CONTROLS_CFG.ManualToggle,  KEY and KEY.M)
+    local kIgn      = resolveBind(CONTROLS_CFG.Ignition,      KEY and KEY.F)
+    local kCam      = resolveBind(CONTROLS_CFG.CameraToggle,  CAMERA_CFG.toggleKey or (KEY and KEY.V))
+    local kGearRst  = resolveBind(CONTROLS_CFG.GearReset,     KEY and KEY.R)
+    local kFrontLk  = resolveBind(CONTROLS_CFG.FrontLock,     KEY and KEY.K)
+    local kRearLk   = resolveBind(CONTROLS_CFG.RearLock,      KEY and KEY.L)
+    local kAllLk    = resolveBind(CONTROLS_CFG.AllLock,       KEY and KEY.J)
+    local kParkBrk  = resolveBind(CONTROLS_CFG.ParkingBrake,  KEY and KEY.P)
+    local kHorn     = resolveBind(CONTROLS_CFG.Horn,          KEY and KEY.G)
 
     -- ========================================================================
     -- CLIENT SIDE
@@ -147,6 +170,11 @@ function SimcadeCore.init(CONFIG)
                 net.writeUInt(10, 4)
                 net.writeBool(true)
                 SimcadeCore.sendPacket()
+            elseif kHorn and btn == kHorn then
+                net.start("Simcade_ClientKeyEvent")
+                net.writeUInt(12, 4)
+                net.writeBool(true)
+                SimcadeCore.sendPacket()
             end
         end)
 
@@ -154,6 +182,11 @@ function SimcadeCore.init(CONFIG)
             if btn == kIgn then
                 net.start("Simcade_ClientKeyEvent")
                 net.writeUInt(4, 4)
+                net.writeBool(false)
+                SimcadeCore.sendPacket()
+            elseif kHorn and btn == kHorn then
+                net.start("Simcade_ClientKeyEvent")
+                net.writeUInt(12, 4)
                 net.writeBool(false)
                 SimcadeCore.sendPacket()
             end
@@ -255,6 +288,10 @@ function SimcadeCore.init(CONFIG)
     local smoothedFwdAccel, smoothedLatAccel = 0, 0
     local lastVelWorld = nil
     local lastHudDriver = nil
+    camServerState.passengerSeats = {}
+    camServerState.activePassengers = {}
+    camServerState.nextPassengerPoll = 0
+    camServerState.passengerEnabled = (CAMERA_CFG.enabled ~= false and CAMERA_CFG.passengerCamEnabled ~= false)
     pcall(function() if enableHud then enableHud(owner(), true) end end)
     local cachedLiftForcePerSec = nil
     local skippedLiftApplied = Vector(0, 0, 0)
@@ -330,8 +367,9 @@ function SimcadeCore.init(CONFIG)
                 end
             end
         end
-        if cur.getAllConstrainedEntities then
-            local okCon, cons = pcall(function() return cur:getAllConstrainedEntities() end)
+        local getCon = (cur == Base and cur.getAllConstrained) or cur.getAllConstrainedEntities
+        if getCon then
+            local okCon, cons = pcall(getCon, cur)
             if okCon and type(cons) == "table" then
                 for _, ce in pairs(cons) do
                     if isValid(ce) and not seenMap[ce] then
@@ -407,6 +445,106 @@ function SimcadeCore.init(CONFIG)
         ctrlState._contraptionMass = total > 0 and total or nil
     end
 
+    local function isSeatEntity(ent)
+        if not isValid(ent) then return false end
+        if ent.isVehicle and ent:isVehicle() then return true end
+        return ent.getClass ~= nil and ent:getClass() == "prop_vehicle_prisoner_pod"
+    end
+
+    function camServerState.sendSeat(ply, seat, isPassenger, mode)
+        if not (isValid(ply) and isValid(Base) and isValid(seat)) then return false end
+        if (not net.canSend or net.canSend()) and net.getBytesLeft() > 64 then
+            local ok, sent = pcall(function()
+                net.start("Simcade_CameraSeat")
+                net.writeEntity(Base)
+                net.writeEntity(seat)
+                net.writeBool(isPassenger and true or false)
+                net.writeUInt((mode or 0) % 4, 2)
+                return SimcadeCore.sendPacket(ply)
+            end)
+            return ok and sent == true
+        end
+        return false
+    end
+
+    function camServerState.pollPassengers(nowTick, driver)
+        if not camServerState.passengerEnabled then return end
+        local seats = camServerState.passengerSeats
+        local active = camServerState.activePassengers
+        if (#seats == 0 and next(active) == nil) or nowTick < camServerState.nextPassengerPoll then return end
+        camServerState.nextPassengerPoll = nowTick + 0.1
+        local seenPass = {}
+        for i = 1, #seats do
+            local seat = seats[i]
+            if isValid(seat) then
+                local p = seat.getDriver and seat:getDriver() or nil
+                if isValid(p) and p ~= driver then
+                    seenPass[p] = seat
+                    local info = active[p]
+                    if not info or info.seat ~= seat then
+                        local initMode = (info and info.camMode)
+                            or (SimcadeCamera and SimcadeCamera.resolvePassengerMode and SimcadeCamera.resolvePassengerMode(CAMERA_CFG))
+                            or 1
+                        info = { seat = seat, camMode = initMode, sent = false }
+                        active[p] = info
+                        local hudOk, hudErr = pcall(enableHud, p, true)
+                        if not hudOk and p ~= owner() then
+                            pcall(printConsole, "[Simcade] Could not connect passenger HUD (link a Starfall HUD component to the passenger seat): " .. tostring(hudErr))
+                        end
+                        info.sent = camServerState.sendSeat(p, seat, true, initMode)
+                        local mName = (SimcadeCamera and SimcadeCamera.modeName and SimcadeCamera.modeName(initMode)) or "Chase"
+                        sendDriverPrint(p, string.format("Passenger Camera: %s (%s=Cycle, Scroll=Zoom)", mName, keyLabel(kCam, "V")))
+                    elseif not info.sent then
+                        info.sent = camServerState.sendSeat(p, seat, true, info.camMode)
+                    end
+                end
+            end
+        end
+        for p in pairs(active) do
+            if not seenPass[p] then
+                if isValid(p) and p ~= driver then
+                    if p == owner() then
+                        timer.simple(0.1, function()
+                            if isValid(owner()) then pcall(enableHud, owner(), true) end
+                        end)
+                    else
+                        pcall(function() if enableHud then enableHud(p, false) end end)
+                    end
+                end
+                active[p] = nil
+            end
+        end
+    end
+
+    local function refreshPassengerSeats(entList)
+        local list, seen = {}, {}
+        local ignore = {}
+        for _, e in ipairs(ExtraFilterStatic) do if isValid(e) then ignore[e] = true end end
+        if type(ExtraFilterSemiDynamic) == "table" then
+            for _, e in ipairs(ExtraFilterSemiDynamic) do if isValid(e) then ignore[e] = true end end
+        end
+        local wiredPass = wireInputs and wireInputs.PassengerSeats
+        if type(wiredPass) == "table" and #wiredPass > 0 then
+            for i = 1, #wiredPass do
+                local e = wiredPass[i]
+                if isValid(e) and e ~= Pod and not seen[e] and isSeatEntity(e) then
+                    seen[e] = true
+                    list[#list + 1] = e
+                end
+            end
+        elseif type(entList) == "table" then
+            for i = 1, #entList do
+                local e = entList[i]
+                if isValid(e) and e ~= Pod and not seen[e] and not ignore[e]
+                    and not (e.isPlayer and e:isPlayer()) and isSeatEntity(e) then
+                    seen[e] = true
+                    list[#list + 1] = e
+                end
+            end
+        end
+        camServerState.passengerSeats = list
+    end
+
     local function rebuildStaticFilter(driverEnt)
         traceFilter = {}
         filterSeen = {}
@@ -419,6 +557,7 @@ function SimcadeCore.init(CONFIG)
             expandFilterEntity(cur, filterSeen, queue, traceFilter)
         end
         refreshContraptionMass(traceFilter)
+        refreshPassengerSeats(traceFilter)
         if find and find.allPlayers then
             local ok, plys = pcall(find.allPlayers)
             if ok and type(plys) == "table" then
@@ -465,12 +604,18 @@ function SimcadeCore.init(CONFIG)
             traceFilter = FilterScan.Result
             filterSeen = FilterScan.Seen
             refreshContraptionMass(traceFilter)
+            refreshPassengerSeats(traceFilter)
         end
     end
 
     if timer and timer.create then
         timer.create("Simcade_ConstraintRefresh", math.max(0.25, TIRE_CFG.ConstraintRefreshInterval or 2.0), 0, startConstraintRefresh)
         timer.create("Simcade_SemiDynamicFilterUpdate", 10, 0, updateSemiDynamicFilter)
+        timer.simple(1.5, function()
+            if isValid(Base) and #camServerState.passengerSeats == 0 then
+                startConstraintRefresh()
+            end
+        end)
     end
 
     local function cleanupWheelHolos()
@@ -698,15 +843,49 @@ function SimcadeCore.init(CONFIG)
     end
 
     net.receive("Simcade_ClientKeyEvent", function(_, ply)
-        if not (physicsCar and isValid(Pod)) then return end
-        local drv = Pod:getDriver()
-        if not isValid(drv) or ply ~= drv then return end
-
+        if not isValid(ply) then return end
         local code = net.readUInt(4)
         local down = net.readBool()
 
+        local drv = isValid(Pod) and Pod:getDriver() or nil
+        if code == 5 then
+            if not down then return end
+            if isValid(drv) and ply == drv then
+                if SimcadeCamera and SimcadeCamera.toggleMode then
+                    local newCam = SimcadeCamera.toggleMode(camServerState)
+                    pcall(function()
+                        net.start("Simcade_CameraMode")
+                        net.writeUInt(newCam % 4, 2)
+                        SimcadeCore.sendPacket(drv)
+                    end)
+                    local mName = (SimcadeCamera.modeName and SimcadeCamera.modeName(newCam))
+                        or ((newCam == 0 and "Off") or (newCam == 1 and "Chase") or (newCam == 3 and "Freecam") or "FPV")
+                    sendDriverPrint(drv, "Camera Mode: " .. mName)
+                end
+            elseif camServerState.passengerEnabled and camServerState.activePassengers[ply] and SimcadeCamera and SimcadeCamera.togglePassengerMode then
+                local info = camServerState.activePassengers[ply]
+                local newCam = SimcadeCamera.togglePassengerMode(CAMERA_CFG, info.camMode)
+                info.camMode = newCam
+                pcall(function()
+                    net.start("Simcade_CameraMode")
+                    net.writeUInt(newCam % 4, 2)
+                    SimcadeCore.sendPacket(ply)
+                end)
+                local mName = (SimcadeCamera.modeName and SimcadeCamera.modeName(newCam))
+                    or ((newCam == 0 and "Off") or (newCam == 1 and "Chase") or (newCam == 3 and "Freecam") or "FPV")
+                sendDriverPrint(ply, "Passenger Camera: " .. mName)
+            end
+            return
+        end
+
+        if not (physicsCar and isValid(Pod)) then return end
+        if not isValid(drv) or ply ~= drv then return end
+
         if code == 4 then
             ctrlState.ignKeyHeld = down
+            return
+        elseif code == 12 then
+            ctrlState.hornHeld = down
             return
         end
         if not down then return end
@@ -716,16 +895,6 @@ function SimcadeCore.init(CONFIG)
             physicsCar:setManual(man)
             nextHudNetTime = 0
             sendDriverPrint(drv, man and "Gearbox: MANUAL" or "Gearbox: AUTOMATIC")
-        elseif code == 5 then
-            if SimcadeCamera and SimcadeCamera.toggleMode then
-                local newCam = SimcadeCamera.toggleMode(camServerState)
-                pcall(function()
-                    net.start("Simcade_CameraMode")
-                    net.writeUInt(newCam % 3, 2)
-                    SimcadeCore.sendPacket(drv)
-                end)
-                sendDriverPrint(drv, "Camera Mode: " .. ((newCam == 0 and "Off") or (newCam == 1 and "Chase") or "FPV"))
-            end
         elseif code == 7 then
             if physicsCar.manualBox and physicsCar.resetGear then
                 physicsCar:resetGear()
@@ -794,6 +963,9 @@ function SimcadeCore.init(CONFIG)
             updateSemiDynamicFilter()
         else
             wireInputs[name] = value
+            if name == "PassengerSeats" then
+                refreshPassengerSeats(traceFilter)
+            end
             if addonHost and addonHost.onWireInput then
                 addonHost.onWireInput(name, value)
             end
@@ -816,6 +988,70 @@ function SimcadeCore.init(CONFIG)
             readConnected("Base")
             startupInputs = nil
         end)
+    end
+
+    local function printDriverControls(Driver)
+        local sFullThr = inKeyLabel(CONTROLS_CFG.FullThrottle or (IN_KEY and IN_KEY.SPEED), "Shift")
+        local sClutch  = inKeyLabel(CONTROLS_CFG.Clutch       or (IN_KEY and IN_KEY.WALK),  "Alt")
+        local sHbk     = inKeyLabel(CONTROLS_CFG.Handbrake    or (IN_KEY and IN_KEY.JUMP),  "Space")
+        local sGearUp  = inKeyLabel(CONTROLS_CFG.GearUp       or (IN_KEY and IN_KEY.ATTACK), "M1")
+        local sGearDn  = inKeyLabel(CONTROLS_CFG.GearDown     or (IN_KEY and IN_KEY.ATTACK2), "M2")
+
+        local driveParts = {
+            "WASD=Drive",
+            sFullThr .. "=Full Thr",
+            sClutch .. "=Clutch",
+            sHbk .. "=Handbrake",
+        }
+        if ENGINE_CFG.ParkingBrakeToggle ~= false and kParkBrk then
+            driveParts[#driveParts + 1] = keyLabel(kParkBrk, "P") .. "=ParkBrake"
+        end
+
+        local sysParts = {}
+        if kIgn then
+            sysParts[#sysParts + 1] = keyLabel(kIgn, "F") .. "=Ignition"
+        end
+        if kManual then
+            local shiftHint = sGearUp .. "/" .. sGearDn .. "=Shift"
+            if kGearRst then
+                shiftHint = shiftHint .. ", " .. keyLabel(kGearRst, "R") .. "=Reset"
+            end
+            sysParts[#sysParts + 1] = string.format("%s=Manual (%s)", keyLabel(kManual, "M"), shiftHint)
+        end
+        if CAMERA_CFG.enabled ~= false and kCam then
+            sysParts[#sysParts + 1] = keyLabel(kCam, "V") .. "=Camera"
+        end
+        local hornCfg = CONFIG.SOUND_CFG and CONFIG.SOUND_CFG.Horn
+        if kHorn and TIRE_CFG.EnableAudio ~= false and hornCfg and hornCfg.enabled ~= false
+            and type(hornCfg.sndsource) == "string" and hornCfg.sndsource ~= "" then
+            sysParts[#sysParts + 1] = keyLabel(kHorn, "G") .. "=Horn"
+        end
+        if aHost and aHost.keyBindingOrder and aHost.keyHandlers then
+            for _, id in ipairs(aHost.keyBindingOrder) do
+                local h = aHost.keyHandlers[id]
+                if h and h.key then
+                    sysParts[#sysParts + 1] = keyLabel(h.key, "?") .. "=" .. tostring(id)
+                end
+            end
+        end
+
+        sendDriverPrint(Driver, "Controls:")
+        sendDriverPrint(Driver, table.concat(driveParts, " | "))
+        if #sysParts > 0 then
+            sendDriverPrint(Driver, table.concat(sysParts, " | "))
+        end
+        if ENGINE_CFG.ClassicAuto then
+            sendDriverPrint(Driver, string.format("Automatic: %s / %s select P, R, N, D", sGearUp, sGearDn))
+        end
+        if ENGINE_CFG.DiffLockToggleable ~= false then
+            local diffParts = {}
+            if kFrontLk then diffParts[#diffParts + 1] = keyLabel(kFrontLk, "K") .. "=Front" end
+            if kRearLk  then diffParts[#diffParts + 1] = keyLabel(kRearLk, "L")  .. "=Rear" end
+            if kAllLk   then diffParts[#diffParts + 1] = keyLabel(kAllLk, "J")   .. "=All" end
+            if #diffParts > 0 then
+                sendDriverPrint(Driver, "Diff Locks: " .. table.concat(diffParts, " | "))
+            end
+        end
     end
 
     hook.add("think", "Simcade_PhysicsTick", function()
@@ -876,30 +1112,17 @@ function SimcadeCore.init(CONFIG)
             if not hudEnabled then
                 pcall(printConsole, "[Simcade] Could not connect the driver's HUD: " .. tostring(hudError))
             end
-            if (not net.canSend or net.canSend()) and net.getBytesLeft() > 64 then
-                pcall(function()
-                    net.start("Simcade_CameraMode")
-                    net.writeUInt((camServerState.camMode or 1) % 3, 2)
-                    SimcadeCore.sendPacket(Driver)
-                end)
-            end
-            local sIgn = keyLabel(kIgn, "F")
-            local sMan = keyLabel(kManual, "M")
-            local sRst = keyLabel(kGearRst, "R")
-            local sCam = keyLabel(kCam, "V")
-            local sPrk = keyLabel(kParkBrk, "P")
-            sendDriverPrint(Driver, "Controls:")
-            sendDriverPrint(Driver, string.format("WASD=Drive | Shift=Full Thr | Alt=Clutch | Space=Handbrake | %s=ParkBrake", sPrk))
-            sendDriverPrint(Driver, string.format("%s=Ignition | %s=Manual (M1/M2=Shift, %s=Reset) | %s=Camera", sIgn, sMan, sRst, sCam))
-            if ENGINE_CFG.ClassicAuto then
-                sendDriverPrint(Driver, "Automatic: GearUp / GearDown (default M1 / M2) select P, R, N, D")
-            end
-            if ENGINE_CFG.DiffLockToggleable ~= false then
-                sendDriverPrint(Driver, string.format("Diff Locks: %s=Front | %s=Rear | %s=All", keyLabel(kFrontLk, "K"), keyLabel(kRearLk, "L"), keyLabel(kAllLk, "J")))
-            end
+            camServerState.sendSeat(Driver, Pod, false, camServerState.camMode or 1)
+            printDriverControls(Driver)
         elseif not hasDriver and lastHudDriver ~= nil then
-            if isValid(lastHudDriver) and lastHudDriver ~= owner() then
-                pcall(function() if enableHud then enableHud(lastHudDriver, false) end end)
+            if isValid(lastHudDriver) and not camServerState.activePassengers[lastHudDriver] then
+                if lastHudDriver == owner() then
+                    timer.simple(0.1, function()
+                        if isValid(owner()) then pcall(enableHud, owner(), true) end
+                    end)
+                else
+                    pcall(function() if enableHud then enableHud(lastHudDriver, false) end end)
+                end
             end
             lastHudDriver = nil
             rebuildStaticFilter(nil)
@@ -912,6 +1135,8 @@ function SimcadeCore.init(CONFIG)
                 end
             end
         end
+
+        camServerState.pollPassengers(nowTick, Driver)
 
         local ctrl = SimcadeControls.pollInputs(Driver, hasDriver, wireInputs, physicsCar, ctrlState, CONTROLS_CFG)
         local rawThrottle        = ctrl.rawThrottle
@@ -953,10 +1178,10 @@ function SimcadeCore.init(CONFIG)
         local steerInput         = ctrl.steerTarget
         local halfThrottleActive = ctrl.halfThrottleActive
         local lightsPressed      = (ctrl.fKey == 1)
-        local wKey, sKey, aKey, dKey, rKey = ctrl.wKey, ctrl.sKey, ctrl.aKey, ctrl.dKey, ctrl.rKey
 
         if not hasDriver then
             ctrlState.ignKeyHeld = false
+            ctrlState.hornHeld = false
         end
         local podLight = false
         if hasDriver and isValid(Pod) then
@@ -1532,7 +1757,7 @@ function SimcadeCore.init(CONFIG)
                 cachedLiftForcePerSec = nil
             end
 
-            -- Angular damping + yaw delta + air control
+            -- Angular damping + yaw delta
             local angDrag = VEHICLE_CFG.angularDrag or Vector(3.6, 3.8, 3.4)
             local rollPitchMult = (#groundedSuspWheels >= 3) and 0.55 or 0.15
             local rollRate = angVelLocal:dot(resolvedLocalFwd)
@@ -1546,10 +1771,6 @@ function SimcadeCore.init(CONFIG)
                 deltaAngVel.z = deltaAngVel.z - angVelLocal.z * (1.0 - math.exp(-yawStabRate * dt))
             end
 
-            if groundedCount == 0 and hasDriver then
-                local airStr = VEHICLE_CFG.airControlStrength or Vector(85, 75, 55)
-                deltaAngVel = deltaAngVel + Vector((dKey - aKey) * airStr.x * dt, (wKey - sKey) * airStr.y * dt, 0)
-            end
             local inPark = physicsCar.classicAuto and not physicsCar.manualBox and physicsCar.autoRange == 0
             local drivetrainOpen = inPark or clutchDown or (physicsCar.dt and physicsCar.dt.gear == 1) or rawHandbrake > 0.5
             local canHold = groundedCount >= 2 and (drivetrainOpen or (rawThrottle < 0.05 and (physicsCar.drv.thr or 0) < 0.05))
@@ -1917,8 +2138,10 @@ function SimcadeCore.init(CONFIG)
         local pDroop = ctrlState._pendingSuspDroop or 0
         local pGear  = ctrlState._pendingGearChanged == true
         local pBov   = ctrlState._pendingBovTrigger == true
+        local hornHeld = hasDriver and (ctrlState.hornHeld == true) or false
+        local pHornChanged = (hornHeld ~= (ctrlState._lastSyncedHorn == true))
 
-        if (now >= nextAudioNetTime or pGear or pBov or pBump > 0 or pDroop > 0) then
+        if (now >= nextAudioNetTime or pGear or pBov or pBump > 0 or pDroop > 0 or pHornChanged) then
             queue("audio", 0.24, nextAudioNetTime, function()
                 local dominantMatType = 0
                 if groundedCount > 0 then
@@ -1956,12 +2179,14 @@ function SimcadeCore.init(CONFIG)
                 local hasEngSoundEnt = isValid(ctrlState.engineSoundEnt)
                 net.writeBool(hasEngSoundEnt)
                 if hasEngSoundEnt then net.writeEntity(ctrlState.engineSoundEnt) end
+                net.writeBool(hornHeld)
                 if not sendTelemetry() then return false end
-                nextAudioNetTime = nextDeadline(nextAudioNetTime, (ignRes.running or ignRes.cranking or kmh > 1) and netInterval or math.max(netInterval, 0.30))
+                nextAudioNetTime = nextDeadline(nextAudioNetTime, (ignRes.running or ignRes.cranking or kmh > 1 or hornHeld) and netInterval or math.max(netInterval, 0.30))
                 ctrlState._pendingSuspBump = 0
                 ctrlState._pendingSuspDroop = 0
                 ctrlState._pendingGearChanged = false
                 ctrlState._pendingBovTrigger = false
+                ctrlState._lastSyncedHorn = hornHeld
                 return true
             end)
         end
@@ -2122,6 +2347,12 @@ function SimcadeCore.init(CONFIG)
     end)
 
     hook.add("removed", "Simcade_ServerCleanup", function()
+        for p in pairs(camServerState.activePassengers) do
+            if isValid(p) and p ~= owner() then
+                pcall(function() if enableHud then enableHud(p, false) end end)
+            end
+        end
+        camServerState.activePassengers = {}
         restoreBaseInertia()
         if addonHost then addonHost.runHook("OnCleanup") end
         cleanupWheelHolos()

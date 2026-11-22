@@ -21,7 +21,7 @@
 --@include simcadebase/simcade_prediction.txt
 
 -- Updated automatically when build_release.py builds to simcadebase/releases.
-local LOCAL_REVISION = 9
+local LOCAL_REVISION = 10
 -- Bump when the cores require a new setting or change an existing setting's meaning.
 -- Optional settings with backwards-compatible defaults can keep the same schema.
 local LOCAL_CONFIG_SCHEMA = 2

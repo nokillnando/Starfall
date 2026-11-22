@@ -66,7 +66,8 @@ if CLIENT then
             config = cfg,
             syncedState = {},
             bindKey = function(id, defaultKey)
-                keyBindings[id] = controlsCfg[id] or defaultKey
+                local boundKey = (controlsCfg[id] ~= nil) and controlsCfg[id] or defaultKey
+                keyBindings[id] = (boundKey ~= false) and boundKey or nil
             end,
             addWireInput = function() end,
             addWireOutput = function() end,
@@ -150,6 +151,7 @@ function SimcadeAddons.initServer(cfg, notifyDriverFn)
     local extraOutputs = {}
     local inputHandlers = {}
     local keyHandlers = {}
+    local keyBindingOrder = {}
     local wireValues = {}
     local overrides = {}
     local wraps = {}
@@ -172,7 +174,15 @@ function SimcadeAddons.initServer(cfg, notifyDriverFn)
             pendingEvents[name] = { data = data, time = timer.curtime() }
         end,
         bindKey = function(id, defaultKey, onPress, onRelease)
-            keyHandlers[id] = { key = (cfg.CONTROLS_CFG and cfg.CONTROLS_CFG[id]) or defaultKey, onPress = onPress, onRelease = onRelease }
+            local boundKey = (cfg.CONTROLS_CFG and cfg.CONTROLS_CFG[id] ~= nil) and cfg.CONTROLS_CFG[id] or defaultKey
+            if boundKey == false or boundKey == nil then
+                keyHandlers[id] = nil
+                return
+            end
+            if not keyHandlers[id] then
+                keyBindingOrder[#keyBindingOrder + 1] = id
+            end
+            keyHandlers[id] = { key = boundKey, onPress = onPress, onRelease = onRelease }
         end,
         addWireInput = function(name, portType, onChange)
             extraInputs[#extraInputs + 1] = { name = name, type = portType or "Number" }
@@ -259,6 +269,8 @@ function SimcadeAddons.initServer(cfg, notifyDriverFn)
         pendingEvents = pendingEvents,
         extraInputs = extraInputs,
         extraOutputs = extraOutputs,
+        keyHandlers = keyHandlers,
+        keyBindingOrder = keyBindingOrder,
         onWireInput = function(name, value)
             wireValues[name] = value
             local cb = inputHandlers[name]

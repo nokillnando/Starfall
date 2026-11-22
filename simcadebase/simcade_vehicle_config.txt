@@ -33,7 +33,6 @@ CONFIG.VEHICLE_CFG = {
     AutoAlignToPod              = false,
     comOffset                   = Vector(0, 0, 0),
     angularDrag                 = Vector(3.6, 3.8, 3.4),
-    airControlStrength          = Vector(85, 75, 55),
 
     -- Simulation and networking
     DriverPrediction            = true,      -- Predict the driver's Simcade gauges, sounds and tire effects
@@ -395,8 +394,9 @@ CONFIG.ENGINE_CFG = {
     peakPowerRPM       = 6600,
     redlineRPM         = 7200,
     limiterRPM         = 7100,
-    revLimitDrop       = 280,
-    revLimitDelay      = 0.04,
+    revLimitDrop       = 280,       -- RPM drop below limiterRPM before ignition returns (0 = pure time-based cut, 60-120 = rapid race bounce, 250-500+ = deep drop)
+    revLimitDelay      = 0.04,      -- Minimum ignition-cut hold time in seconds (e.g. 0.01-0.03 = ultra-quick race cut, 0.04-0.12 = slower/heavier cut)
+    flywheelInertia    = nil,       -- Rotational inertia (kg·m²; nil/0 = auto from displacement & cylinders). Lower = faster rev up & down (0.03-0.08 race, 0.10-0.22 street, 0.25-0.45+ heavy; clamped 0.03..1.50)
 
     -- ------------------------------------------------------------------------
     -- 2. Ignition & Starter (Sim-Engine 4-state: 0=Off, 1=Crank, 2=Start, 3=Run)
@@ -536,30 +536,42 @@ CONFIG.CONTROLS_CFG = {
     FrontLock     = KEY.K,            -- Toggle Front Diff Lock (when DiffLockToggleable = true)
     RearLock      = KEY.L,            -- Toggle Rear Diff Lock (when DiffLockToggleable = true)
     AllLock       = KEY.J,            -- Toggle All / Center Diff Lock (when DiffLockToggleable = true)
+    Horn          = KEY.G,            -- Hold to sound horn (uses SOUND_CFG.Horn)
 }
 
 CONFIG.CAMERA_CFG = {
-    enabled             = true,
-    chaseEnabled        = true,
-    fpvEnabled          = true,
-    defaultMode         = 1,         -- 0 = Off, 1 = Chase Cam, 2 = FPV (Press [V] in seat to cycle)
-    toggleKey           = KEY.V,
-    maxDist             = 190,
-    minDist             = 160,
-    heightOffset        = 55,
-    pitchOffset         = 5,
-    angleResponsiveness = 3.5,
-    posDamping          = 15,
-    centerForce         = 15,
-    boundaryForce       = 75,
-    lookAhead           = true,
-    lookAheadDist       = 200,
-    idleTimeout         = 2.0,
-    mouseSens           = 0.05,
-    doCollision         = true,
-    colMask             = 131083,
-    colExtra            = 8,
-    fpvOffset           = Vector(-10, 0, 28),
+    enabled                 = true,
+    chaseEnabled            = true,
+    fpvEnabled              = true,
+    freecamEnabled          = false,     -- Optional 360° orbit freecam mode for driver (no auto-recenter)
+    defaultMode             = 1,         -- 0 = Off, 1 = Chase Cam, 2 = FPV, 3 = Freecam (Press [V] in seat to cycle)
+    toggleKey               = KEY.V,
+    maxDist                 = 190,
+    minDist                 = 160,
+    heightOffset            = 55,
+    pitchOffset             = 5,
+    angleResponsiveness     = 3.5,
+    posDamping              = 15,
+    centerForce             = 15,
+    boundaryForce           = 75,
+    lookAhead               = true,
+    lookAheadDist           = 200,
+    idleTimeout             = 2.0,
+    mouseSens               = 0.05,
+    doCollision             = true,
+    colMask                 = 131083,    -- World-only trace mask so vehicle body collision props don't push the camera inside
+    colExtra                = 8,
+    fpvOffset               = Vector(-10, 0, 28),
+
+    -- Passenger camera (auto-detects constrained/parented passenger seats on Base)
+    passengerCamEnabled     = true,      -- Enable custom camera for passengers (avoids Source cam colliding with body props)
+    passengerDefaultMode    = 1,         -- 0 = Off, 1 = Chase, 2 = FPV (seat-anchored), 3 = Freecam (360° orbit, no auto-recenter)
+    passengerChaseEnabled   = true,
+    passengerFreecamEnabled = true,
+    passengerFpvEnabled     = true,
+    passengerDist           = 190,       -- Initial orbit distance for passenger Freecam (scroll wheel zooms)
+    passengerHeightOffset   = 55,        -- Orbit center height above Base for passenger Chase/Freecam
+    passengerFpvOffset      = Vector(0, 0, 28), -- Eye offset from passenger seat in FPV
 }
 
 CONFIG.HUD_CFG = {
@@ -605,6 +617,17 @@ CONFIG.SOUND_CFG = {
     TurboVolume            = 1.0,
     TurboBOVPitch          = 1.0,
     TurboBOVVolume         = 1.0,
+    Horn = { -- Hold CONTROLS_CFG.Horn to sound horn (local sound path or https:// URL)
+        enabled   = true,
+        sndsource = "ambient/alarms/klaxon1.wav",
+        loadMode  = "stream", -- "stream" or "download" for web URLs
+        volume    = 0.85,
+        pitch     = 1.0,
+        loop      = true, -- true = continuous while held, false = one-shot on press
+        fadeIn    = 25,   -- Ramp-in speed when loop = true
+        fadeOut   = 18,   -- Ramp-out speed when loop = true
+        cooldown  = 0.25, -- Min seconds between presses when loop = false
+    },
     SuperchargerSound = { -- Optional loop; supply a supercharger whine path to enable
         enabled = false,
         sndsource = "",

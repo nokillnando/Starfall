@@ -200,7 +200,8 @@ function SimcadeEngine.synthesizeSpec(cfg)
 
     -- Auto-derive flywheel inertia and engine braking from displacement & cylinders unless overridden
     local autoInertia = math.clamp(0.06 + liters * 0.035 + (cylinders - 4) * 0.008, 0.07, 0.45)
-    local flywheelInertia = tonumber(cfg.flywheelInertia) or autoInertia
+    local cfgInertia = tonumber(cfg.flywheelInertia)
+    local flywheelInertia = (cfgInertia and cfgInertia > 0) and cfgInertia or autoInertia
     local autoEngBrake = math.clamp(35 + liters * 24 + cylinders * 4, 40, 260)
     local engineBrakeTorque = tonumber(cfg.engineBrakeTorque) or autoEngBrake
 

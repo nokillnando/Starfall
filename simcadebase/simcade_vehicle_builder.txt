@@ -355,7 +355,7 @@ function SimcadeVehicleBuilder.buildCarData(vehicleCfg, tireCfg, suspCfg, engine
         c[124] = spec.idleRPM
         c[125] = spec.redlineRPM
         c[126] = spec.limiterRPM
-        c[127] = clamp(spec.flywheelInertia * 0.001, 0.00010, 0.0015)
+        c[127] = clamp(spec.flywheelInertia * 0.001, 0.00003, 0.0015)
         engineTorqueCurve = spec.torqueCurve
         enginePeakTorqueNm = spec.peakTorqueNm
         for i = 0, 8 do

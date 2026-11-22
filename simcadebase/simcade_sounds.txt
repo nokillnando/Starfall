@@ -108,11 +108,11 @@ local function createLoopSound(ent, primaryPath, fallbackPath, forceDownload, us
                 local holder = { snd = nil, isBass = true, lastVol = -1 }
                 loadBassAudio(sndPath, "3d noblock noplay", forceDownload, function(s)
                     if s and isValid(s) and isValid(ent) then
-                        if useOverheadBass and s.setFade then s:setFade(1000, 100000) end
-                        s:setPos(ent:getPos())
-                        s:setVolume(0)
-                        if s.setLooping then s:setLooping(true) end
-                        s:play()
+                        if useOverheadBass and s.setFade then pcall(s.setFade, s, 1000, 100000) end
+                        pcall(s.setPos, s, ent:getPos())
+                        pcall(s.setVolume, s, 0)
+                        if s.setLooping then pcall(s.setLooping, s, true) end
+                        pcall(s.play, s)
                         holder.snd = s
                     end
                 end)
@@ -154,8 +154,17 @@ local function applyManagedVolPitch(s, isBass, pos, vol, pitch100)
             pcall(s.setPitch, s, clamp(pitch100, 25, 250), 0.04)
         end
     end
-    if not isBass and vol > 0.01 and s.isPlaying and not s:isPlaying() then
-        s:play()
+    if vol > 0.01 then
+        if isBass then
+            local stopped = (s.getState and s:getState() == 0) or (not s.getState and s.isPlaying and not s:isPlaying())
+            if stopped then
+                if s.setLooping then pcall(s.setLooping, s, true) end
+                if s.setTime then pcall(s.setTime, s, 0) end
+                s:play()
+            end
+        elseif s.isPlaying and not s:isPlaying() then
+            s:play()
+        end
     end
 end
 
@@ -166,7 +175,10 @@ local function setManagedVolPitch(sndObj, isBass, pos, vol, pitch100, bassPos, b
     local finalPos = (isBass and bassPos) or pos
     local finalVol = isBass and (vol * (bassAtten or 1)) or vol
     if isBass then
-        if finalVol <= 0.001 and sndObj.lastVol == 0 then return end
+        if finalVol <= 0.001 and sndObj.lastVol == 0 then
+            if isValid(s) and s.setPos and finalPos then pcall(s.setPos, s, finalPos) end
+            return
+        end
         sndObj.lastVol = finalVol <= 0.001 and 0 or finalVol
     end
     pcall(applyManagedVolPitch, s, isBass, finalPos, finalVol, pitch100)
@@ -315,12 +327,26 @@ function SimcadeSounds.initClient(cfg)
     local pendingSuspBumpInt    = 0
     local pendingSuspDroopInt   = 0
     local soundInitStage        = 0
+    local hornCfg               = (type(SND.Horn) == "table") and SND.Horn or {}
+    local hornPathRaw           = hornCfg.sndsource or hornCfg.path or (type(SND.Horn) == "string" and SND.Horn or "")
+    local hornPath              = type(hornPathRaw) == "string" and hornPathRaw or ""
     local soundTick = {
         due = 0,
         interval = math.min(0.02, SimcadeCore.networkInterval(cfg.VEHICLE_CFG)),
         useOverheadBass = useOverheadBass,
         computeBassAnchor = computeBassAnchor,
         updateActiveBassPos = updateActiveBassPos,
+        horn = {
+            cfg = hornCfg,
+            path = hornPath,
+            enabled = (hornCfg.enabled ~= false) and hornPath ~= "",
+            loop = (hornCfg.loop ~= false),
+            snd = nil,
+            bass = false,
+            vol = 0,
+            prevHeld = false,
+            nextOneShot = 0,
+        },
     }
 
     local function collectVariants(cfgEntry)
@@ -478,6 +504,9 @@ function SimcadeSounds.initClient(cfg)
         if gearWhine.onClank.enabled == true then preloadOneShot(gearWhine.onClank, nil) end
         if gearWhine.offClank.enabled == true then preloadOneShot(gearWhine.offClank, nil) end
     end
+    if soundTick.horn.enabled and not soundTick.horn.loop then
+        preloadOneShot(soundTick.horn.cfg, soundTick.horn.path)
+    end
 
     local function isCpuHot(limit)
         local qMax = quotaMax and quotaMax() or 0
@@ -506,6 +535,7 @@ function SimcadeSounds.initClient(cfg)
         local surfId        = net.readUInt(8)
         local hasEngEnt     = net.readBool()
         local engEnt        = hasEngEnt and net.readEntity() or nil
+        local hornHeld      = net.readBool()
 
         lastAudio.rpm      = rpm
         lastAudio.redline  = math.max(3000, redline or 8000)
@@ -517,6 +547,7 @@ function SimcadeSounds.initClient(cfg)
         lastAudio.running  = running
         lastAudio.surfId   = surfId or 1
         lastAudio.gear     = gear
+        lastAudio.horn     = hornHeld
 
         if ent and ent:isValid() then
             local resolvedEngEnt = (engEnt and engEnt:isValid()) and engEnt or ent
@@ -546,6 +577,7 @@ function SimcadeSounds.initClient(cfg)
             updPos(inductionSounds.turbo.snd, inductionSounds.turbo.bass, frameEngBassPos)
             updPos(inductionSounds.supercharger.snd, inductionSounds.supercharger.bass, frameEngBassPos)
             updPos(starterSnd, starterBass, frameEngBassPos)
+            updPos(soundTick.horn.snd, soundTick.horn.bass, frameEngBassPos)
             for _, track in pairs(gearWhine.tracks) do
                 updPos(track.snd, track.bass, frameEngBassPos)
             end
@@ -575,6 +607,8 @@ function SimcadeSounds.initClient(cfg)
                     stopManagedSound(track.snd, track.bass)
                 end
                 stopManagedSound(starterSnd, starterBass)
+                stopManagedSound(soundTick.horn.snd, soundTick.horn.bass)
+                soundTick.horn.snd, soundTick.horn.bass, soundTick.horn.vol = nil, false, 0
                 stopManagedSound(skidSnd, skidBass)
                 stopManagedSound(rollSnd, rollBass)
                 baseEnt = pendingBaseEnt
@@ -608,6 +642,9 @@ function SimcadeSounds.initClient(cfg)
                 return
             elseif soundInitStage == 5 then
                 starterSnd, starterBass = createLoopSound(initEngEnt, starterPath, DEFAULT_SOUNDS.fallbackStarter, globalDownload, overheadBass)
+                if soundTick.horn.enabled and soundTick.horn.loop then
+                    soundTick.horn.snd, soundTick.horn.bass = createLoopSound(initEngEnt, soundTick.horn.path, nil, shouldDownloadEntry(soundTick.horn.cfg, globalDownload), overheadBass)
+                end
                 soundInitStage = 6
                 return
             elseif soundInitStage == 6 then
@@ -656,7 +693,7 @@ function SimcadeSounds.initClient(cfg)
         local pred = SimcadePrediction and SimcadePrediction.get and SimcadePrediction.get(baseEnt)
         local throttle = pred and pred.result.throttle or lastAudio.thr
         local speed = pred and math.abs(pred.result.forward_ms) * 3.6 or lastAudio.speed
-        local skid = pred and pred.skid or lastAudio.skid
+        local skid = pred and math.max(pred.skid or 0, lastAudio.skid or 0) or lastAudio.skid
         local boost = pred and pred.turboPSI or lastAudio.boost
 
         local confirmationWindow = pred and pred.roundTrip + 0.25 or 0.3
@@ -919,6 +956,28 @@ function SimcadeSounds.initClient(cfg)
             setManagedVolPitch(curRollSnd, curRollBass, basePos, curRollVol, curRollPitch, bassPos, bassAtten)
         end
 
+        local horn = soundTick.horn
+        if horn.enabled then
+            local hornHeld = lastAudio.horn == true
+            local hornPitch = clamp((tonumber(horn.cfg.pitch) or 1.0) * 100, 40, 220)
+            local hornMaxVol = clamp(tonumber(horn.cfg.volume) or 0.85, 0, 2)
+            if horn.loop then
+                if horn.snd then
+                    local rate = hornHeld and math.max(1, tonumber(horn.cfg.fadeIn) or 25) or math.max(1, tonumber(horn.cfg.fadeOut) or 18)
+                    local targetVol = hornHeld and hornMaxVol or 0
+                    horn.vol = horn.vol + (targetVol - horn.vol) * math.min(1, soundDt * rate)
+                    if not hornHeld and horn.vol < 0.005 then horn.vol = 0 end
+                    setManagedVolPitch(horn.snd, horn.bass, engPos, horn.vol, hornPitch, engBassPos, engBassAtten)
+                end
+            else
+                if hornHeld and not horn.prevHeld and now >= horn.nextOneShot then
+                    horn.nextOneShot = now + math.max(0.05, tonumber(horn.cfg.cooldown) or 0.25)
+                    playOneShot(engEnt, engPos, horn.cfg, horn.path, hornMaxVol, hornPitch)
+                end
+            end
+            horn.prevHeld = hornHeld
+        end
+
         if SimcadeAddons and SimcadeAddons._clientHost then
             SimcadeAddons._clientHost.runHook("OnSoundTick", baseEnt, lastAudio)
         end
@@ -933,6 +992,7 @@ function SimcadeSounds.initClient(cfg)
             stopManagedSound(track.snd, track.bass)
         end
         stopManagedSound(starterSnd, starterBass)
+        stopManagedSound(soundTick.horn.snd, soundTick.horn.bass)
         for _, entry in pairs(surfaceSounds) do
             stopManagedSound(entry.skidSnd, entry.skidBass)
             stopManagedSound(entry.rollSnd, entry.rollBass)

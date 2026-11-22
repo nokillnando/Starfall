@@ -480,17 +480,25 @@ return function(options)
             local cx, cy = w * 0.5, h * 0.5
 
             -- Clean LVS-style shadowed floating text (opaque alpha for crisp $alphatest)
-            if labelFont and render.setFont then render.setFont(labelFont) end
-            render.setColor(Color(0, 0, 0, 255))
-            render.drawSimpleText(cx + 6, cy - 68 + 6, rtTitle, 1, 1)
-            render.setColor(Color(255, 255, 255, 255))
-            render.drawSimpleText(cx, cy - 68, rtTitle, 1, 1)
+            if rtSub == "" then
+                if labelFont and render.setFont then render.setFont(labelFont) end
+                render.setColor(Color(0, 0, 0, 255))
+                render.drawSimpleText(cx + 6, cy + 6, rtTitle, 1, 1)
+                render.setColor(Color(rtAccent.r, rtAccent.g, rtAccent.b, 255))
+                render.drawSimpleText(cx, cy, rtTitle, 1, 1)
+            else
+                if labelFont and render.setFont then render.setFont(labelFont) end
+                render.setColor(Color(0, 0, 0, 255))
+                render.drawSimpleText(cx + 6, cy - 68 + 6, rtTitle, 1, 1)
+                render.setColor(Color(255, 255, 255, 255))
+                render.drawSimpleText(cx, cy - 68, rtTitle, 1, 1)
 
-            if subFont and render.setFont then render.setFont(subFont) end
-            render.setColor(Color(0, 0, 0, 255))
-            render.drawSimpleText(cx + 5, cy + 54 + 5, rtSub, 1, 1)
-            render.setColor(Color(rtAccent.r, rtAccent.g, rtAccent.b, 255))
-            render.drawSimpleText(cx, cy + 54, rtSub, 1, 1)
+                if subFont and render.setFont then render.setFont(subFont) end
+                render.setColor(Color(0, 0, 0, 255))
+                render.drawSimpleText(cx + 5, cy + 54 + 5, rtSub, 1, 1)
+                render.setColor(Color(rtAccent.r, rtAccent.g, rtAccent.b, 255))
+                render.drawSimpleText(cx, cy + 54, rtSub, 1, 1)
+            end
 
             render.selectRenderTarget()
         end)
@@ -621,8 +629,17 @@ return function(options)
                 if ShowLabel then
                     ensureLabelAssets()
                     if isValid(labelHolo) then
-                        local title = best._occupied and "OCCUPIED" or ("[" .. getUseKeyName() .. "] Enter")
-                        local sub = best._occupied and (best.label .. " - " .. best._driverName) or best.label
+                        local title, sub
+                        if best._occupied then
+                            title = "OCCUPIED"
+                            sub = best.label .. " - " .. best._driverName
+                        elseif AllowEnterVehicle then
+                            title = "[" .. getUseKeyName() .. "] Enter"
+                            sub = best.label
+                        else
+                            title = best.label
+                            sub = ""
+                        end
                         local key = title .. "|" .. sub .. "|" .. tostring(accent.r) .. "," .. tostring(accent.g) .. "," .. tostring(accent.b)
                         if key ~= lastRenderKey then
                             lastRenderKey = key

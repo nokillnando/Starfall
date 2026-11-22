@@ -228,7 +228,7 @@ function Chassis:place(x, y, headingRad, gz)
     end
     local E = self.eng
     E.w = c[124] * RAD_RPM
-    E.T = 0; E.tload = 0; E.lim = false
+    E.T = 0; E.tload = 0; E.lim = false; E.limUntil = 0
     E.inductionTorqueRatio, E.boostPSI = 1.0, 0
     local d = self.dt
     d.gear = 2; d.req = 2; d.state = 1; d.clutch = 0; d.last = 0; d.shifting = 0; d.mem = 0; d.grind = nil; d.mode = 0
@@ -1038,10 +1038,18 @@ function Chassis:postEngine()
     local rpm = E.w * RPM
     self.lastTload = E.tload
     E.tload = 0
+    local dropRPM = self.revLimitDrop
+    if dropRPM == nil then dropRPM = 0.012500000186264515 * c[126] end
+    local delaySec = self.revLimitDelay or 0
+    local now = self.now or 0
     if E.lim then
-        if rpm < c[126] - 0.012500000186264515 * c[126] then E.lim = false end
-    elseif rpm > -25 + c[126] then
+        local releaseRPM = max(c[124], c[126] - dropRPM)
+        if now >= (E.limUntil or 0) and (rpm <= releaseRPM or ((E.T or 0) < 0.05 and rpm < c[126] - 50)) then
+            E.lim = false
+        end
+    elseif rpm >= c[126] - 25 then
         E.lim = true
+        E.limUntil = now + delaySec
     end
 end
 function Chassis:gearRatio(g)
@@ -1151,7 +1159,7 @@ function Chassis:torque()
         local overRevRatio = rpm / max(1, self.c[126])
         v14 = v14 * clamp(overRevRatio * overRevRatio, 1, 16)
     end
-    if E.lim then v14 = v14 * 2 end
+    if E.lim then v14 = (v14 < -0.01) and (v14 * 2) or -0.02 end
     local r = v14 + v18
     if r < 0 and not E.lim then
         return r * (self.dt.gear == 1 and 0.65 or 0.90)
@@ -1738,6 +1746,8 @@ function Chassis:carryFrom(old)
         W.su.x = O.su.x
     end
     self.eng.w = old.eng.w
+    self.eng.lim = old.eng.lim
+    self.eng.limUntil = old.eng.limUntil and (old.eng.limUntil - old.now + self.now) or 0
     local d, od = self.dt, old.dt
     d.gear, d.req, d.state, d.clutch, d.shifting, d.timer, d.want, d.last = od.gear, od.req, od.state, od.clutch, od.shifting, od.timer, od.want, od.last
     self.drv.gear, self.drv.want, self.drv.u16Deg = old.drv.gear, old.drv.want, old.drv.u16Deg
@@ -1800,6 +1810,8 @@ local function initializeVehiclePhysicsBridge(PhysicsApi)
         end
         if data.engineTorqueCurve then car.eng.tq = data.engineTorqueCurve end
         car.maxTorqueNm = data.enginePeakTorqueNm or (engineCfg and engineCfg.PeakTorqueNm) or 260
+        car.revLimitDrop  = max(0, tonumber(engineCfg and engineCfg.revLimitDrop) or 280)
+        car.revLimitDelay = max(0, tonumber(engineCfg and engineCfg.revLimitDelay) or 0.04)
         car.baseParams = cloneArr(data.c, 0, 164)
         car.tireSimSpecs = data.tireSimSpecs
         car.compoundName = compoundName or "Sport"
