@@ -8,7 +8,7 @@
 
 local CONFIG = {}
 -- Advance only after applying the required settings for the new config format.
-CONFIG.SCHEMA_VERSION = 2
+CONFIG.SCHEMA_VERSION = 3
 
 CONFIG.CORE_UPDATE = {
     enabled = true,
@@ -31,8 +31,8 @@ CONFIG.VEHICLE_CFG = {
     InvertForward               = false,
     InvertRight                 = false,
     AutoAlignToPod              = false,
-    comOffset                   = Vector(0, 0, 0),
-    angularDrag                 = Vector(3.6, 3.8, 3.4),
+    comOffset                   = Vector(0, 0, 0),       -- Shifts the wheel/suspension origin relative to the Base prop's mass center (Source units: X=fwd, Y=left, Z=up). Does not move GMod's VPhysics COM; use frontWeightBias / centerOfMassHeight / CGHeight for weight balance.
+    angularDrag                 = Vector(3.6, 3.8, 0), -- Chassis roll (X) and pitch (Y) damping (scaled 0.55 on ground, 0.15 airborne). Z is unused (yaw damping uses STEERING_CFG.yawStabilityAssist).
 
     -- Simulation and networking
     DriverPrediction            = true,      -- Predict the driver's Simcade gauges, sounds and tire effects
