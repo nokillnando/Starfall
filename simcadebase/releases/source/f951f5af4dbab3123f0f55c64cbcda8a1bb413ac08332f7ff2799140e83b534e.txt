@@ -1,0 +1,2584 @@
+--@name Simcade Vehicle Physics Core
+--@author [C17] Red Fox & Gemini and - (noname)
+--@shared
+
+local SimcadeVehiclePhysics = {}
+local Steering = assert(SimcadeSteering, "Load simcade_steering.txt before simcade_vehicle_physics.txt")
+local Aero = assert(SimcadeAero, "Load simcade_aero.txt before simcade_vehicle_physics.txt")
+local VehicleBuilder = assert(SimcadeVehicleBuilder, "Load simcade_vehicle_builder.txt before simcade_vehicle_physics.txt")
+
+local function makePhysicsCurves()
+return {assist=1,
+atan={len=257,[0]=0,1,3,4,5,7,8,9,10,12,13,14,15,17,18,19,20,22,23,24,26,27,28,29,31,32,33,34,36,37,38,39,41,42,43,44,46,47,48,49,51,52,53,54,56,57,58,59,61,62,63,64,65,67,68,69,70,72,73,74,75,76,78,79,80,81,82,84,85,86,87,88,89,91,92,93,94,95,96,98,99,100,101,102,103,105,106,107,108,109,110,111,113,114,115,116,117,118,119,120,121,123,124,125,126,127,128,129,130,131,132,133,134,136,137,138,139,140,141,142,143,144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,176,176,177,178,179,180,181,182,183,184,185,186,187,187,188,189,190,191,192,193,194,195,195,196,197,198,199,200,201,201,202,203,204,205,206,206,207,208,209,210,210,211,212,213,214,214,215,216,217,218,218,219,220,221,222,222,223,224,225,225,226,227,228,228,229,230,231,231,232,233,233,234,235,236,236,237,238,238,239,240,241,241,242,243,243,244,245,245,246,247,247,248,249,249,250,251,251,252,253,253,254,255,255,0},
+ang_damp={n=6,lo=0,hi=10,k=0.5,v={len=6,[0]=0.05000000074505806,0.05000000074505806,0.25,0.699999988079071,2,5}},
+rest={n=8,lo=0,hi=1,k=7,v={len=8,[0]=1.5,1,0.6000000238418579,0.2199999988079071,0.05999999865889549,0.029999999329447746,0.014999999664723873,0}},
+clutch_dir={len=4,[0]=-3,0,1.5,0},
+first_gear={len=10,[0]=-10,1,-7.5,0.9599999785423279,-3.5,0.925000011920929,-0.30000001192092896,0.875,-0.05000000074505806,0},
+firstGearLoadScale=-0.7,
+yaw_damp={len=6,[0]=0,0,0.4000000059604645,0,2,20},
+aero_front=Aero.frontForceOffset,
+aero_rear=Aero.rearForceOffset,
+}
+end
+
+local function makeShiftLogic()
+    local M = {}
+    local function trunc(x)
+        return x < 0 and math.ceil(x) or math.floor(x)
+    end
+    function M.shiftPoints(c, top)
+        local up, down = {}, {}
+        for i = 0, 11 do up[i] = 0; down[i] = 0 end
+        local idle, redline, limiter = c[124], c[125], c[126]
+        up[1] = (redline - idle) * c[108] + idle
+        local last = top + 1
+        local gear = 2
+        while gear < last do
+            local r0, r1 = c[108 + 9 + gear - 1], c[108 + 9 + gear]
+            up[gear] = redline - 100
+            down[gear + 1] = math.abs(r0) <= 1e-5 and 0 or r1 / r0 * up[gear]
+            gear = gear + 1
+        end
+        up[gear] = limiter + 500
+        return up, down
+    end
+    return M
+end
+local function makeVehicleSolver()
+local M = {}
+local abs, sqrt, floor, ceil, sin, cos, min, max = math.abs, math.sqrt, math.floor, math.ceil, math.sin, math.cos, math.min, math.max
+local PI = math.pi
+local RPM, RAD_RPM = 9.549296760559082, 0.10471975803375244
+local U16_RAD = 9.587379924e-05
+local SUBSTEP = 0.0044      -- flt_7FC070
+local MPH = 2.2369999885559082
+local function clamp(v, a, b)
+    if v < a then return a elseif v > b then return b end
+    return v
+end
+local function trunc(x)
+    if x < 0 then return ceil(x) end
+    return floor(x)
+end
+local frexp, ldexp = math.frexp, math.ldexp
+local function f32(x)
+    if x == 0 or x ~= x or x == math.huge or x == -math.huge then return x end
+    local m, e = frexp(x)
+    local bits = 24
+    if e < -125 then bits = 24 - (-125 - e) end     -- a denormal keeps fewer
+    if bits < 1 then return 0 * x end
+    local s = ldexp(m, bits)
+    local r = floor(s)
+    local f = s - r
+    if f > 0.5 or (f == 0.5 and r % 2 == 1) then r = r + 1 end
+    return ldexp(r, e - bits)
+end
+M.f32 = f32
+local function curve(t, x)
+    if t.points then
+        local points = t.points
+        local first = points[1]
+        if x <= first.rpm then return first.value end
+        if x >= points[t.n].rpm then return points[t.n].value end
+        local lower, upper = 1, t.n
+        while upper - lower > 1 do
+            local middle = floor((lower + upper) * 0.5)
+            if x < points[middle].rpm then upper = middle else lower = middle end
+        end
+        local previous, current = points[lower], points[upper]
+        local fraction = (x - previous.rpm) / (current.rpm - previous.rpm)
+        return previous.value + (current.value - previous.value) * fraction
+    end
+    local v = (x - t.lo) * t.k
+    local i = v < 0 and ceil(v) or floor(v)
+    if i < 0 or v < 0 then return t.v[0] end
+    if i >= t.n - 1 then return t.v[t.n - 1] end
+    local f = v - i
+    return (1 - f) * t.v[i] + f * t.v[i + 1]
+end
+local function points(p, x)
+    local n = floor(p.len / 2)
+    if x <= p[0] then return p[1] end
+    if x >= p[2 * n - 2] then return p[2 * n - 1] end
+    for i = 0, n - 2 do
+        if x >= p[2 * i] and x < p[2 * i + 2] then
+            return (p[2 * i + 3] - p[2 * i + 1]) * ((x - p[2 * i]) / (p[2 * i + 2] - p[2 * i])) + p[2 * i + 1]
+        end
+    end
+    return p[1]
+end
+local function ticksOf(dt) return trunc(f32(dt) * 4000 + 0.5) end
+local function vec(a, b, c) return { [0] = a, b, c } end
+local function dot(a, b) return a[0] * b[0] + a[1] * b[1] + a[2] * b[2] end
+local function len(a) return sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]) end
+local function toWorld(R, v) return vec(v[0] * R[0] + v[1] * R[3] + v[2] * R[6], v[0] * R[1] + v[1] * R[4] + v[2] * R[7], v[0] * R[2] + v[1] * R[5] + v[2] * R[8]) end
+local function toLocal(R, v) return vec(v[0] * R[0] + v[1] * R[1] + v[2] * R[2], v[0] * R[3] + v[1] * R[4] + v[2] * R[5], v[0] * R[6] + v[1] * R[7] + v[2] * R[8]) end
+local function slice(c, from, to)
+    local out, n = {}, 0
+    for i = from, to - 1 do out[n] = c[i]; n = n + 1 end
+    return out
+end
+local Chassis = {}
+Chassis.__index = Chassis
+function M.new(data)
+    local self = setmetatable({}, Chassis)
+    self.data = data
+    self.braking = data.braking
+    self.steerCfg = data.steerCfg
+    self.race = nil
+    self.isDrag = false
+    local c = data.c
+    self.c = c
+    self.T = data.T
+    self.top = data.top
+    self.up = data.up
+    self.down = data.down
+    self.winScale = 1
+    self.clutchK = 1
+    self.ranges = { up = { [0] = -100, 0 }, down = { [0] = -100, 0 }, r3 = { [0] = -100, 0 } }
+    self.now = 0
+    self.yawAcc, self.yawPrev = 0, 0
+    self.assist = self.T.assist     -- the car's +1124: a player's option, on by default (0x7FAA3C)
+    self.manualBox = self.isDrag
+    self.clutchPedal = 1
+    self.m = c[68]
+    self.im = 1 / self.m
+    self.Iinv = vec(1 / c[72], 1 / c[77], 1 / c[82])
+    self.Iinv2 = vec(1 / c[72], 1 / c[77], 1 / (c[82] * c[88]))   -- on the ground its yaw inertia counts for more
+    self.cg = vec(c[0], c[1], c[2])
+    self.hull = {}
+    local lo, hi = vec(math.huge, math.huge, math.huge), vec(-math.huge, -math.huge, -math.huge)
+    for i, p in ipairs(data.hull) do
+        local h = vec(p[0] - c[0], p[1] - c[1], p[2] - c[2])
+        self.hull[i] = h
+        for k = 0, 2 do lo[k] = min(lo[k], h[k]); hi[k] = max(hi[k], h[k]) end
+    end
+    self.hullMid = vec((lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, (lo[2] + hi[2]) * 0.5)
+    self.hullHalf = len(vec(hi[0] - self.hullMid[0], hi[1] - self.hullMid[1], hi[2] - self.hullMid[2]))
+    self.pairs = {}
+    self.recs = 0
+    self.stepH = 0
+    self.pos = vec(0, 0, 0)
+    self.R = { [0] = 1, 0, 0, 0, 1, 0, 0, 0, 1 }
+    self.Pos = vec(0, 0, 0)
+    self.P = vec(0, 0, 0)
+    self.L = vec(0, 0, 0)
+    self.E = 0
+    self.v = vec(0, 0, 0)
+    self.w = vec(0, 0, 0)
+    self.a = vec(0, 0, 0)
+    self.F = vec(0, 0, 0)
+    self.Tq = vec(0, 0, 0)
+    self.grav = 9.800000190734863
+    self.damp336 = 1; self.damp340 = 1; self.mode344 = 0
+    self.limit512 = 0
+    self.lim516 = c[164]
+    self.perf = 1
+    self.restState = 0
+    self.awake = true
+    self.wheels = {}
+    for i = 0, 3 do
+        local o, tire, su = 4 + 12 * i, 52 + 8 * floor(i / 2), 92 + 8 * floor(i / 2)
+        local W = { i = i, o = o, tire = tire, radius = c[o + 4], I = 0.0015, w = 0, ang = 0, T = 0, locked = 0, dir = 1, slip = 0, slip364 = 0, contact = 0, avgT = 0, Fx = 0, Fy = 0,
+            world = vec(0, 0, 0), pt = vec(0, 0, 0), n = vec(0, 0, 1), load = 0, sliding = 0, brk = 0, hbk = 0, grip = 1, perf = 1, vel = vec(0, 0, 0),
+            basis = { [0] = 1, 0, 0, 0, 1, 0, 0, 0, 1 }, at = vec(0, 0, 0), M = { [0] = 1, 0, 0, 1 }, slipX = 0, slipY = 0, usage = 0, surface = 1, bumpZ = 0,
+            ground = { p = vec(0, 0, 0), n = vec(0, 0, 1), s = 1 } }
+        W.su = { i = i, row = su, x = 0, mount = vec(c[o] - c[0], c[o + 1] - c[1], c[o + 2] - c[2]), mountZ = c[o + 2], ["local"] = vec(0, 0, 0) }
+        self.wheels[i] = W
+    end
+    local w = self.wheels
+    self.steer = { a0 = 0, a1 = 0, u16 = 0 }
+    self.eng = { w = 0, T = 0, tload = 0, mult = 1, lim = false, perf = 1, inductionTorqueRatio = 1.0, boostPSI = 0,
+        tq = { n = 9, lo = c[124], hi = c[126], k = 8 / (c[126] - c[124]), v = slice(c, 128, 137) },
+        br = { n = 3, lo = c[124], hi = c[126], k = 2 / (c[126] - c[124]), v = slice(c, 146, 149) } }
+    self.dt = { clutch = 0, req = 1, gear = 1, last = 0, state = 2, shifting = 0, wt = 0, timer = 0, mem = 0, want = 1, torque = 0, split = c[112], rUp = 0, rDown = 0, r3 = 0,
+        q = 0, qAt = 0 }
+    self.aero = { T = 0, grounded = 0, on = 1, grip = 1 }
+    self.drv = { gear = -1, want = 1, thr = 0, brk = 0, hbk = 0, gas = 0, brake = 0, handbrake = 0, reversing = false, u16Deg = 0,
+        launch = 0 }
+    self.ticks = 0
+    self.grounded = 0
+    self.heading = 0
+    self.forward = 0
+    self.speed = 0
+    self.rpm = c[124]
+    self.gearShown = 1
+    self.engaged = 0
+    self.throttleOut = 0
+    self.clutchTq = 0
+    self:place(0, 0, 0.4, 0)
+    return self
+end
+function Chassis:place(x, y, headingRad, gz)
+    local c = self.c
+    local ch, sh = cos(headingRad), sin(headingRad)
+    self.R = { [0] = ch, sh, 0, -sh, ch, 0, 0, 0, 1 }
+    local wheelZ = c[4 + 2] - c[2]
+    local rad = c[8]
+    self.pos = vec(x, y, gz + rad - wheelZ)
+    self.dt.q = 0; self.dt.qAt = 0
+    self.Pos = vec(0, 0, 0)
+    self.P = vec(0, 0, 0); self.L = vec(0, 0, 0); self.E = 0; self.v = vec(0, 0, 0); self.w = vec(0, 0, 0)
+    self.yawAcc, self.yawPrev = 0, 0
+    self:keepState()
+    self.F = vec(0, 0, 0); self.Tq = vec(0, 0, 0)
+    for i = 0, 3 do
+        local W = self.wheels[i]
+        W.w = 0; W.ang = 0; W.T = 0; W.locked = 0; W.avgT = 0; W.su.x = 0
+    end
+    local E = self.eng
+    E.w = c[124] * RAD_RPM
+    E.T = 0; E.tload = 0; E.lim = false
+    E.inductionTorqueRatio, E.boostPSI = 1.0, 0
+    local d = self.dt
+    d.gear = 2; d.req = 2; d.state = 1; d.clutch = 0; d.last = 0; d.shifting = 0; d.mem = 0; d.grind = nil; d.mode = 0
+    self.drv.gear = self.manualBox and 2 or -1; self.drv.reversing = false
+    self.drv.reverseLaunch = false
+    self.drv.reverseHold = 0
+    self.drv.forwardLaunch = false
+    self.drv.forwardHold = 0
+    self.heldGear = self.drv.gear
+    self.pairs = {}
+    self:post(0)
+    self.rpm = c[124]
+    self.gearShown = 1
+    self.forward = 0; self.speed = 0
+end
+-- A negative hold means this pedal has already braked the car to a near-stop.
+-- A positive hold keeps the applied brake during the gap before a second press.
+local function updateDirectionBrake(latched, hold, launched, pedal, otherPedal, brakeWhileMoving, speed, stopped, dt)
+    hold = hold or 0
+    if otherPedal >= 0.10 or abs(speed) > 0.75 then hold = 0 end
+    if hold > 0 then hold = max(0, hold - dt) end
+    if not launched and brakeWhileMoving and pedal > 0.25 then latched = true end
+    if pedal < 0.10 then
+        launched = false
+        if hold < 0 then hold = 0.45 end
+        if hold == 0 then latched = false end
+    elseif latched and stopped and otherPedal < 0.10 and hold == 0 then
+        hold = -1
+    end
+    return latched, hold, launched
+end
+
+function Chassis:driver(steer, gas, brake, handbrake, dt, hold, u16)
+    self.ticks = self.ticks + ticksOf(dt)
+    -- unoccupied keeps live tire & chassis grip
+    local D = self.drv
+    D.gas = gas; D.brake = brake; D.handbrake = handbrake
+    local v16 = self.forward
+    local v18 = D.gas
+    D.hbk = D.handbrake
+    -- Treat creeping downhill as motion outside this stop deadband (m/s).
+    local directionChangeSpeed = 0.25
+    local rollingForward = v16 > directionChangeSpeed
+    local rollingBackward = v16 < -directionChangeSpeed
+    local forwardBrake = D.forwardBrake or v18
+    if self._vphysMode and self.classicAuto and not self.manualBox then
+        local reverse = self.autoRange == 1
+        local swap = reverse and self.reverseWSonReverse
+        D.reversing = reverse
+        D.thr = swap and (D.reverseGas or brake) or gas
+        D.brk = SimcadeBraking.updatePedal(self, D, swap and forwardBrake or brake, dt)
+        if self.autoRange == 0 then D.thr, D.brk = 0, 1 end
+        if self.ignitionRunning == false then D.thr = 0 end
+    elseif self._vphysMode and self.ignitionRunning == false then
+        D.reversing = false
+        D.reverseLaunch = false
+        D.reverseHold = 0
+        D.forwardLaunch, D.forwardHold = false, 0
+        D.thr = 0
+        D.brk = clamp(D.brake, 0, 1)
+    elseif self._vphysMode and self.manualBox then
+        D.reversing = (D.gear <= 0)
+        D.thr = clamp(v18, 0, 1)
+        D.brk = SimcadeBraking.updatePedal(self, D, clamp(D.brake, 0, 1), dt)
+    elseif self._vphysMode and not self.manualBox then
+        -- Clean 4-way forward / brake / reverse / brake state machine:
+        --   1) Moving forward  + S -> brake (latches until S is released at a stop)
+        --   2) Stopped         + S (unlatched) -> reverse throttle
+        --   3) Moving backward + W (in reverse) -> brake (latches until W is released at a stop)
+        --   4) Stopped or rolling backward while in forward gear + W (unlatched) -> forward throttle
+        local stopSpeed = 0.35
+        local movingForward = v16 > stopSpeed
+        local movingBackward = v16 < -stopSpeed
+        local stopped = not movingForward and not movingBackward
+        local wPressed = v18 > 0.10
+        local sPressed = D.brake > 0.10
+
+        -- Clear latches as soon as their pedal is released, or when the opposite pedal is pressed.
+        if not sPressed or wPressed then D.brakeLatch = false end
+        if not wPressed or sPressed then D.revBrakeLatch = false end
+        D.reverseHold, D.forwardHold = 0, 0
+        D.reverseLaunch, D.forwardLaunch = false, false
+
+        local rawBrk = 0
+        if D.reversing then
+            if sPressed and not wPressed then
+                if movingForward and v16 > 2.0 then
+                    -- Rolling forward fast while in reverse: brake first before driving backward.
+                    D.thr = 0
+                    rawBrk = clamp(D.brake, 0, 1)
+                    D.brakeLatch = true
+                else
+                    D.thr = clamp(D.reverseGas ~= nil and D.reverseGas or D.brake, 0, 1)
+                    rawBrk = 0
+                    D.gear = 0
+                    if self.dt.gear > 0 then self.dt.gear, self.dt.req, self.dt.shifting = 0, 0, 0 end
+                end
+            elseif wPressed and not sPressed then
+                if movingBackward then
+                    -- Braking from reverse motion: latch W until released at a stop.
+                    D.thr = 0
+                    rawBrk = clamp(forwardBrake, 0, 1)
+                    D.revBrakeLatch = true
+                elseif D.revBrakeLatch then
+                    -- Still holding W after braking to a stop from reverse.
+                    D.thr = 0
+                    rawBrk = clamp(forwardBrake, 0, 1)
+                else
+                    -- Fresh W press while stopped (or rolling forward): switch cleanly to forward!
+                    D.reversing = false
+                    D.thr = clamp(v18, 0, 1)
+                    rawBrk = 0
+                    if D.gear <= 0 then self:gearDrive() end
+                end
+            elseif wPressed and sPressed then
+                D.thr = 0
+                rawBrk = clamp(max(forwardBrake, D.brake), 0, 1)
+            else
+                D.thr = 0
+                rawBrk = 0
+            end
+        else
+            if wPressed and not sPressed then
+                -- In forward gear, W always accelerates forward (even if rolling back on a hill)
+                -- unless rolling backward fast (> 2.5 m/s) where braking first is safer.
+                if movingBackward and v16 < -2.5 then
+                    D.thr = 0
+                    rawBrk = clamp(forwardBrake, 0, 1)
+                    D.revBrakeLatch = true
+                else
+                    D.thr = clamp(v18, 0, 1)
+                    rawBrk = 0
+                    if D.gear <= 0 then self:gearDrive() end
+                end
+            elseif sPressed and not wPressed then
+                if movingForward then
+                    -- Braking from forward motion: latch S until released at a stop.
+                    D.thr = 0
+                    rawBrk = clamp(D.brake, 0, 1)
+                    D.brakeLatch = true
+                elseif D.brakeLatch then
+                    -- Still holding S after braking to a stop from forward.
+                    D.thr = 0
+                    rawBrk = clamp(D.brake, 0, 1)
+                else
+                    -- Fresh S press while stopped (or rolling backward): switch cleanly to reverse!
+                    D.reversing = true
+                    D.thr = clamp(D.reverseGas ~= nil and D.reverseGas or D.brake, 0, 1)
+                    rawBrk = 0
+                    D.gear = 0
+                    if self.dt.gear > 0 then self.dt.gear, self.dt.req, self.dt.shifting = 0, 0, 0 end
+                end
+            elseif wPressed and sPressed then
+                -- Allow burnout when stopped, brake when moving.
+                D.thr = stopped and clamp(v18, 0, 1) or 0
+                rawBrk = clamp(D.brake, 0, 1)
+            else
+                D.thr = 0
+                rawBrk = 0
+            end
+        end
+
+        D.brk = SimcadeBraking.updatePedal(self, D, rawBrk, dt)
+        D.reverseGas = nil
+    else
+        if D.brake <= 0.6000000238418579 or D.gas >= 0.5 then
+            if v16 > -2 then D.reversing = false end
+        else
+            D.reversing = true
+        end
+        local v7, v17, v21
+        if v16 <= 0.5 and D.reversing then
+            if v16 < -30 or v16 < -2 then
+                v7 = D.brake; v17 = 0; v21 = v18
+            else
+                v7 = D.brake; v17 = v18; v21 = 0
+            end
+        else
+            v7 = 0; v17 = v18; v21 = D.brake
+        end
+        local v19 = v7 + v7
+        if v19 > 1 then v19 = 1 end
+        D.brk = v21
+        if v17 + 0.20000000298023224 < v19 then
+            D.thr = v19
+            D.gear = 0
+            local d = self.dt
+            if d.gear ~= 0 and (self.restState == 2 or self.speed < 0.1) then
+                d.gear, d.req, d.shifting = 0, 0, 0
+            end
+        else
+            if self.isDrag and self.gearShown == 1 then
+                local v11 = D.thr
+                local v23 = 1 * dt + v11
+                local v12 = v11 - 1.5 * dt
+                if v17 > v12 then v12 = v17 end
+                if v23 < v12 then v12 = v23 end
+                v17 = v12
+                if D.gas > 0.6000000238418579 and self.rpm < self.c[124] + 1000 and 0.6000000238418579 > v12 then v17 = 0.6000000238418579 end
+            end
+            D.thr = clamp(v17, 0, 1)
+            if D.gear <= 0 then self:gearDrive() end
+        end
+    end
+    D.lamp = hold and brake or D.brk
+    if hold then
+        if not self.held then self.heldGear = D.gear end
+        D.brk, D.gear, self.held = 1, 1, true
+    elseif self.held then
+        self.held = false
+        if self.race then self:gearDrive() else self.drv.gear = self.manualBox and self.heldGear or -1 end
+    end
+    if self.clutchPedal < 1 then
+        self:clutchSet(self.clutchPedal)
+    elseif self.dt.mode == 3 then
+        self.dt.mode = 0
+    end
+    if u16 ~= nil then
+        local u = trunc(u16) % 65536
+        self.steer.u16 = u
+        local deg = u * (360 / 65536)
+        if deg > 180 then deg = deg - 360 end
+        self.drv.u16Deg = deg
+    else
+        self:steerKeyboard(steer, dt)
+    end
+end
+function Chassis:gearDrive()
+    self.drv.gear = self.manualBox and 2 or -1
+end
+local GRIND = 0.44999998807907104   -- flt_7A18C8
+-- Selector positions follow the Red Fox order: 0 Park, 1 Reverse, 2 Neutral, 3 Drive.
+function Chassis:setAutoRange(range)
+    local d = self.dt
+    local gear, request = 1, 1
+    if range == 1 then
+        gear, request = min(d.gear, 0), 0
+    elseif range == 3 then
+        gear, request = max(d.gear, 2), -1
+    end
+    self.autoRange = range
+    self.drv.gear, self.drv.reversing = request, range == 1
+    d.gear, d.req, d.shifting, d.grind = gear, gear, 0, nil
+    if gear == 1 then d.state, d.clutch = 1, 0 end
+end
+
+function Chassis:setManual(on)
+    if self.isDrag then self.userManual = on; on = true end
+    self.manualBox = on
+    local d = self.dt
+    local D = self.drv
+    D.brakeLatch = false
+    D.revBrakeLatch = false
+    D.reverseLaunch = false
+    D.reverseHold = 0
+    D.forwardLaunch, D.forwardHold = false, 0
+    self.shiftHoldEnd = 0
+    self.nextShiftTime = 0
+    self.nextDownshiftTime = 0
+    if d then
+        d.shifting = 0
+        d.grind = nil
+        d.mode = 0
+        local isStopped = abs(self.forward or 0) * 3.6 <= (self.stoppedPhaseBrakeSpeed or 5)
+        if on then
+            if D.reversing or d.gear <= 0 then
+                local rg = (d.gear <= 0) and d.gear or 0
+                d.gear = rg
+                d.req = rg
+                D.gear = rg
+                D.reversing = true
+            else
+                if d.gear < 2 and not self.classicAuto then d.gear = 2 end
+                d.req = d.gear
+                D.gear = d.gear
+                D.reversing = false
+            end
+            if d.gear == 1 then
+                d.state = 1
+                d.clutch = 0
+            elseif isStopped then
+                d.state = 2
+                d.clutch = 0
+            else
+                d.state = 3
+                d.clutch = 1
+            end
+        elseif self.classicAuto then
+            self:setAutoRange(d.gear <= 0 and 1 or (d.gear == 1 and 2 or 3))
+        else
+            D.gear = -1
+            D.reversing = false
+            if d.gear <= 1 then
+                d.gear = 2
+            end
+            d.req = d.gear
+            if isStopped then
+                d.state = 2
+                d.clutch = 0
+            else
+                d.state = 3
+                d.clutch = 1
+            end
+        end
+    else
+        D.gear = on and 2 or -1
+        D.reversing = false
+    end
+    if self.held then self.heldGear = D.gear end
+end
+function Chassis:shiftKey(up)
+    if self.parking or self.servoState then return end
+    if not self.manualBox then
+        if self.classicAuto then
+            local range = clamp(self.autoRange + (up and 1 or -1), 0, 3)
+            if range == self.autoRange then return end
+            if range <= 1 and self.speed * 3.6 > self.speedToReverse then return end
+            if range == 3 and -self.forward * 3.6 > self.speedToReverse then return end
+            self:setAutoRange(range)
+        end
+        return
+    end
+    local D = self.drv
+    if up then
+        if D.gear < self.top + 1 then D.gear = D.gear + 1 end
+    elseif D.gear > (self.minGear or 0) then
+        D.gear = D.gear - 1
+    end
+end
+function Chassis:resetGear()
+    if not self.manualBox or self.parking or self.servoState then return end
+    self.drv.gear = 1
+    if self.dt then
+        self.dt.req = 1
+        self.dt.gear = 1
+        self.dt.shifting = 0
+        self.dt.grind = nil
+    end
+end
+function Chassis:clutchSet(a)
+    local d = self.dt
+    d.mode = 3
+    if a > 0.949999988079071 then
+        d.state = 3; d.clutch = 1
+    elseif a < 0.05000000074505806 then
+        d.state = 1; d.clutch = 0
+    elseif a == 1 then
+        d.state = 3; d.clutch = a
+    elseif a == 0 then
+        d.state = 1; d.clutch = a
+    elseif a <= d.clutch then
+        d.clutch = a; d.state = 0
+    else
+        d.state = 2; d.clutch = a
+    end
+end
+function Chassis:steerKeyboard(input, dt)
+    Steering.updateInput(self, input, dt)
+end
+function Chassis:slipAngle()
+    local a = (self:atan16(self.R[0], self.R[1]) - self:atan16(self.v[0], self.v[1])) % 65536
+    a = a * U16_RAD
+    if a > PI then return a - 2 * PI end
+    return a
+end
+function Chassis:atan16(x, y)
+    local A = self.T.atan
+    local a, b = abs(x), abs(y)
+    local v
+    if a <= b then
+        if b <= a then
+            v = b == 0 and 0 or 0x2000
+        else
+            v = 0x4000 - 32 * A[floor(a / b * 256)]     -- (trunc of what's never below 0)
+        end
+    else
+        v = 32 * A[floor(b / a * 256)]
+    end
+    if x >= 0 and y >= 0 then return v end
+    if x < 0 and y >= 0 then return 0x8000 - v end
+    if x < 0 and y < 0 then return 0x8000 + v end
+    return 0x10000 - v
+end
+local PARK_SPEED = 0.3
+function Chassis:updateWheelMounts()
+    local c, WS = self.c, self.wheels
+    for i = 0, 3 do
+        local o = 4 + 12 * i
+        local S = WS[i].su
+        S.mount[0], S.mount[1], S.mount[2] = c[o] - c[0], c[o + 1] - c[1], c[o + 2] - c[2]
+        S.mountZ = c[o + 2]
+        WS[i].radius = c[o + 4]
+    end
+end
+function Chassis:prepareFrame()
+    self:updateWheelMounts()
+    local c = self.c
+    self.damp336 = 1; self.damp340 = 1
+    self.grav = 9.800000190734863
+    self.aero.on = 1
+    self.aero.grip = 1
+    local v11 = 1
+    if self.grounded == 0 then v11 = 0 end
+    if self.mode344 ~= v11 then
+        if v11 == 0 then self.L[2] = self.L[2] / c[88] end
+        self.mode344 = v11
+    end
+    if (self.drv.hbk > 0.1 and abs(self.forward) > 0.55) or self.drv.thr > 0.30000001192092896 or (self.grounded == 4 and abs(self.R[2]) > 0.15000000596046448) then self.damp336 = 0 end
+    self.eng.perf = self.perf
+    do local i = 0 self.wheels[i].perf = self.perf end do local i = 1 self.wheels[i].perf = self.perf end do local i = 2 self.wheels[i].perf = self.perf end do local i = 3 self.wheels[i].perf = self.perf end
+    if self.assist ~= 0 then
+        local v27 = c[163]
+        if v27 == 0 then
+            local v24 = self.forward >= 1 and self:slipAngle() or 0
+            if v24 * self.L[2] < 0 and abs(v24) > 0.10000000149011612 then v27 = 20 end
+        end
+        self.limit512 = v27
+    else
+        self.limit512 = c[162]
+    end
+    self.lim516 = c[164]
+    if c[112] > 0.800000011920929 then self.dt.split = c[112] end
+end
+function Chassis:updateDriverState(dt)
+    local D, E, Dt = self.drv, self.eng, self.dt
+    if self.gearShown ~= 1 then
+        if D.thr <= D.brk or D.hbk >= D.thr then
+            if D.thr < 0.5 then D.thr = 0 end
+        else
+            if D.brk < 0.5 then D.brk = 0 end
+            if D.hbk < 0.5 then D.hbk = 0 end
+        end
+    end
+    local v12 = D.thr
+    if v12 > 0.15000000596046448 then
+        if v12 > 0 and Dt.gear > 1 and E.w * RPM < 3000 and 0.5 > v12 then v12 = 0.5 end
+    else
+        v12 = 0
+    end
+    self:steerWheels(self.steer.u16)
+    if self.dt.shifting ~= 0 then
+        v12 = 0
+    end
+    E.T = v12
+    if D.want > 1 and D.want <= self.top + 1 then
+        if Dt.want == 1 then Dt.timer = 0 end
+        Dt.want = D.want
+    end
+    D.gear = self:gearRequest(D.gear, self.rpm, dt)
+    D.want = Dt.want
+    self.aero.T = v12
+    self.aero.grounded = self.grounded * 0.25
+end
+function Chassis:steerWheels(u16)
+    Steering.applyWheelAngles(self, u16)
+end
+function Chassis:gearRequest(a2, a3in, dt)
+    if self._vphysMode and not self.manualBox and SimcadeGearbox and SimcadeGearbox.evaluateAutoShift then
+        local d = self.dt
+        if a2 == -1 and d.gear > 1 and d.shifting == 0 then
+            local targetG = SimcadeGearbox.evaluateAutoShift(self, dt)
+            if targetG then
+                d.req = targetG
+            end
+            return a2
+        elseif a2 == 0 and self.drv and self.drv.reversing and d.gear <= 0 then
+            if d.shifting == 0 then
+                local targetG = SimcadeGearbox.evaluateAutoShift(self, dt)
+                if targetG then
+                    d.req = targetG
+                end
+            end
+            return a2
+        end
+    end
+    local d, c = self.dt, self.c
+    local a3 = a3in
+    if a3 <= -1 then a3 = self.eng.w * RPM end
+    local v6 = d.gear
+    local manualReverseGear = self.manualBox and a2 <= 0 and a2 >= (self.minGear or 0)
+    if a2 == -1 and not manualReverseGear then
+        d.want = 1
+        if v6 <= 1 then
+            d.req = 2
+            return a2
+        end
+        if d.state == 3 then
+            local v24 = self:shiftUp(v6, false)
+            local v27 = d.rDown + self.down[v6]
+            local v7 = 0
+            if v6 == 2 then
+                v27 = self.eng.T >= 0.20000000298023224 and 0 or c[124] + 100
+            else
+                local up = self:shiftUp(v6 - 1, true)
+                v7 = up * (self:gearRatio(v6) / max(0.05, self:gearRatio(v6 - 1))) - 200
+            end
+            if self._vphysMode then
+                local wRad = max(0.20, self.wheels[2].radius or 0.34)
+                local roadMS = max(0, self.forward)
+                local curRatio = abs(self:gearRatio(v6))
+                if curRatio < 0.01 then curRatio = 1 end
+                local roadSyncRPM = (roadMS / wRad) * c[111] * curRatio * RPM
+                local wheelSpinMS = max(
+                    abs(self.wheels[2].w or 0) * wRad,
+                    abs(self.wheels[0].w or 0) * (self.wheels[0].radius or wRad)
+                )
+                local isWheelSpinningWildly = (wheelSpinMS - roadMS) > 7.78 -- > 28 km/h spin excess
+                if a3 < v24 or v6 >= self.top + 1 then
+                    if v6 > 2 and (self.now or 0) >= (self.downshiftCooldownEnd or 0) then
+                        local lowerRatio = abs(self:gearRatio(v6 - 1))
+                        local projectedLowerRPM = (curRatio > 0.05) and (roadSyncRPM * (lowerRatio / curRatio)) or 99999
+                        local safeDownCap = (c[125] or 8000) * 0.85
+                        if roadSyncRPM <= v27 and roadSyncRPM <= v7 and projectedLowerRPM < safeDownCap then
+                            d.req = v6 - 1
+                            self.downshiftCooldownEnd = (self.now or 0) + 0.35
+                        end
+                    end
+                elseif not isWheelSpinningWildly then
+                    local ok = (self.grounded >= 2) and (roadSyncRPM >= v24 * 0.78)
+                    if ok then d.req = v6 + 1 end
+                end
+            else
+                if a3 < v24 or v6 >= self.top + 1 then
+                    if a3 <= v27 and a3 <= v7 then d.req = v6 - 1 end
+                else
+                    local ok = true
+                    for i = 0, 3 do
+                        local W = self.wheels[i]
+                        ok = ok and W.contact ~= 0 and W.slip < 4
+                    end
+                    if ok then d.req = v6 + 1 end
+                end
+            end
+        end
+        return a2
+    end
+    if a2 ~= -2 or manualReverseGear then
+        if d.mode == 3 then
+            local g = d.gear
+            if a2 ~= g then
+                if self.manualBox then
+                    if d.state == 1 then
+                        d.gear = a2
+                        d.req = a2
+                        d.shifting = 0
+                    else
+                        d.req = a2
+                        d.shifting = 0
+                    end
+                    d.grind = nil
+                else
+                    if d.state ~= 1 then d.shifting = 0; d.grind = self.now; return g end
+                    if d.shifting == 0 then d.shifting = 1; d.req = a2 end
+                end
+            end
+            if self.manualBox and d.state == 1 then return a2 end
+            return g
+        end
+        if a2 ~= d.gear and a2 ~= d.req then
+            d.req = a2
+        end
+        return a2
+    end
+    return a2
+end
+function Chassis:shiftUp(g, low)
+    local d, c = self.dt, self.c
+    local v3 = g == 3 and d.r3 or d.rUp
+    if low then v3 = self.ranges.up[0] end
+    return min(self.isDrag and c[126] or c[125], v3 + self.up[g])
+end
+function Chassis:integrate(h)
+    local WS, E, d, c = self.wheels, self.eng, self.dt, self.c
+    if self.lim516 ~= 0 then
+        local v3 = self.perf * self.lim516 + 1.899999976158142
+        local v28, v8 = self.R[2], nil
+        if v28 < 0 then
+            v28 = -v28
+            if v28 > 0.3 then v28 = 0.3 end
+            v8 = (1.1 - 1) / 0.3 * v28 + 1
+        else
+            if v28 > 0.3 then v28 = 0.3 end
+            v8 = 1 - (1 - 0.9) / 0.3 * v28
+        end
+        local fwd = vec(self.R[0], self.R[1], self.R[2])
+        if sqrt(self.v[0] * self.v[0] + self.v[1] * self.v[1]) * 2.2360248565673828 > v3 * v8 and dot(fwd, self.F) > 0 then
+            local lo = toLocal(self.R, self.F)
+            local v10 = -(5 * v28)
+            if v10 > -0.5 then v10 = -0.5 end
+            lo[0] = v10
+            self.F = toWorld(self.R, lo)
+        end
+    end
+    local v0, w, R = self.v, self.w, self.R
+    local D = self.deriv
+    if not D then D = { pos = vec(0, 0, 0), R = {}, P = vec(0, 0, 0), L = vec(0, 0, 0), w = {} }; self.deriv = D end
+    local dPos, dR, dP, dL = D.pos, D.R, D.P, D.L
+    dPos[0], dPos[1], dPos[2] = v0[0], v0[1], v0[2]
+    dR[0], dR[1], dR[2] = R[2] * w[1] - w[2] * R[1], w[2] * R[0] - R[2] * w[0], w[0] * R[1] - R[0] * w[1]
+    dR[3], dR[4], dR[5] = R[5] * w[1] - w[2] * R[4], w[2] * R[3] - R[5] * w[0], w[0] * R[4] - R[3] * w[1]
+    dR[6], dR[7], dR[8] = R[8] * w[1] - w[2] * R[7], w[2] * R[6] - R[8] * w[0], w[0] * R[7] - R[6] * w[1]
+    dP[0], dP[1], dP[2] = self.F[0], self.F[1], self.F[2]
+    dL[0], dL[1], dL[2] = self.Tq[0], self.Tq[1], self.Tq[2]
+    local wl = len(w)
+    if self.damp340 ~= 0 then
+        local v19 = -curve(self.T.ang_damp, wl)
+        dL[0] = dL[0] + v19 * self.L[0]; dL[1] = dL[1] + v19 * self.L[1]; dL[2] = dL[2] + v19 * self.L[2]
+    end
+    local v29 = len(v0) / 4
+    local v21 = wl / 2
+    if v21 > v29 then v29 = v21 end
+    local dE = curve(self.T.rest, v29) <= self.E and -10 or 0.10000000149011612
+    if self.damp336 ~= 0 then
+        local a, b = -(2 * self.E), -(8 * self.E)
+        dL[0] = dL[0] + a * self.L[0]; dL[1] = dL[1] + a * self.L[1]; dL[2] = dL[2] + a * self.L[2]
+        dP[0] = dP[0] + b * self.P[0]; dP[1] = dP[1] + b * self.P[1]; dP[2] = dP[2] + b * self.P[2]
+    end
+    if self.limit512 ~= 0 then
+        if clamp(self.Tq[2], -self.limit512, self.limit512) ~= self.Tq[2] then
+            dL[2] = self.Tq[2] > 0 and self.limit512 or -self.limit512
+        end
+    end
+    local dw = D.w
+    for i = 0, 3 do
+        local W = WS[i]
+        if W.contact == 0 then
+            -- No contact patch to enforce rolling speed or react drive torque.
+            W.avgT = 0
+            if W.locked ~= 0 then
+                W.w, dw[i] = 0, 0
+            else
+                local momentum = W.I * W.w + h * (W.T - 0.002 * W.w)
+                local brakeImpulse = h * (W.airBrakeTorque or 0)
+                momentum = momentum - clamp(momentum, -brakeImpulse, brakeImpulse)
+                dw[i] = (momentum / W.I - W.w) / h
+            end
+        else
+            local torque = (W.T - W.radius * W.Fx + W.avgT) * 0.5
+            W.avgT = torque
+            local a = (torque - 0.0020000000949949026 * W.w) / W.I
+            if W.locked ~= 0 then a = 0 end
+            if W.sliding == 0 and h > 0.0010000000474974513 then a = a - W.slip / (W.radius * h) end
+            dw[i] = a
+        end
+    end
+    local dEng = (self:torque() + E.tload) / c[127]
+    local dCl = 0
+    if d.mode ~= 3 then
+        local rCl = c[115] * self.clutchK
+        if d.q > 0 then rCl = rCl * (d.q + 1) elseif d.q < 0 and d.req >= 3 then rCl = rCl * 0.3499999940395355 end
+        dCl = rCl * self.T.clutch_dir[d.state]
+    end
+    local pos, P, L = self.pos, self.P, self.L
+    pos[0] = pos[0] + h * dPos[0]; P[0] = P[0] + h * dP[0]; L[0] = L[0] + h * dL[0]
+    pos[1] = pos[1] + h * dPos[1]; P[1] = P[1] + h * dP[1]; L[1] = L[1] + h * dL[1]
+    pos[2] = pos[2] + h * dPos[2]; P[2] = P[2] + h * dP[2]; L[2] = L[2] + h * dL[2]
+    R[0] = R[0] + h * dR[0]; R[1] = R[1] + h * dR[1]; R[2] = R[2] + h * dR[2]
+    R[3] = R[3] + h * dR[3]; R[4] = R[4] + h * dR[4]; R[5] = R[5] + h * dR[5]
+    R[6] = R[6] + h * dR[6]; R[7] = R[7] + h * dR[7]; R[8] = R[8] + h * dR[8]
+    self.E = self.E + h * dE
+    local W = WS[0]; W.ang = W.ang + h * W.w; W.w = W.w + h * dw[0]
+    W = WS[1]; W.ang = W.ang + h * W.w; W.w = W.w + h * dw[1]
+    W = WS[2]; W.ang = W.ang + h * W.w; W.w = W.w + h * dw[2]
+    W = WS[3]; W.ang = W.ang + h * W.w; W.w = W.w + h * dw[3]
+    E.w = E.w + h * dEng
+    d.clutch = d.clutch + h * dCl
+    self:post(h)
+end
+function Chassis:post(h)
+    self:postBody()
+    do local i = 0
+        local W = self.wheels[i]
+        self:postWheel(W)
+        self:postSusp(W)
+    end
+    do local i = 1
+        local W = self.wheels[i]
+        self:postWheel(W)
+        self:postSusp(W)
+    end
+    do local i = 2
+        local W = self.wheels[i]
+        self:postWheel(W)
+        self:postSusp(W)
+    end
+    do local i = 3
+        local W = self.wheels[i]
+        self:postWheel(W)
+        self:postSusp(W)
+    end
+    self:postEngine()
+    self:postDrive()
+    if self._vphysMode and self.updateSimClutch then self:updateSimClutch() end
+    self.stepH = h
+    self:forces()
+end
+function Chassis:postBody()
+    local im = self.im
+    local P, v = self.P, self.v
+    v[0], v[1], v[2] = P[0] * im, P[1] * im, P[2] * im
+    local s = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+    if s > 200 then
+        local k = 200 / s
+        P[0], P[1], P[2] = P[0] * k, P[1] * k, P[2] * k
+        v[0], v[1], v[2] = P[0] * im, P[1] * im, P[2] * im
+    end
+    local k = im * 0.10204081237316132
+    local F, a = self.F, self.a
+    a[0], a[1], a[2] = F[0] * k, F[1] * k, F[2] * k
+    local I = self.mode344 ~= 0 and self.Iinv2 or self.Iinv
+    local R, L = self.R, self.L
+    local l0, l1, l2 = L[0] * R[0] + L[1] * R[1] + L[2] * R[2], L[0] * R[3] + L[1] * R[4] + L[2] * R[5], L[0] * R[6] + L[1] * R[7] + L[2] * R[8]
+    l0, l1, l2 = l0 * I[0], l1 * I[1], l2 * I[2]
+    local w = self.w
+    w[0], w[1], w[2] = l0 * R[0] + l1 * R[3] + l2 * R[6], l0 * R[1] + l1 * R[4] + l2 * R[7], l0 * R[2] + l1 * R[5] + l2 * R[8]
+    local wl = sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2])
+    if wl > 250 then
+        local q = 250 / wl
+        w[0], w[1], w[2] = w[0] * q, w[1] * q, w[2] * q
+    end
+    if self.E < 0 then self.E = 0 end
+    F[0], F[1], F[2] = 0, 0, 0
+    local Tq = self.Tq
+    Tq[0], Tq[1], Tq[2] = 0, 0, 0
+    if self.grav > 0 then self:addForce3(0, 0, -(self.m * self.grav), 0, 0, 0) end
+end
+function Chassis:addForce3(f0, f1, f2, r0, r1, r2)
+    local l = sqrt(f0 * f0 + f1 * f1 + f2 * f2)
+    if l > 1200 then
+        local k = 1200 / l
+        f0, f1, f2 = f0 * k, f1 * k, f2 * k
+    end
+    local F = self.F
+    F[0] = F[0] + f0; F[1] = F[1] + f1; F[2] = F[2] + f2
+    local t0, t1, t2 = r1 * f2 - r2 * f1, r2 * f0 - r0 * f2, r0 * f1 - r1 * f0
+    local lt = sqrt(t0 * t0 + t1 * t1 + t2 * t2)
+    if lt > 100 then
+        local k = 100 / lt
+        t0, t1, t2 = t0 * k, t1 * k, t2 * k
+    end
+    local Tq = self.Tq
+    Tq[0] = Tq[0] + t0; Tq[1] = Tq[1] + t1; Tq[2] = Tq[2] + t2
+end
+function Chassis:postWheel(W)
+    W.Fx = 0; W.Fy = 0; W.T = 0; W.slip = 0
+    if W.dir == 0 then
+        if W.w < 0 then W.w = 0 end
+    elseif W.dir == 2 and W.w > 0 then
+        W.w = 0
+    end
+    W.dir = W.w > 1e-5 and 0 or (W.w >= -1e-5 and 1 or 2)
+    if W.ang > 6.283185 then W.ang = W.ang - 6.283185 elseif W.ang < -6.283185 then W.ang = W.ang + 6.283185 end
+end
+function Chassis:postSusp(W)
+    local S, c, R = W.su, self.c, self.R
+    local row = S.row
+    local mt, pos = S.mount, self.pos
+    local m0, m1, m2 = mt[0] * R[0] + mt[1] * R[3] + mt[2] * R[6], mt[0] * R[1] + mt[1] * R[4] + mt[2] * R[7], mt[0] * R[2] + mt[1] * R[5] + mt[2] * R[8]
+    local G = W.ground
+    local n = G.n
+    W.surface = self.isDrag and 1 or G.s
+    W.bumpZ = 0
+    local upn = R[6] * n[0] + R[7] * n[1] + R[8] * n[2]
+    local g = -100
+    if upn >= 0.0010000000474974513 then
+        g = ((G.p[0] - m0 - pos[0]) * n[0] + (G.p[1] - m1 - pos[1]) * n[1] + (G.p[2] - m2 - pos[2]) * n[2] + W.bumpZ * n[2]) / upn
+    else
+        W.surface = 0
+    end
+    W.n = n
+    local v7 = g + W.radius
+    local maxx, minx = c[row + 5], c[row + 6]
+    if v7 <= maxx then
+        if v7 < minx then
+            S.x = minx
+        else
+            S.x = v7
+        end
+    else
+        S.x = maxx
+    end
+    local sl = S["local"]
+    sl[0], sl[1], sl[2] = mt[0], mt[1], mt[2] + S.x
+    local ca, sa = 1, 0      -- cos(0), sin(0): a back wheel's
+    if W.i == 0 then local a = self.steer.a0; ca, sa = cos(a), sin(a) elseif W.i == 1 then local a = self.steer.a1; ca, sa = cos(a), sin(a) end
+    local M2 = W.M
+    M2[0], M2[1], M2[2], M2[3] = ca, sa, -sa, ca
+    local r0, r1, r2 = sl[0] * R[0] + sl[1] * R[3] + sl[2] * R[6], sl[0] * R[1] + sl[1] * R[4] + sl[2] * R[7], sl[0] * R[2] + sl[1] * R[5] + sl[2] * R[8]
+    local w, v = self.w, self.v
+    local wv = W.vel
+    wv[0], wv[1], wv[2] = (w[1] * r2 - w[2] * r1) + v[0], (w[2] * r0 - w[0] * r2) + v[1], (w[0] * r1 - w[1] * r0) + v[2]
+    local nsa = -sa
+    local B = W.basis
+    B[0], B[1], B[2] = ca * R[0] + sa * R[3] + 0 * R[6], ca * R[1] + sa * R[4] + 0 * R[7], ca * R[2] + sa * R[5] + 0 * R[8]
+    B[3], B[4], B[5] = nsa * R[0] + ca * R[3] + 0 * R[6], nsa * R[1] + ca * R[4] + 0 * R[7], nsa * R[2] + ca * R[5] + 0 * R[8]
+    B[6], B[7], B[8] = R[6], R[7], R[8]
+    local at = W.at
+    at[0], at[1], at[2] = r0 + pos[0], r1 + pos[1], r2 + pos[2]
+end
+function Chassis:postEngine()
+    local E, c = self.eng, self.c
+    local lo, hi = (self.ignitionRunning == false) and 0 or (c[124] * RAD_RPM), c[126] * RAD_RPM
+    if self.manualBox and self.dt.gear >= 2 and (self.clutchPedal or 1) > 0.5 then
+        hi = max(hi, abs(self.dt.wt or 0))
+    end
+    E.w = clamp(E.w, lo, hi)
+    local rpm = E.w * RPM
+    self.lastTload = E.tload
+    E.tload = 0
+    if E.lim then
+        if rpm < c[126] - 0.012500000186264515 * c[126] then E.lim = false end
+    elseif rpm > -25 + c[126] then
+        E.lim = true
+    end
+end
+function Chassis:gearRatio(g)
+    return (self.gearRatioMap and self.gearRatioMap[g]) or self.c[116 + (g or 1)] or 0
+end
+function Chassis:shaftW()
+    local c, W = self.c, self.wheels
+    local v2 = 0
+    local sp = c[112]
+    if sp >= 0.0010000000474974513 then v2 = (W[3].w + W[2].w) * 0.5 * c[111] end
+    if sp <= 0.9990000128746033 then
+        v2 = v2 + (W[1].w + W[0].w) * 0.5 * c[110]
+        if sp >= 0.0010000000474974513 then v2 = v2 * 0.5 end
+    end
+    return v2 * self:gearRatio(self.dt.gear)
+end
+function Chassis:stalled() return self.eng.T < 0.30000001192092896 and self.c[124] * RAD_RPM + 0.0001 >= self.dt.wt end
+function Chassis:matched() return abs(self.eng.w - self.dt.wt) <= 50 end
+function Chassis:postDrive()
+    local d, E = self.dt, self.eng
+    d.wt = self:shaftW()
+    local st = d.state
+    if d.mode == 3 then
+        E.mult = 1
+        if st == 1 and d.shifting ~= 0 then d.shifting = 0; d.gear = d.req end
+    elseif st == 0 then
+        E.mult = 0
+        if d.clutch <= 0 then
+            d.clutch = 0
+            d.state = 1
+            if d.shifting ~= 0 then
+                self.shiftHoldEnd = (self.now or 0) + (self.shiftDelay or 0)
+            else
+                self.shiftHoldEnd = 0
+            end
+        end
+    elseif st == 1 then
+        E.mult = 0
+        d.gear = d.req
+        if d.shifting ~= 0 and d.gear ~= 1 and (self.clutchPedal or 1) > 0.5 and d.wt and d.wt > 0 then
+            local targetW = clamp(d.wt, self.c[124] * RAD_RPM, self.c[126] * RAD_RPM)
+            local syncRate = clamp((self.substepDt or 0.005) * 8, 0.015, 0.12)
+            E.w = E.w + (targetW - E.w) * syncRate
+        end
+        if (self.now or 0) >= (self.shiftHoldEnd or 0) and (d.shifting ~= 0 or not self:stalled()) then
+            d.state = 2
+            d.shifting = 0
+        end
+    elseif st == 2 then
+        E.mult = self._vphysMode and 1 or 0.699999988079071
+        if d.shifting ~= 0 and d.gear ~= 1 and (self.clutchPedal or 1) > 0.5 and d.wt and d.wt > 0 then
+            local targetW = clamp(d.wt, self.c[124] * RAD_RPM, self.c[126] * RAD_RPM)
+            local syncRate = clamp((self.substepDt or 0.005) * 12, 0.02, 0.15)
+            E.w = E.w + (targetW - E.w) * syncRate
+        end
+        if d.clutch >= 1 then
+            d.clutch = 1
+            if self:matched() or (self._vphysMode and d.gear ~= 1) then d.state = 3 end
+        end
+        if d.shifting == 0 and self:stalled() and d.gear ~= 1 then d.state = 0 end
+        if d.gear ~= d.req and d.shifting == 0 then
+            d.shifting = 1; d.last = E.w * RPM; d.state = 0
+        end
+    elseif st == 3 then
+        if d.q > 0 and d.qAt == 0 then d.qAt = self.now end
+        E.mult = 1
+        local g = d.gear
+        local clutchSlipping = self._vphysMode and (self.simClutch or 0) > 0.01
+        -- A manually engaged over-rev stays coupled so the wheels can force engine speed above the limiter.
+        local manualOverRev = self.manualBox and g >= 2 and (self.clutchPedal or 1) > 0.5 and d.wt > self.c[126] * RAD_RPM
+        if g ~= 1 and self:stalled() then
+            d.state = 0
+        elseif g ~= 1 and abs(E.w - (d.wt or 0)) > 150 and (self.clutchPedal or 1) > 0.5 and not manualOverRev and not clutchSlipping then
+            d.state = 2
+        end
+        if g ~= 1 and (self.clutchPedal or 1) > 0.5 and d.wt and d.wt > 0 and (not clutchSlipping or d.wt > E.w) then
+            local lockRate = clamp((self.substepDt or 0.005) * 16, 0.04, 0.18)
+            local maxW = self.manualBox and g >= 2 and max(self.c[126] * RAD_RPM, d.wt) or self.c[126] * RAD_RPM
+            E.w = clamp(E.w + (d.wt - E.w) * lockRate, self.c[124] * RAD_RPM, maxW)
+        end
+        if g == d.req then
+            d.shifting = 0
+        else
+            d.shifting = 1; d.last = E.w * RPM; d.state = 0
+        end
+    end
+    if d.grind then
+        E.mult = 0
+        if self.now - d.grind >= GRIND then d.grind = nil end
+    elseif d.state == 3 and d.qAt > 0 then
+        local e = self.now - d.qAt
+        local v = (0.5 - e) / 0.5 * d.q * 2
+        if v > 0 then E.mult = v + 1 end
+        if e >= 0.5 then d.qAt = 0; d.q = 0 end
+    end
+end
+function Chassis:torque()
+    if self.ignitionRunning == false then return 0 end
+    local E = self.eng
+    local rpm = E.w * RPM
+    local T = E.lim and 0 or E.mult * E.T
+    local v18 = curve(E.tq, rpm) * E.perf * T * (E.inductionTorqueRatio or 1.0)
+    local manualOverRev = self.manualBox and self.dt.gear >= 2 and (self.clutchPedal or 1) > 0.5 and rpm > self.c[126]
+    local brakeFrac = (E.lim or manualOverRev) and 1.0 or clamp(1.0 - (E.T or 0) / 0.15, 0, 1)
+    local v14 = -(curve(E.br, rpm) * brakeFrac)
+    if manualOverRev then
+        local overRevRatio = rpm / max(1, self.c[126])
+        v14 = v14 * clamp(overRevRatio * overRevRatio, 1, 16)
+    end
+    if E.lim then v14 = v14 * 2 end
+    local r = v14 + v18
+    if r < 0 and not E.lim then
+        return r * (self.dt.gear == 1 and 0.65 or 0.90)
+    end
+    return r
+end
+-- An open differential delivers equal shaft torque. The LSD starts from that
+-- same split and couples wheel speeds separately in applyDiffCoupling.
+local function driveAxle(a, b, torque, locked)
+    local share = 0.5
+    if locked then
+        if a.contact == 0 and b.contact ~= 0 then share = 0
+        elseif b.contact == 0 and a.contact ~= 0 then share = 1 end
+    end
+    if a.locked == 0 then a.T = a.T + share * torque end
+    if b.locked == 0 then b.T = b.T + (1 - share) * torque end
+end
+
+function Chassis:drive(a2, outMult)
+    if self.ignitionRunning == false then return end
+    local d, c, WS, E = self.dt, self.c, self.wheels, self.eng
+    if d.gear == 1 then return end
+    if self._vphysMode and (self.drv.brk or 0) > 0.05 and (self.drv.thr or 0) < 0.05 and a2 > 0 then return end
+    local wheelMult = outMult or 1.0
+    d.torque = d.torque + a2 * wheelMult
+    local v3 = self.grounded * 0.25
+    if 0.25 > v3 then v3 = 0.25 end
+    E.tload = E.tload - v3 * a2
+    local v5 = a2 * wheelMult * self:gearRatio(d.gear)
+    local v18 = (1 - d.split) * c[110] * v5
+    local v7 = v5 * (c[111] * d.split)
+    local frontActive = (not self._vphysMode) or ((1 - d.split) >= 0.001)
+    local rearActive  = (not self._vphysMode) or (d.split >= 0.001)
+    if frontActive then
+        local locked = (self.effFrontDiffType or self.frontDiffType) == 2 or self.frontLockActive or self.allLockActive
+        driveAxle(WS[0], WS[1], v18, locked)
+    end
+    if rearActive then
+        local locked = (self.effRearDiffType or self.rearDiffType) == 2 or self.rearLockActive or self.allLockActive
+        driveAxle(WS[2], WS[3], v7, locked)
+    end
+end
+function Chassis:clutchDrive()
+    local d, E = self.dt, self.eng
+    d.torque = 0
+    if self.clutchType == "torque_converter" then
+        local engage = ((d.state == 0 or d.state == 2) and d.clutch or 1.0) * (1.0 - (self.simClutch or 0))
+        if engage <= 0.001 then return end
+        local rpmNow = E.w * RPM
+        local wt = d.wt or 0
+        local sr = clamp(wt / max(1, E.w), 0, 1.2)
+        if (self.tcLockupRPM or 0) > 0 and rpmNow >= self.tcLockupRPM and sr >= 0.90 and (self.drv and self.drv.thr or 0) > 0.05 then
+            self:drive(self:torque() * engage, 1.0)
+            return
+        end
+        local coupRatio = max(0.1, self.tcCouplingRatio or 0.85)
+        local tcMult = 1.0 + max(0, (self.tcMaxMult or 2.0) - 1.0) * clamp(1.0 - sr / coupRatio, 0, 1)
+        local tq = self:torque()
+        if E.w >= wt then
+            self:drive(tq * engage, tcMult)
+        else
+            self:drive(tq * engage * 0.65, 1.0)
+        end
+        return
+    end
+    if d.state == 0 or d.state == 2 then
+        local engage = d.clutch * (1.0 - (self.simClutch or 0))
+        local thrIn = (self.drv and self.drv.thr or 0)
+        local maxSlipW = 80 + 220 * clamp(thrIn, 0, 1)
+        local minSlipW = (d.gear ~= 1 and thrIn > 0.05) and 0 or -maxSlipW
+        local v6 = clamp(E.w - d.wt, minSlipW, maxSlipW)
+        local v7 = self.c[113]
+        local v8 = (d.wt - E.w) * RPM
+        if d.mem ~= 0 and v8 * d.mem < 0 and abs(v8) > 2000 and abs(d.mem) > 2000 then v7 = v7 * 0.5 end
+        d.mem = v8
+        local clTq = v7 * engage * v6
+        if v6 > 0 then
+            local baseTq = max(0, self:torque())
+            clTq = min(clTq, baseTq * engage * 2.2)
+        end
+        self:drive(clTq)
+    elseif d.state == 3 then
+        local engage = 1.0 - (self.simClutch or 0)
+        self:drive(self:torque() * engage)
+    end
+end
+function Chassis:shaftAcc()
+    local c, W, d = self.c, self.wheels, self.dt
+    local v1 = 0
+    local W0, W1, W2, W3 = W[0], W[1], W[2], W[3]
+    if c[112] >= 0.0010000000474974513 then v1 = ((W3.T - W3.radius * W3.Fx) / W3.I + (W2.T - W2.radius * W2.Fx) / W2.I) * 0.5 * c[111] end
+    if c[112] <= 0.9990000128746033 then
+        v1 = v1 + ((W1.T - W1.radius * W1.Fx) / W1.I + (W0.T - W0.radius * W0.Fx) / W0.I) * 0.5 * c[110]
+        if c[112] >= 0.0010000000474974513 then v1 = v1 * 0.5 end
+    end
+    return v1 * self:gearRatio(d.gear)
+end
+function Chassis:solve()
+    local WS, R = self.wheels, self.R
+    self:clutchDrive()
+    local W0, W1, W2, W3 = WS[0], WS[1], WS[2], WS[3]
+    self:tire(W0); self:tire(W1); self:tire(W2); self:tire(W3)
+    local F = self.F
+    local Fl0, Fl1 = F[0] * R[0] + F[1] * R[1] + F[2] * R[2], F[0] * R[3] + F[1] * R[4] + F[2] * R[5]
+    local tq = self:torque()
+    local im = self.im
+    local inv = (self.mode344 ~= 0 and self.Iinv2 or self.Iinv)[2]
+    local M, m = W0.M, W0.su.mount
+    local a0, b0, c0, d0, p0, q0, y0, r0, I0, free0 = M[0], M[1], M[2], M[3], m[0], m[1], W0.Fy, W0.radius, W0.I, W0.contact ~= 0 and W0.sliding == 0 and W0.locked == 0
+    M, m = W1.M, W1.su.mount
+    local a1, b1, c1, d1, p1, q1, y1, r1, I1, free1 = M[0], M[1], M[2], M[3], m[0], m[1], W1.Fy, W1.radius, W1.I, W1.contact ~= 0 and W1.sliding == 0 and W1.locked == 0
+    M, m = W2.M, W2.su.mount
+    local a2, b2, c2, d2, p2, q2, y2, r2, I2, free2 = M[0], M[1], M[2], M[3], m[0], m[1], W2.Fy, W2.radius, W2.I, W2.contact ~= 0 and W2.sliding == 0 and W2.locked == 0
+    M, m = W3.M, W3.su.mount
+    local a3, b3, c3, d3, p3, q3, y3, r3, I3, free3 = M[0], M[1], M[2], M[3], m[0], m[1], W3.Fy, W3.radius, W3.I, W3.contact ~= 0 and W3.sliding == 0 and W3.locked == 0
+    local d, c, E = self.dt, self.c, self.eng
+    -- Gear selection can persist while the automatic clutch is open or slipping at low RPM.
+    local lock = d.state == 3 and ((self._vphysMode and (self.simClutch or 0) <= 0.01) or (not self._vphysMode and (self.simClutch or 0) < 1))
+    local c127, v7 = c[127], nil
+    if lock then
+        v7 = 1 / c127
+        if c[112] <= 0.9990000128746033 then
+            local v9 = self:gearRatio(d.gear) * c[110]
+            v7 = v7 + (1 - d.split) / W0.I * v9 * v9 * 0.5
+        end
+        if c[112] >= 0.0010000000474974513 then
+            local v10 = self:gearRatio(d.gear) * c[111]
+            v7 = v7 + d.split / W2.I * v10 * v10 * 0.5
+        end
+    end
+    do local _ = 1
+        local x0, x1, x2, x3 = W0.Fx, W1.Fx, W2.Fx, W3.Fx
+        local fx = c0 * y0 + a0 * x0
+        local fy = d0 * y0 + b0 * x0
+        local sx, sy = Fl0 + fx, Fl1 + fy
+        local sT = 0 + fy * p0 - fx * q0
+        fx = c1 * y1 + a1 * x1
+        fy = d1 * y1 + b1 * x1
+        sx = sx + fx; sy = sy + fy
+        sT = sT + fy * p1 - fx * q1
+        fx = c2 * y2 + a2 * x2
+        fy = d2 * y2 + b2 * x2
+        sx = sx + fx; sy = sy + fy
+        sT = sT + fy * p2 - fx * q2
+        fx = c3 * y3 + a3 * x3
+        fy = d3 * y3 + b3 * x3
+        sx = sx + fx; sy = sy + fy
+        sT = sT + fy * p3 - fx * q3
+        local v43, v44 = sx * im, im * sy
+        local v42 = sT * inv
+        if free0 then W0.Fx = ((W0.T - r0 * x0) / I0 * r0 - ((v42 * p0 + v44) * c0 + (v43 - v42 * q0) * a0)) / r0 * I0 + x0 end
+        if free1 then W1.Fx = ((W1.T - r1 * x1) / I1 * r1 - ((v42 * p1 + v44) * c1 + (v43 - v42 * q1) * a1)) / r1 * I1 + x1 end
+        if free2 then W2.Fx = ((W2.T - r2 * x2) / I2 * r2 - ((v42 * p2 + v44) * c2 + (v43 - v42 * q2) * a2)) / r2 * I2 + x2 end
+        if free3 then W3.Fx = ((W3.T - r3 * x3) / I3 * r3 - ((v42 * p3 + v44) * c3 + (v43 - v42 * q3) * a3)) / r3 * I3 + x3 end
+        if lock then
+            local v12 = (tq + E.tload) / c127
+            local v6 = v12 - self:shaftAcc()
+            self:drive(v6 / v7)
+        end
+    end
+    do local _ = 2
+        local x0, x1, x2, x3 = W0.Fx, W1.Fx, W2.Fx, W3.Fx
+        local fx = c0 * y0 + a0 * x0
+        local fy = d0 * y0 + b0 * x0
+        local sx, sy = Fl0 + fx, Fl1 + fy
+        local sT = 0 + fy * p0 - fx * q0
+        fx = c1 * y1 + a1 * x1
+        fy = d1 * y1 + b1 * x1
+        sx = sx + fx; sy = sy + fy
+        sT = sT + fy * p1 - fx * q1
+        fx = c2 * y2 + a2 * x2
+        fy = d2 * y2 + b2 * x2
+        sx = sx + fx; sy = sy + fy
+        sT = sT + fy * p2 - fx * q2
+        fx = c3 * y3 + a3 * x3
+        fy = d3 * y3 + b3 * x3
+        sx = sx + fx; sy = sy + fy
+        sT = sT + fy * p3 - fx * q3
+        local v43, v44 = sx * im, im * sy
+        local v42 = sT * inv
+        if free0 then W0.Fx = ((W0.T - r0 * x0) / I0 * r0 - ((v42 * p0 + v44) * c0 + (v43 - v42 * q0) * a0)) / r0 * I0 + x0 end
+        if free1 then W1.Fx = ((W1.T - r1 * x1) / I1 * r1 - ((v42 * p1 + v44) * c1 + (v43 - v42 * q1) * a1)) / r1 * I1 + x1 end
+        if free2 then W2.Fx = ((W2.T - r2 * x2) / I2 * r2 - ((v42 * p2 + v44) * c2 + (v43 - v42 * q2) * a2)) / r2 * I2 + x2 end
+        if free3 then W3.Fx = ((W3.T - r3 * x3) / I3 * r3 - ((v42 * p3 + v44) * c3 + (v43 - v42 * q3) * a3)) / r3 * I3 + x3 end
+        if lock then
+            local v12 = (tq + E.tload) / c127
+            local v6 = v12 - self:shaftAcc()
+            self:drive(v6 / v7)
+        end
+    end
+    do local _ = 3
+        local x0, x1, x2, x3 = W0.Fx, W1.Fx, W2.Fx, W3.Fx
+        local fx = c0 * y0 + a0 * x0
+        local fy = d0 * y0 + b0 * x0
+        local sx, sy = Fl0 + fx, Fl1 + fy
+        local sT = 0 + fy * p0 - fx * q0
+        fx = c1 * y1 + a1 * x1
+        fy = d1 * y1 + b1 * x1
+        sx = sx + fx; sy = sy + fy
+        sT = sT + fy * p1 - fx * q1
+        fx = c2 * y2 + a2 * x2
+        fy = d2 * y2 + b2 * x2
+        sx = sx + fx; sy = sy + fy
+        sT = sT + fy * p2 - fx * q2
+        fx = c3 * y3 + a3 * x3
+        fy = d3 * y3 + b3 * x3
+        sx = sx + fx; sy = sy + fy
+        sT = sT + fy * p3 - fx * q3
+        local v43, v44 = sx * im, im * sy
+        local v42 = sT * inv
+        if free0 then W0.Fx = ((W0.T - r0 * x0) / I0 * r0 - ((v42 * p0 + v44) * c0 + (v43 - v42 * q0) * a0)) / r0 * I0 + x0 end
+        if free1 then W1.Fx = ((W1.T - r1 * x1) / I1 * r1 - ((v42 * p1 + v44) * c1 + (v43 - v42 * q1) * a1)) / r1 * I1 + x1 end
+        if free2 then W2.Fx = ((W2.T - r2 * x2) / I2 * r2 - ((v42 * p2 + v44) * c2 + (v43 - v42 * q2) * a2)) / r2 * I2 + x2 end
+        if free3 then W3.Fx = ((W3.T - r3 * x3) / I3 * r3 - ((v42 * p3 + v44) * c3 + (v43 - v42 * q3) * a3)) / r3 * I3 + x3 end
+        if lock then
+            local v12 = (tq + E.tload) / c127
+            local v6 = v12 - self:shaftAcc()
+            self:drive(v6 / v7)
+        end
+    end
+    do local _ = 4
+        local x0, x1, x2, x3 = W0.Fx, W1.Fx, W2.Fx, W3.Fx
+        local fx = c0 * y0 + a0 * x0
+        local fy = d0 * y0 + b0 * x0
+        local sx, sy = Fl0 + fx, Fl1 + fy
+        local sT = 0 + fy * p0 - fx * q0
+        fx = c1 * y1 + a1 * x1
+        fy = d1 * y1 + b1 * x1
+        sx = sx + fx; sy = sy + fy
+        sT = sT + fy * p1 - fx * q1
+        fx = c2 * y2 + a2 * x2
+        fy = d2 * y2 + b2 * x2
+        sx = sx + fx; sy = sy + fy
+        sT = sT + fy * p2 - fx * q2
+        fx = c3 * y3 + a3 * x3
+        fy = d3 * y3 + b3 * x3
+        sx = sx + fx; sy = sy + fy
+        sT = sT + fy * p3 - fx * q3
+        local v43, v44 = sx * im, im * sy
+        local v42 = sT * inv
+        if free0 then W0.Fx = ((W0.T - r0 * x0) / I0 * r0 - ((v42 * p0 + v44) * c0 + (v43 - v42 * q0) * a0)) / r0 * I0 + x0 end
+        if free1 then W1.Fx = ((W1.T - r1 * x1) / I1 * r1 - ((v42 * p1 + v44) * c1 + (v43 - v42 * q1) * a1)) / r1 * I1 + x1 end
+        if free2 then W2.Fx = ((W2.T - r2 * x2) / I2 * r2 - ((v42 * p2 + v44) * c2 + (v43 - v42 * q2) * a2)) / r2 * I2 + x2 end
+        if free3 then W3.Fx = ((W3.T - r3 * x3) / I3 * r3 - ((v42 * p3 + v44) * c3 + (v43 - v42 * q3) * a3)) / r3 * I3 + x3 end
+        if lock then
+            local v12 = (tq + E.tload) / c127
+            local v6 = v12 - self:shaftAcc()
+            self:drive(v6 / v7)
+        end
+    end
+    do local _ = 5
+        local x0, x1, x2, x3 = W0.Fx, W1.Fx, W2.Fx, W3.Fx
+        local fx = c0 * y0 + a0 * x0
+        local fy = d0 * y0 + b0 * x0
+        local sx, sy = Fl0 + fx, Fl1 + fy
+        local sT = 0 + fy * p0 - fx * q0
+        fx = c1 * y1 + a1 * x1
+        fy = d1 * y1 + b1 * x1
+        sx = sx + fx; sy = sy + fy
+        sT = sT + fy * p1 - fx * q1
+        fx = c2 * y2 + a2 * x2
+        fy = d2 * y2 + b2 * x2
+        sx = sx + fx; sy = sy + fy
+        sT = sT + fy * p2 - fx * q2
+        fx = c3 * y3 + a3 * x3
+        fy = d3 * y3 + b3 * x3
+        sx = sx + fx; sy = sy + fy
+        sT = sT + fy * p3 - fx * q3
+        local v43, v44 = sx * im, im * sy
+        local v42 = sT * inv
+        if free0 then W0.Fx = ((W0.T - r0 * x0) / I0 * r0 - ((v42 * p0 + v44) * c0 + (v43 - v42 * q0) * a0)) / r0 * I0 + x0 end
+        if free1 then W1.Fx = ((W1.T - r1 * x1) / I1 * r1 - ((v42 * p1 + v44) * c1 + (v43 - v42 * q1) * a1)) / r1 * I1 + x1 end
+        if free2 then W2.Fx = ((W2.T - r2 * x2) / I2 * r2 - ((v42 * p2 + v44) * c2 + (v43 - v42 * q2) * a2)) / r2 * I2 + x2 end
+        if free3 then W3.Fx = ((W3.T - r3 * x3) / I3 * r3 - ((v42 * p3 + v44) * c3 + (v43 - v42 * q3) * a3)) / r3 * I3 + x3 end
+        if lock then
+            local v12 = (tq + E.tload) / c127
+            local v6 = v12 - self:shaftAcc()
+            self:drive(v6 / v7)
+        end
+    end
+    if self.tireSimSpecs then
+        local coasting = (self.drv.thr or 0) < 0.05 and (self.drv.brk or 0) < 0.05 and (self.drv.hbk or 0) < 0.05
+        for i = 0, 3 do
+            local W = WS[i]
+            if W.contact ~= 0 and coasting and W.T < 0 then
+                local pLon = max(0, W.peakLongKN or W.load or 0)
+                local maxCoastT = pLon * 0.85 * max(0.15, W.radius)
+                if W.T < -maxCoastT then W.T = -maxCoastT end
+            end
+            if W.contact ~= 0 and W.sliding == 0 and W.locked == 0 then
+                local pLon = max(0, W.peakLongKN or W.load or 0)
+                W.Fx = clamp(W.T / max(0.15, W.radius), -pLon, pLon)
+            end
+        end
+    end
+    self:ellipse(W0); self:ellipse(W1); self:ellipse(W2); self:ellipse(W3)
+    self:afterSolve()
+end
+function Chassis:applyDiffCoupling()
+    local c, W = self.c, self.wheels
+    self.frontDiffLocked = false
+    self.rearDiffLocked = false
+    local function couple(a, b, diffType, stiffness, lockRatio, forceLock)
+        if a.locked ~= 0 and b.locked ~= 0 then return false end
+        local wa, wb = a.w, b.w
+        local isLocked = false
+        if forceLock or diffType == 2 then
+            local avg = (wa + wb) * 0.5
+            a.w = avg
+            b.w = avg
+            isLocked = true
+        elseif (diffType == nil or diffType == 1) then
+            local dw = abs(wa - wb)
+            if dw > 0.2 then
+                local stiffScale = clamp((stiffness or 3.0) * 0.08, 0.05, 1.0)
+                local maxRatio = clamp(lockRatio or 0.90, 0.05, 1.0)
+                local lockFrac = clamp((dw - 0.2) * stiffScale, 0, maxRatio)
+                local avg = (wa + wb) * 0.5
+                a.w = wa + (avg - wa) * lockFrac
+                b.w = wb + (avg - wb) * lockFrac
+                isLocked = lockFrac > 0.05
+            end
+        end
+        return isLocked
+    end
+    local rType = self.effRearDiffType ~= nil and self.effRearDiffType or self.rearDiffType
+    local fType = self.effFrontDiffType ~= nil and self.effFrontDiffType or self.frontDiffType
+    if c[112] >= 0.001 then
+        self.rearDiffLocked = couple(W[2], W[3], rType, self.effRearStiffness or self.rearLSDStiffness, self.effRearLockRatio or self.rearLSDLockRatio, self.rearLockActive or self.allLockActive)
+    end
+    if c[112] <= 0.999 then
+        self.frontDiffLocked = couple(W[0], W[1], fType, self.effFrontStiffness or self.frontLSDStiffness, self.effFrontLockRatio or self.frontLSDLockRatio, self.frontLockActive or self.allLockActive)
+    end
+    local cType = self.allLockActive and 2 or (self.centerDiffType or 0)
+    if cType > 0 and c[112] >= 0.001 and c[112] <= 0.999 then
+        local wF = (W[0].w + W[1].w) * 0.5
+        local wR = (W[2].w + W[3].w) * 0.5
+        local cLock = (cType == 2) and 1.0 or clamp(abs(wF - wR) * 0.15, 0, 0.85)
+        if cLock > 0.01 then
+            local wAvg = (wF + wR) * 0.5
+            local dF = (wAvg - wF) * cLock
+            local dR = (wAvg - wR) * cLock
+            W[0].w = W[0].w + dF; W[1].w = W[1].w + dF
+            W[2].w = W[2].w + dR; W[3].w = W[3].w + dR
+        end
+    end
+end
+function Chassis:afterSolve()
+    if self._vphysMode then
+        self:applyDiffCoupling()
+    end
+    if self.ignitionRunning == false then
+        self.eng.tload = 0
+        return
+    end
+    local d, E = self.dt, self.eng
+    if self._vphysMode and d.gear ~= 1 and self.grounded > 0 then
+        local dw = self:shaftW() - E.w
+        local lim = abs(self:torque())
+        if d.state == 3 and (self.simClutch or 0) <= 0.01 then
+            E.tload = E.tload + clamp(dw * self.c[113] * 0.65, -lim, lim)
+        end
+        if E.T > 0.1 then
+            E.tload = clamp(E.tload, -lim * 0.95, lim)
+        end
+    elseif d.gear ~= 1 and d.state == 3 and self.grounded > 0 then
+        local dw = self:shaftW() - E.w
+        local avgSlip = self:avgUsage()
+        if E.T <= 0.20000000298023224 or avgSlip <= 0.10000000149011612 then
+            local lim = abs(self:torque())
+            E.tload = E.tload + clamp(dw * self.c[113], -lim, lim)
+        else
+            d.wt = E.w
+            self:syncWheels(E.w)
+        end
+    end
+    if d.gear == 2 then
+        local v6, v7 = self:torque(), E.tload
+        local v12 = v7 + v6
+        if v7 < v6 and v12 < 0 then E.tload = E.tload + points(self.T.first_gear, v12) * self.T.firstGearLoadScale * v12 end
+    end
+end
+function Chassis:avgUsage()
+    local c, W = self.c, self.wheels
+    local v2, v4 = 0, 0
+    if c[112] >= 0.0010000000474974513 then v2 = W[3].slip364 + W[2].slip364; v4 = 2 end
+    if c[112] <= 0.9990000128746033 then v4 = v4 + 2; v2 = v2 + W[1].slip364 + W[0].slip364 end
+    return v2 / v4
+end
+function Chassis:syncWheels(a2)
+    local c, W, d = self.c, self.wheels, self.dt
+    local v3 = a2 - self:shaftW()
+    local fast = (not self._vphysMode) and (self.speed * MPH < 40)
+    self.frontDiffLocked = false
+    self.rearDiffLocked = false
+    local function one(a, b, final, diffType, stiffness, lockRatio, forceLock)
+        local k = v3 / (self:gearRatio(d.gear) * final)
+        local l = fast or (a.contact == 0 and b.contact == 0)
+        local wa, wb = a.w, b.w
+        local isLocked = false
+        if l or forceLock or diffType == 2 then
+            wb = (wb + wa) * 0.5; wa = wb
+            isLocked = true
+        elseif (diffType == nil or diffType == 1) then
+            local dw = abs(wa - wb)
+            if dw > 0.4 then
+                local stiffScale = clamp((stiffness or 3.0) * 0.06, 0.05, 1.0)
+                local maxRatio = clamp(lockRatio or 0.90, 0.05, 1.0)
+                local lockFrac = clamp((dw - 0.4) * stiffScale, 0, maxRatio)
+                local avg = (wa + wb) * 0.5
+                wa = wa + (avg - wa) * lockFrac
+                wb = wb + (avg - wb) * lockFrac
+                isLocked = lockFrac > 0.05
+            end
+        end
+        a.w = wa + k; b.w = wb + k
+        return isLocked
+    end
+    local rType = self.effRearDiffType ~= nil and self.effRearDiffType or self.rearDiffType
+    local fType = self.effFrontDiffType ~= nil and self.effFrontDiffType or self.frontDiffType
+    if c[112] >= 0.0010000000474974513 then
+        self.rearDiffLocked = one(W[2], W[3], c[111], rType, self.effRearStiffness or self.rearLSDStiffness, self.effRearLockRatio or self.rearLSDLockRatio, self.rearLockActive or self.allLockActive)
+    end
+    if c[112] <= 0.9990000128746033 then
+        self.frontDiffLocked = one(W[0], W[1], c[110], fType, self.effFrontStiffness or self.frontLSDStiffness, self.effFrontLockRatio or self.frontLSDLockRatio, self.frontLockActive or self.allLockActive)
+    end
+    local cType = self.allLockActive and 2 or (self.centerDiffType or 0)
+    if cType > 0 and c[112] >= 0.001 and c[112] <= 0.999 then
+        local wF = (W[0].w + W[1].w) * 0.5
+        local wR = (W[2].w + W[3].w) * 0.5
+        local cLock = (cType == 2) and 1.0 or clamp(abs(wF - wR) * 0.15, 0, 0.85)
+        if cLock > 0.01 then
+            local wAvg = (wF + wR) * 0.5
+            local dF = (wAvg - wF) * cLock
+            local dR = (wAvg - wR) * cLock
+            W[0].w = W[0].w + dF; W[1].w = W[1].w + dF
+            W[2].w = W[2].w + dR; W[3].w = W[3].w + dR
+        end
+    end
+end
+function Chassis:aeroForces()
+    Aero.applyForces(self)
+end
+function Chassis:forces()
+    self:aeroForces()
+    for i = 0, 3 do
+        local W = self.wheels[i]
+        local extLoad = self.vphysLoadsKN and self.vphysLoadsKN[i] or 0
+        local gndS = (W.ground and W.ground.s) or 0
+        if gndS ~= 0 and extLoad > 0.001 then
+            W.contact = 1
+            W.load = extLoad
+            local pt, at, n = W.pt, W.at, W.n
+            pt[0], pt[1], pt[2] = at[0] + n[0] * -W.radius, at[1] + n[1] * -W.radius, at[2] + n[2] * -W.radius
+        else
+            W.contact = 0
+            W.load = 0
+        end
+    end
+    self:solve()
+    local pos = self.pos
+    local shiftX = self.comShiftX_m or 0
+    local ox = pos[0] + self.R[0] * shiftX
+    local oy = pos[1] + self.R[1] * shiftX
+    local oz = pos[2] + self.R[2] * shiftX
+    do local i = 0
+        local W = self.wheels[i]
+        if W.contact ~= 0 then
+            local f, pt = W.world, W.pt
+            self:addForce3(f[0], f[1], f[2], pt[0] - ox, pt[1] - oy, pt[2] - oz)
+        end
+    end
+    do local i = 1
+        local W = self.wheels[i]
+        if W.contact ~= 0 then
+            local f, pt = W.world, W.pt
+            self:addForce3(f[0], f[1], f[2], pt[0] - ox, pt[1] - oy, pt[2] - oz)
+        end
+    end
+    do local i = 2
+        local W = self.wheels[i]
+        if W.contact ~= 0 then
+            local f, pt = W.world, W.pt
+            self:addForce3(f[0], f[1], f[2], pt[0] - ox, pt[1] - oy, pt[2] - oz)
+        end
+    end
+    do local i = 3
+        local W = self.wheels[i]
+        if W.contact ~= 0 then
+            local f, pt = W.world, W.pt
+            self:addForce3(f[0], f[1], f[2], pt[0] - ox, pt[1] - oy, pt[2] - oz)
+        end
+    end
+    local wl = len(self.w)
+    if self.grounded < 2 and wl < 0.5 then
+        local k = -(points(self.T.yaw_damp, wl) * self.m)
+        self.Tq[0] = self.Tq[0] + k * self.w[0]; self.Tq[1] = self.Tq[1] + k * self.w[1]; self.Tq[2] = self.Tq[2] + k * self.w[2]
+    end
+end
+local SAME_N, SAME_D = 0.995, 0.02     -- the same plane again: its normal within about 6 degrees, a point's depth within 2 cm. The chip's
+local NEAR, IN = 0.0010000000474974513, 9.999999747378752e-06    -- 0x5B3D20: touching within 0.001, into it within 0.00001
+local px, py, pz, ps = {}, {}, {}, {}
+function Chassis:orthonormalize()
+    local R = self.R
+    local a0, a1, a2 = R[0], R[1], R[2]
+    local l = sqrt(a0 * a0 + a1 * a1 + a2 * a2)
+    if l == 0 then l = 1 end
+    a0, a1, a2 = a0 / l, a1 / l, a2 / l
+    local r3, r4, r5 = R[3], R[4], R[5]
+    local c0, c1, c2 = a1 * r5 - a2 * r4, a2 * r3 - a0 * r5, a0 * r4 - a1 * r3
+    l = sqrt(c0 * c0 + c1 * c1 + c2 * c2)
+    if l == 0 then l = 1 end
+    c0, c1, c2 = c0 / l, c1 / l, c2 / l
+    local b0, b1, b2 = c1 * a2 - c2 * a1, c2 * a0 - c0 * a2, c0 * a1 - c1 * a0
+    R[0], R[1], R[2], R[3], R[4], R[5], R[6], R[7], R[8] = a0, a1, a2, b0, b1, b2, c0, c1, c2
+end
+function Chassis:state(dt)
+    local R, c = self.R, self.c
+    local v = self.cg
+    local g0, g1, g2 = v[0] * R[0] + v[1] * R[3] + v[2] * R[6], v[0] * R[1] + v[1] * R[4] + v[2] * R[7], v[0] * R[2] + v[1] * R[5] + v[2] * R[8]
+    local Ps, pos = self.Pos, self.pos
+    Ps[0], Ps[1], Ps[2] = pos[0] - g0, pos[1] - g1, pos[2] - g2
+    self.speed = len(self.v)
+    self.forward = self.v[2] * R[2] + self.v[1] * R[1] + self.v[0] * R[0]
+    local g = 0
+    do local i = 0
+        if self.wheels[i].contact ~= 0 then g = g + 1 end
+    end
+    do local i = 1
+        if self.wheels[i].contact ~= 0 then g = g + 1 end
+    end
+    do local i = 2
+        if self.wheels[i].contact ~= 0 then g = g + 1 end
+    end
+    do local i = 3
+        if self.wheels[i].contact ~= 0 then g = g + 1 end
+    end
+    self.grounded = g
+    local d, E = self.dt, self.eng
+    self.throttleOut = E.lim and 0 or E.mult * E.T
+    self.gearShown = d.gear
+    self.engaged = d.state == 3 and 1 or 0
+    self.clutchTq = d.torque
+    local v50 = E.w * RPM
+    local shifting = d.shifting ~= 0 and d.req > 2
+    local v65 = -(shifting and 15 or 2.5) / c[127]
+    if dt > 0 and (v50 - self.rpm) / dt < v65 then
+        local v53 = self.rpm + v65 * dt
+        if v53 >= v50 then v50 = v53 end
+    end
+    self.rpm = self.rpm * 0.44999998807907104 + v50 * 0.550000011920929
+    self:keepState()
+end
+function Chassis:keepState()
+    local R, v, w = self.R, self.v, self.w
+    local S = self.ps
+    if not S then S = { up = vec(0, 0, 0) }; self.ps = S end
+    S.h, S.v0, S.v1, S.w2 = self:atan16(R[0], R[1]), v[0], v[1], w[2]
+    S.up[0], S.up[1], S.up[2] = R[6], R[7], R[8]
+end
+function Chassis:carryFrom(old)
+    do local i = 0
+        local W, O = self.wheels[i], old.wheels[i]
+        W.ground, W.n, W.surface, W.contact = O.ground, O.n, O.surface, O.contact
+        W.w, W.ang = O.w, O.ang
+        W.su.x = O.su.x
+    end
+    do local i = 1
+        local W, O = self.wheels[i], old.wheels[i]
+        W.ground, W.n, W.surface, W.contact = O.ground, O.n, O.surface, O.contact
+        W.w, W.ang = O.w, O.ang
+        W.su.x = O.su.x
+    end
+    do local i = 2
+        local W, O = self.wheels[i], old.wheels[i]
+        W.ground, W.n, W.surface, W.contact = O.ground, O.n, O.surface, O.contact
+        W.w, W.ang = O.w, O.ang
+        W.su.x = O.su.x
+    end
+    do local i = 3
+        local W, O = self.wheels[i], old.wheels[i]
+        W.ground, W.n, W.surface, W.contact = O.ground, O.n, O.surface, O.contact
+        W.w, W.ang = O.w, O.ang
+        W.su.x = O.su.x
+    end
+    self.eng.w = old.eng.w
+    local d, od = self.dt, old.dt
+    d.gear, d.req, d.state, d.clutch, d.shifting, d.timer, d.want, d.last = od.gear, od.req, od.state, od.clutch, od.shifting, od.timer, od.want, od.last
+    self.drv.gear, self.drv.want, self.drv.u16Deg = old.drv.gear, old.drv.want, old.drv.u16Deg
+    self.steer.a0, self.steer.a1, self.steer.u16 = old.steer.a0, old.steer.a1, old.steer.u16
+    self.held, self.parked = old.held, old.parked
+    self.stepH = old.stepH
+    self.yawAcc, self.yawPrev = old.yawAcc, old.yawPrev
+    self.manualBox, self.clutchPedal, self.heldGear = old.manualBox, old.clutchPedal, old.heldGear
+    self.autoRange = old.autoRange
+    d.mode, d.grind = od.mode, od.grind and od.grind - old.now + self.now
+end
+M.Chassis = Chassis
+return M
+end
+
+SimcadeVehiclePhysics.T    = makePhysicsCurves()
+SimcadeVehiclePhysics.Tune = makeShiftLogic()
+SimcadeVehiclePhysics.Phys = makeVehicleSolver()
+
+
+local function initializeVehiclePhysicsBridge(PhysicsApi)
+    local T    = PhysicsApi.T
+    local Tune = PhysicsApi.Tune
+    local Phys = PhysicsApi.Phys
+    local Tires = SimcadeTires
+    local Braking = assert(SimcadeBraking, "Load simcade_braking.txt before simcade_vehicle_physics.txt")
+    local abs, min, max, clamp = math.abs, math.min, math.max, math.clamp or function(v, a, b)
+        if v < a then return a elseif v > b then return b else return v end
+    end
+    local floor, ceil, sqrt = math.floor, math.ceil, math.sqrt
+    local trunc = function(x) return x < 0 and ceil(x) or floor(x) end
+
+    local IN_TO_M    = 0.0254
+    local M_TO_IN    = 1.0 / IN_TO_M
+    local SUBSTEP    = 0.0044
+    local RPM_TO_RAD = 0.10471975803375244
+    local RAD_TO_RPM = 9.549296760559082
+    local MPH_CONV   = 2.2369999885559082
+
+    local evaluateMagicFormula = Tires.evaluateMagicFormula
+
+    function PhysicsApi.mapSurface(matType, surfaceProps)
+        return Tires.mapSurface(matType, surfaceProps)
+    end
+
+    local function cloneArr(src, a, b)
+        local dst = {}
+        for i = a, b do dst[i] = src[i] end
+        return dst
+    end
+
+    function PhysicsApi.buildCarData(vehicleCfg, tireCfg, suspCfg, engineCfg, steerCfg, runtimeWheels, totalMassKg, compoundName, aeroCfg)
+        return VehicleBuilder.buildCarData(vehicleCfg, tireCfg, suspCfg, engineCfg, steerCfg, runtimeWheels, totalMassKg, compoundName, aeroCfg, { T = T, Tune = Tune })
+    end
+    function PhysicsApi.newFromConfig(vehicleCfg, tireCfg, suspCfg, engineCfg, steerCfg, runtimeWheels, totalMassKg, compoundName, aeroCfg)
+        local data = PhysicsApi.buildCarData(vehicleCfg, tireCfg, suspCfg, engineCfg, steerCfg, runtimeWheels, totalMassKg, compoundName, aeroCfg)
+        local car = Phys.new(data)
+        for _, wheel in ipairs(runtimeWheels or {}) do
+            if wheel.physicsIndex ~= nil then car.wheels[wheel.physicsIndex].alignment = wheel end
+        end
+        if data.engineTorqueCurve then car.eng.tq = data.engineTorqueCurve end
+        car.maxTorqueNm = data.enginePeakTorqueNm or (engineCfg and engineCfg.PeakTorqueNm) or 260
+        car.baseParams = cloneArr(data.c, 0, 164)
+        car.tireSimSpecs = data.tireSimSpecs
+        car.compoundName = compoundName or "Sport"
+        car.turboEnabled = data.turboEnabled and true or false
+        car.shiftDelay = data.shiftDelay or 0.14
+        car.frontWeightBias = data.frontWeightBias or 0.50
+        car.comShiftX_m = data.comShiftX_m or 0
+        car.clutchType             = string.lower(tostring((engineCfg and engineCfg.ClutchType) or "friction"))
+        car.tcStallRPM             = (engineCfg and engineCfg.TC_StallRPM) or 2200
+        car.tcMaxMult              = (engineCfg and engineCfg.TC_MaxMult) or 2.0
+        car.tcCouplingRatio        = (engineCfg and engineCfg.TC_CouplingRatio) or 0.85
+        car.tcLockupRPM            = (engineCfg and engineCfg.TC_LockupRPM) or 3200
+        car.tcCreepTorque          = (engineCfg and engineCfg.TC_CreepTorque) or 0.12
+        car.centrifugalEngageRPM   = (engineCfg and engineCfg.CentrifugalEngageRPM) or 1800
+        car.centrifugalFullRPM     = (engineCfg and engineCfg.CentrifugalFullRPM) or 3200
+        car.useClutchLerpInManual  = (engineCfg and engineCfg.UseClutchLerpInManual ~= nil) and engineCfg.UseClutchLerpInManual or true
+        car.clutchLerp             = (engineCfg and engineCfg.ClutchLerp) or 0.4
+        car.clutchLerpReverse      = (engineCfg and engineCfg.ClutchLerpReverse) or 0.5
+        car.stoppedPhaseBrakeSpeed = (engineCfg and engineCfg.StoppedPhaseBrakeSpeed) or 5
+        car.downshiftCooldown      = (engineCfg and engineCfg.DownshiftCooldown) or 0.45
+        car.alwaysSportMode        = (engineCfg and engineCfg.AlwaysSportMode == true)
+        car.comfortUpshiftRPM      = (engineCfg and engineCfg.ComfortUpshiftRPM) or 62
+        car.sportUpshiftRPM        = (engineCfg and engineCfg.SportUpshiftRPM) or 90
+        car.comfortDownshiftRPM    = (engineCfg and engineCfg.ComfortDownshiftRPM) or 34
+        car.sportDownshiftRPM      = (engineCfg and engineCfg.SportDownshiftRPM) or 55
+        car.gearRatioMap           = data.gearRatioMap
+        car.minGear                = data.minGear or 0
+        car.fwdGearSpeeds          = (engineCfg and (engineCfg.ForwardGearSpeeds or engineCfg.GearSpeeds)) or nil
+        car.gearSpeeds             = (engineCfg and engineCfg.gearSpeeds) or nil
+        car.reverseGearSpeeds      = data.reverseGearSpeeds
+        car.frontDiffType     = (engineCfg and engineCfg.FrontDiffType ~= nil) and engineCfg.FrontDiffType or 1
+        car.frontLSDStiffness = (engineCfg and engineCfg.FrontLSDStiffness) or 3.0
+        car.frontLSDLockRatio = ((engineCfg and engineCfg.FrontLSDLockRatio) or 90) / 100
+        car.frontLSDPreload   = (engineCfg and engineCfg.FrontLSDPreload) or 15.0
+        car.rearDiffType      = (engineCfg and engineCfg.RearDiffType ~= nil) and engineCfg.RearDiffType or 1
+        car.rearLSDStiffness  = (engineCfg and engineCfg.RearLSDStiffness) or 3.0
+        car.rearLSDLockRatio  = ((engineCfg and engineCfg.RearLSDLockRatio) or 90) / 100
+        car.rearLSDPreload    = (engineCfg and engineCfg.RearLSDPreload) or 15.0
+        car.centerDiffType    = (engineCfg and engineCfg.CenterDiffType ~= nil) and engineCfg.CenterDiffType or 0
+        car.diffLockCfg       = {
+            toggleable     = (not engineCfg) or (engineCfg.DiffLockToggleable ~= false),
+            frontType      = (engineCfg and engineCfg.FrontLockType) or 2,
+            frontStiffness = (engineCfg and engineCfg.FrontLockStiffness) or 30.0,
+            frontRatio     = ((engineCfg and engineCfg.FrontLockRatio) or 95) / 100,
+            rearType       = (engineCfg and engineCfg.RearLockType) or 2,
+            rearStiffness  = (engineCfg and engineCfg.RearLockStiffness) or 30.0,
+            rearRatio      = ((engineCfg and engineCfg.RearLockRatio) or 95) / 100,
+            centerType     = (engineCfg and engineCfg.CenterLockType) or 2,
+        }
+        car.frontLockActive    = false
+        car.rearLockActive     = false
+        car.allLockActive      = false
+        car.frontActiveLockPct = 0
+        car.rearActiveLockPct  = 0
+        car.frontDriveShare = data.frontDriveShare or 0
+        car.rearDriveShare = data.rearDriveShare or (1.0 - car.frontDriveShare)
+        car.c[112] = car.rearDriveShare
+        car.baseParams[112] = car.rearDriveShare
+        if car.dt then car.dt.split = car.rearDriveShare end
+        if car.eng then car.eng.inductionTorqueRatio, car.eng.boostPSI = 1.0, 0 end
+        car.classicAuto = engineCfg and engineCfg.ClassicAuto == true
+        car.speedToReverse = (engineCfg and engineCfg.SpeedToReverse) or 5
+        car.reverseWSonReverse = engineCfg and engineCfg.ReverseWSonReverse ~= false
+        if engineCfg and engineCfg.isAutomatic == false then
+            car:setManual(true)
+        elseif car.classicAuto and not car.manualBox then
+            car:setAutoRange(0)
+        end
+        car.aeroCfg = aeroCfg
+        return car
+    end
+
+    local Chassis = Phys.Chassis
+
+    function Chassis:toggleDiffLock(which)
+        if self.diffLockCfg and self.diffLockCfg.toggleable == false then return nil end
+        if which == "front" then
+            self.frontLockActive = not self.frontLockActive
+            return self.frontLockActive
+        elseif which == "rear" then
+            self.rearLockActive = not self.rearLockActive
+            return self.rearLockActive
+        elseif which == "all" then
+            self.allLockActive = not self.allLockActive
+            return self.allLockActive
+        end
+        return nil
+    end
+
+    function Chassis:computeActiveDiff(controls)
+        local cfg = self.activeDiffCfg
+        local dlc = self.diffLockCfg or {}
+        local thr = clamp((self.drv and self.drv.thr) or (controls and controls.gas) or 0, 0, 1)
+        local spdKmh = abs(self.forward or 0) * 3.6
+        local steerAmt = clamp(abs((controls and controls.steer) or 0), 0, 1)
+
+        local function evalAxle(isFront, wA, wB)
+            local manualOn = self.allLockActive or (isFront and self.frontLockActive) or ((not isFront) and self.rearLockActive)
+            if manualOn then
+                local t = isFront and (dlc.frontType or 2) or (dlc.rearType or 2)
+                local s = isFront and (dlc.frontStiffness or 30.0) or (dlc.rearStiffness or 30.0)
+                local r = isFront and (dlc.frontRatio or 0.95) or (dlc.rearRatio or 0.95)
+                return t, s, r, r * 100
+            end
+            local targeted = cfg and cfg.enabled and ((isFront and cfg.TargetFrontAxle) or ((not isFront) and cfg.TargetRearAxle))
+            if not targeted then
+                local baseT = isFront and self.frontDiffType or self.rearDiffType
+                local baseS = isFront and self.frontLSDStiffness or self.rearLSDStiffness
+                local baseR = isFront and self.frontLSDLockRatio or self.rearLSDLockRatio
+                return baseT, baseS, baseR, 0
+            end
+            local minR = isFront and (cfg.FrontMinLockRatio or 10) or (cfg.RearMinLockRatio or 15)
+            local maxR = isFront and (cfg.FrontMaxLockRatio or 95) or (cfg.RearMaxLockRatio or 40)
+            local minS = isFront and (cfg.FrontMinStiffness or 1.0) or (cfg.RearMinStiffness or 5.0)
+            local maxS = isFront and (cfg.FrontMaxStiffness or 30.0) or (cfg.RearMaxStiffness or 20.0)
+            local slipRPM = abs((wA and wA.w or 0) - (wB and wB.w or 0)) * RAD_TO_RPM
+            local declSpd = max(5, cfg.SteerDeclineSpeed or 40)
+            local spdFactor = clamp((declSpd - spdKmh) / declSpd, 0, 1)
+            local lockReduction = 1.0 - (steerAmt * spdFactor * 0.85)
+            local lockRange = max(1, maxR - minR)
+            local lockPct = (minR + thr * lockRange + slipRPM * (lockRange * 0.1) * thr * (cfg.SlipScale or 2.0) * 0.5) * lockReduction
+            local dynThresh = (cfg.SlipThreshold or 12.0) * (1 + steerAmt * 2.0)
+            if not (cfg.BypassCapsOnSlip and slipRPM >= dynThresh) then
+                local cap = 0
+                if thr > 0 then
+                    if thr < 0.2 then cap = (thr / 0.2) * 25
+                    elseif thr < 0.6 then cap = 25 + ((thr - 0.2) / 0.4) * 15
+                    else cap = 40 + ((thr - 0.6) / 0.4) * max(0, maxR - 40) end
+                end
+                lockPct = min(lockPct, cap)
+            end
+            lockPct = clamp(lockPct, minR, maxR)
+            local stiffness = minS + ((lockPct - minR) / lockRange) * (maxS - minS)
+            local activeT = isFront and (cfg.FrontActiveType or 1) or (cfg.RearActiveType or 1)
+            return activeT, stiffness, lockPct / 100, lockPct
+        end
+
+        local W = self.wheels
+        self.effFrontDiffType, self.effFrontStiffness, self.effFrontLockRatio, self.frontActiveLockPct = evalAxle(true,  W[0], W[1])
+        self.effRearDiffType,  self.effRearStiffness,  self.effRearLockRatio,  self.rearActiveLockPct  = evalAxle(false, W[2], W[3])
+    end
+
+    local function getWheelPeakGrip(self, W, spec)
+        local wsMult = W._wsMult or 1.0
+        local tireLoadKN = max(0, (W.load or 0) * wsMult)
+        local Fz = Tires.addAeroLoadKN(tireLoadKN, self.aeroCfg, self.m or 1450, self.forward or 0, W.i < 2)
+        W.effectiveLoadKN = Fz
+        if Fz <= 0.001 or (W.contact or 0) == 0 then
+            return 0, 0
+        end
+        local matType = W.ground and W.ground.matType
+        local surfLat, surfLon = Tires.computeSurfaceMult(spec, W.surface or 1, matType)
+        local loadRatio = clamp(Fz / max(0.5, spec.nominalLoadKN or 3.68), 0.15, 2.8)
+        local loadSens  = clamp(1.0 - (spec.LoadSens or 0.12) * (loadRatio - 1.0), 0.65, 1.20)
+        local wGrip = (W.grip or 1) * (W.perf or 1)
+        local pLat = Fz * spec.CoF * loadSens * surfLat * spec.latScale  * wGrip
+        local pLon = Fz * spec.CoF * loadSens * surfLon * spec.longScale * wGrip
+        return pLat, pLon
+    end
+
+    -- The axle points left on both sides. Rotate static camber about forward, then
+    -- rotate the axle about the rearward-tilted steering pivot (Rodrigues' formula).
+    function Chassis:updateAlignment(W, steer)
+        local wheel = W.alignment or {}
+        local right = W.i == 1 or W.i == 2
+        local camber = ((wheel.camberDeg or 0) + (W.travelCamberDeg or 0)) * (right and 1 or -1)
+        if (wheel.legacySteeringCamber or 0) ~= 0 then
+            local limit = max(0.01, self.steerCfg.Lock or self.steerCfg.maxAngle or 38)
+            camber = camber - wheel.legacySteeringCamber * clamp(math.deg(steer) / limit, -1, 1)
+        end
+        W.hubCamberDeg = camber
+        local c, k = math.rad(camber), math.rad(wheel.casterDeg or 0)
+        local cy, cz = math.cos(c), math.sin(c)
+        local px, pz = -math.sin(k), math.cos(k)
+        local cs, sn = math.cos(steer), math.sin(steer)
+        local d = pz * cz * (1 - cs)
+        W.axleX = -pz * cy * sn + px * d
+        W.axleY = cy * cs - px * cz * sn
+        W.axleZ = cz * cs + px * cy * sn + pz * d
+        if (W.beamRollDeg or 0) ~= 0 then
+            local roll = math.rad(W.beamRollDeg)
+            local cr, sr = math.cos(roll), math.sin(roll)
+            W.axleY, W.axleZ = cr * W.axleY - sr * W.axleZ, sr * W.axleY + cr * W.axleZ
+        end
+    end
+
+    function Chassis:tire(W)
+        W.roadCamberRad, W.camberFy = 0, 0
+        if not self.tireSimSpecs then
+            W.Fx, W.Fy, W.slip, W.slipX, W.slipY = 0, 0, 0, 0, 0
+            return
+        end
+        if W.contact == 0 then
+            W.Fx, W.Fy, W.peakLatKN, W.peakLongKN = 0, 0, 0, 0
+            W.slip, W.slip364, W.slipX, W.slipY = 0, 0, 0, 0
+            W.slipAngleRad, W.slipRatio, W.sliding, W.absActive = 0, 0, 0, false
+            local brakes = self.braking
+            local service = W.i < 2 and brakes.frontBrakeKNm or brakes.rearBrakeKNm
+            W.airBrakeTorque = service * self.drv.brk + brakes.handbrake.torqueKNm * W.hbk
+            W.locked = (W.hbk > 0.1 and brakes.handbrake.lockWheels) and 1 or 0
+            if W.locked ~= 0 then W.w = 0 end
+            return
+        end
+        local b, vel = W.basis, W.vel
+        local vFwd = vel[0] * b[0] + vel[1] * b[1] + vel[2] * b[2]
+        local vLat = vel[0] * b[3] + vel[1] * b[4] + vel[2] * b[5]
+        local absFwd = abs(vFwd)
+
+        local spec = (W.i < 2) and self.tireSimSpecs.front or self.tireSimSpecs.rear
+        local peakLatKN, peakLongKN = getWheelPeakGrip(self, W, spec)
+
+        local pedalBrk, vBrk, vHbk, absReleasing = Braking.applyWheelTorque(self, W, peakLongKN, vFwd, absFwd)
+
+        local isAxleLocked = (W.i < 2 and ((self.effFrontDiffType == 2) or (self.frontDiffType == 2) or self.frontLockActive or self.allLockActive))
+            or (W.i >= 2 and ((self.effRearDiffType == 2) or (self.rearDiffType == 2) or self.rearLockActive or self.allLockActive))
+        local isCoastingInput = (self.drv and self.drv.thr or 0) < 0.05 and pedalBrk < 0.05 and W.hbk < 0.05
+        local slipSpeedScale = max(2.2, absFwd + 0.5)
+        local spinThreshold = 0.16 * slipSpeedScale
+        if (not isAxleLocked) and W.locked == 0 and (W.contact or 0) ~= 0 and abs(W.T) < 0.001 and pedalBrk < 0.01 and W.hbk < 0.01 and abs(W.w * W.radius) <= absFwd + spinThreshold then
+            W.w = vFwd / max(0.15, W.radius)
+        elseif W.locked == 0 and (W.contact or 0) ~= 0 and W.T > 0 and pedalBrk < 0.05 and W.hbk < 0.05 and vFwd >= 0 and (W.w * W.radius) < vFwd then
+            -- Never let a driven wheel lag behind forward speed and falsely apply negative braking Fx
+            W.w = vFwd / max(0.15, W.radius)
+        elseif W.locked == 0 and (W.contact or 0) ~= 0 and W.T < 0 and pedalBrk < 0.05 and W.hbk < 0.05 and vFwd < 0 and (W.w * W.radius) > vFwd then
+            -- Never let a reverse-driven wheel lag behind reverse speed and falsely apply positive braking Fx
+            W.w = vFwd / max(0.15, W.radius)
+        elseif W.locked == 0 and (W.contact or 0) ~= 0 and isCoastingInput and W.T <= 0 and vFwd >= 0 and (W.w * W.radius) < vFwd then
+            -- Never let mild coasting engine-braking drag lock the tire into a sliding stall at low update rates
+            if abs(W.T / max(0.15, W.radius)) < max(0.25, peakLongKN * 0.55) then
+                W.w = vFwd / max(0.15, W.radius)
+            end
+        elseif W.locked == 0 and (W.contact or 0) ~= 0 and isCoastingInput and W.T >= 0 and vFwd < 0 and (W.w * W.radius) > vFwd then
+            -- Same mild coasting guard in reverse (only when off-throttle)
+            if abs(W.T / max(0.15, W.radius)) < max(0.25, peakLongKN * 0.55) then
+                W.w = vFwd / max(0.15, W.radius)
+            end
+        end
+        peakLatKN = Braking.applyWheelLock(self, W, peakLongKN, peakLatKN, vFwd, absFwd, pedalBrk, vBrk, vHbk, absReleasing)
+        local slipVel = W.radius * W.w - vFwd
+        W.slip = slipVel
+        W.slip364 = slipVel
+
+        local V0 = (spec and spec.V0) or 1.016
+        local denomSpd = max(absFwd, V0)
+        local alphaRaw = math.atan2(vLat, denomSpd)
+        local dz = (spec and spec.lowSpeedDeadzone) or 0.08
+        if absFwd < 3.5 and abs(alphaRaw) < dz then
+            alphaRaw = alphaRaw * ((spec and spec.lowSpeedHoldScale) or 0.35)
+        end
+        local alphaRad = alphaRaw
+        local kappa = clamp(slipVel / slipSpeedScale, -1.0, 1.0)
+        W.slipAngleRad = alphaRad
+        W.slipRatio = kappa
+
+        W.peakLatKN  = peakLatKN
+        W.peakLongKN = peakLongKN
+
+        if peakLatKN <= 0.001 and peakLongKN <= 0.001 then
+            W.Fx, W.Fy = 0, 0
+            W.sliding = 0
+            W.slipX, W.slipY = 0, vLat
+            return
+        end
+
+        local totalSpd = sqrt(vFwd * vFwd + vLat * vLat)
+        local latVelRamp = min(1.0, totalSpd / 0.55)
+        local latSign = (vLat > 0) and -1 or ((vLat < 0) and 1 or 0)
+        local latShape = evaluateMagicFormula(spec.Lat_B, spec.Lat_C, spec.Lat_E, abs(alphaRad))
+        W.Fy = peakLatKN * latShape * latSign * latVelRamp
+        if W.axleX then
+            local R, n = self.R, W.n
+            local nx = R[0]*n[0] + R[1]*n[1] + R[2]*n[2]
+            local ny = R[3]*n[0] + R[4]*n[1] + R[5]*n[2]
+            local nz = R[6]*n[0] + R[7]*n[1] + R[8]*n[2]
+            local inclination = math.asin(clamp(W.axleX*nx + W.axleY*ny + W.axleZ*nz, -1, 1))
+            W.roadCamberRad = (W.i == 1 or W.i == 2) and inclination or -inclination
+            if W.locked == 0 then
+                local thrust = clamp(-inclination * spec.camberStiffness, -1, 1)
+                W.camberFy = peakLatKN * thrust * (1 - abs(latShape)) * min(1, absFwd / 0.55)
+                W.Fy = W.Fy + W.camberFy
+            end
+        end
+
+        -- The lateral curve already accounts for sideslip. Reduce its available
+        -- force by longitudinal spin without restoring grip as sideslip grows.
+        local excessSpin = abs(W.radius * W.w) - absFwd - spinThreshold
+        if excessSpin > 0 and W.locked == 0 then
+            local normalizedSpin = excessSpin / spinThreshold
+            local retention = 1 / sqrt(1 + normalizedSpin * normalizedSpin)
+            W.Fy, W.camberFy = W.Fy * retention, W.camberFy * retention
+        end
+
+        local reqFx = W.T / max(0.15, W.radius)
+        local overGripSpin = ((self.drv and self.drv.thr or 0) > 0.1) and (abs(reqFx) > peakLongKN * 1.02)
+        local isSliding = (W.locked ~= 0) or (abs(kappa) > 0.16) or overGripSpin
+        if not isSliding then
+            W.sliding = 0
+            W.Fx = clamp(reqFx, -peakLongKN, peakLongKN)
+            W.slipX = 0
+            W.slipY = vLat
+        else
+            W.sliding = 1
+            if W.locked ~= 0 then
+                -- A stopped tread scrubs against the road in the direction of travel.
+                local slide = evaluateMagicFormula(spec.Long_B, spec.Long_C, spec.Long_E, 1)
+                local scale = slide / max(totalSpd, 0.8)
+                W.Fx = -peakLongKN * vFwd * scale
+                W.Fy = -peakLatKN * vLat * scale
+            else
+                local slipSign = (abs(kappa) > 0.01) and ((kappa >= 0) and 1 or -1) or ((reqFx >= 0) and 1 or -1)
+                local evalKappa = overGripSpin and max(abs(kappa), 0.16) or abs(kappa)
+                local lonShape = evaluateMagicFormula(spec.Long_B, spec.Long_C, spec.Long_E, evalKappa)
+                if overGripSpin and abs(kappa) < 0.16 then
+                    lonShape = max(lonShape, 0.92)
+                end
+                W.Fx = peakLongKN * lonShape * slipSign
+                if excessSpin > 0 then
+                    local scrubSpeed = sqrt(slipVel * slipVel + vLat * vLat)
+                    local spinBlend = min(1, excessSpin / spinThreshold)
+                    W.Fx = W.Fx * (1 - spinBlend * (1 - abs(slipVel) / scrubSpeed))
+                end
+            end
+            W.slipX = slipVel
+            W.slipY = vLat
+        end
+
+        if (W.contact or 0) ~= 0 and absFwd > 0.15 and (W.effectiveLoadKN or 0) > 0.001 then
+            local rrMult = Tires.computeRollingResistanceMult(spec, W.surface or 1, W.ground and W.ground.matType)
+            W.rrForce = W.effectiveLoadKN * (spec.rollingRes or 0.015) * rrMult * min(1.0, absFwd / 1.5)
+        else
+            W.rrForce = 0
+        end
+    end
+
+    function Chassis:ellipse(W)
+        if not self.tireSimSpecs then
+            W.Fx, W.Fy = 0, 0
+            return
+        end
+        local b, vel = W.basis, W.vel
+        if (W.contact or 0) == 0 or (W.load or 0) <= 0.001 then
+            W.Fx, W.Fy = 0, 0
+            W.usage = 0
+            W.skidIntensity = 0
+            local wf = W.world
+            wf[0], wf[1], wf[2] = 0, 0, 0
+            return
+        end
+
+        local pLon = max(0.05, W.peakLongKN or W.load)
+        local pLat = max(0.05, W.peakLatKN or W.load)
+        local rx = (W.Fx / pLon)
+        local ry = (W.Fy / pLat)
+        local r  = sqrt(rx * rx + ry * ry)
+
+        if r > 1.0 then
+            W.Fx = W.Fx / r
+            W.Fy = W.Fy / r
+            W.camberFy = W.camberFy / r
+        end
+
+        W.usage = clamp(r, 0, 1.35)
+        local vFwd = vel[0] * b[0] + vel[1] * b[1] + vel[2] * b[2]
+        local vLat = vel[0] * b[3] + vel[1] * b[4] + vel[2] * b[5]
+        local hdt = max(0.002, self.substepDt or 0.004)
+        local cornerMass = max(0.08, self.m * 0.25)
+        -- Rolling camber generates thrust even at zero lateral velocity.
+        local jyMax = (0.85 * abs(vLat) * cornerMass) / hdt + abs(W.camberFy)
+        if abs(W.Fy) > jyMax then
+            W.camberFy = W.camberFy * (jyMax / abs(W.Fy))
+            W.Fy = (W.Fy >= 0 and 1 or -1) * jyMax
+        end
+
+        local activeSpd = max(sqrt(vFwd * vFwd + vLat * vLat), abs(W.radius * W.w))
+        local slipVelLong = (W.radius * W.w) - vFwd
+        local totalSlipSpeedIn = sqrt(slipVelLong * slipVelLong + vLat * vLat) * 39.3700787
+        local overRatio = sqrt(((W.slipRatio or 0) / 0.12) ^ 2 + ((W.slipAngleRad or 0) / 0.16) ^ 2)
+        local speedGate = clamp((totalSlipSpeedIn - 24) / 95, 0, 1)
+        local skid = clamp((overRatio - 0.58) / 1.25, 0, 1) * speedGate
+        if (W.locked ~= 0 or W.sliding ~= 0 or (W.usage > 0.92 and not W.absActive)) and activeSpd > 0.8 then
+            skid = max(skid, clamp(W.usage * 0.85, 0.35, 1.0) * max(0.35, speedGate))
+        end
+        if W.absActive and W.locked == 0 and W.sliding == 0 and (self.braking and self.braking.abs and self.braking.abs.threshold or 0.32) <= 0.14 then
+            skid = 0
+        end
+        W.skidIntensity = skid
+
+        if (W.rrForce or 0) > 0.0001 and abs(vFwd) > 0.15 then
+            W.Fx = W.Fx - ((vFwd >= 0) and W.rrForce or -W.rrForce)
+        end
+
+        local wf = W.world
+        wf[0] = W.Fx * b[0] + W.Fy * b[3] + W.load * b[6]
+        wf[1] = W.Fx * b[1] + W.Fy * b[4] + W.load * b[7]
+        wf[2] = W.Fx * b[2] + W.Fy * b[5] + W.load * b[8]
+    end
+
+    function Chassis:updateMass(newMassKg)
+        local newMassT = max(0.35, (newMassKg or 1500) / 1000)
+        local oldMassT = self.baseParams[68] or self.m or 1.22
+        local ratio = newMassT / max(0.1, oldMassT)
+        if abs(ratio - 1) < 0.005 then return end
+
+        local function scaleCarArray(arr)
+            arr[68] = newMassT
+            arr[72] = arr[72] * ratio
+            arr[77] = arr[77] * ratio
+            arr[82] = arr[82] * ratio
+            arr[153] = arr[153] * ratio
+            arr[154] = arr[154] * ratio
+        end
+
+        scaleCarArray(self.baseParams)
+        self.c = self.baseParams
+        if self.rearDriveShare ~= nil then self.c[112] = self.rearDriveShare end
+        if self.rearDriveShare ~= nil and self.dt then self.dt.split = self.rearDriveShare end
+
+        self.m = self.c[68]
+        self.im = 1 / self.m
+        self.Iinv = { [0] = 1 / self.c[72], 1 / self.c[77], 1 / self.c[82] }
+        self.Iinv2 = { [0] = self.Iinv[0], self.Iinv[1], self.Iinv[2] / self.c[88] }
+        if self.tireSimSpecs then
+            local cornerKN = (self.m * 0.25) * 9.800000190734863
+            self.tireSimSpecs.front.nominalLoadKN = cornerKN
+            self.tireSimSpecs.rear.nominalLoadKN  = cornerKN
+        end
+        self:updateWheelMounts()
+    end
+
+    function Chassis:updateSimClutch()
+        local d = self.dt
+        local speedKmh = abs(self.forward or 0) * 3.6
+        local stopSpd = self.stoppedPhaseBrakeSpeed or 5
+        local thrIn = (self.drv and self.drv.thr) or 0
+        local brkIn = (self.drv and self.drv.brk) or 0
+        local hasThrInput = thrIn > 0.05
+        local simClutch = 0
+        if d.gear == 1 or d.state == 0 or d.state == 1 or d.shifting ~= 0 or (self.clutchPedal == 0) or ((self._stepHandbrake or 0) > 0.5) then
+            simClutch = 1
+        elseif self.clutchType == "torque_converter" then
+            local rpmNow = self.eng.w * RAD_TO_RPM
+            local idleRPM = self.c[124] or 800
+            local stallRPM = max(idleRPM + 200, self.tcStallRPM or 2200)
+            local cap = clamp((rpmNow - idleRPM) / (stallRPM - idleRPM), 0, 1)
+            local creep = clamp(self.tcCreepTorque or 0.12, 0, 0.5)
+            local engage = clamp(creep + (1.0 - creep) * cap, 0, 1)
+            if brkIn > 0.05 and not hasThrInput and speedKmh <= stopSpd then
+                engage = creep * 0.25
+            end
+            simClutch = 1.0 - engage
+        elseif self.clutchType == "centrifugal" then
+            local rpmNow = self.eng.w * RAD_TO_RPM
+            local engRPM = self.centrifugalEngageRPM or 1800
+            local fullRPM = max(engRPM + 100, self.centrifugalFullRPM or 3200)
+            local engage = clamp((rpmNow - engRPM) / (fullRPM - engRPM), 0, 1)
+            simClutch = 1.0 - engage
+        else
+            if brkIn > 0.05 and not hasThrInput and speedKmh <= stopSpd then
+                simClutch = 1
+            elseif brkIn > 0.05 and not hasThrInput and speedKmh <= (stopSpd + 15) then
+                simClutch = 1.0 - clamp((speedKmh - stopSpd) / 15.0, 0, 1)
+            elseif not hasThrInput and speedKmh <= stopSpd then
+                simClutch = 1
+            end
+            if simClutch < 1 and (not self.manualBox or self.useClutchLerpInManual) then
+                local rpmNow = self.eng.w * RAD_TO_RPM
+                local redline = max(1000, self.c[126] or 8000)
+                local lerpLim = (d.gear <= 0 or (self.drv and self.drv.reversing)) and (self.clutchLerpReverse or 0.5) or (self.clutchLerp or 0.4)
+                local rpmClutch = max(0, lerpLim - (rpmNow / redline))
+                simClutch = max(simClutch, rpmClutch)
+            end
+        end
+        self.simClutch = clamp(simClutch, 0, 1)
+    end
+
+    -- Synchronize the solver state from GMod VPhysics and advance across 0.0044s substeps
+    function Chassis:stepVPhysics(dt, pos_m, R, vel_m, angVel_rad, wheelGrounds, controls)
+        dt = clamp(dt or 0.015, 0.001, 0.05)
+        self._vphysMode = true
+
+        -- 1. Update wheel ground planes from Base raycasts
+        if wheelGrounds then
+            for i = 0, 3 do
+                local g = wheelGrounds[i]
+                if g then
+                    local wg = self.wheels[i].ground
+                    wg.p[0], wg.p[1], wg.p[2] = g.p[0], g.p[1], g.p[2]
+                    wg.n[0], wg.n[1], wg.n[2] = g.n[0], g.n[1], g.n[2]
+                    wg.s = g.s or 1
+                    wg.matType = g.matType
+                end
+            end
+        end
+
+        -- 2. Copy GMod VPhysics rigid-body pose and velocity into the solver body
+        self.pos[0], self.pos[1], self.pos[2] = pos_m[0], pos_m[1], pos_m[2]
+        for k = 0, 8 do self.R[k] = R[k] end
+        self.v[0], self.v[1], self.v[2] = vel_m[0], vel_m[1], vel_m[2]
+        self.w[0], self.w[1], self.w[2] = angVel_rad[0], angVel_rad[1], angVel_rad[2]
+        self.speed = sqrt(self.v[0] * self.v[0] + self.v[1] * self.v[1] + self.v[2] * self.v[2])
+        self.forward = self.v[0] * R[0] + self.v[1] * R[1] + self.v[2] * R[2]
+
+        local groundedHint = 0
+        for i = 0, 3 do
+            if (self.wheels[i].ground.s or 0) ~= 0 then groundedHint = groundedHint + 1 end
+        end
+        self.mode344 = (groundedHint > 0) and 1 or 0
+
+        self.P[0], self.P[1], self.P[2] = self.v[0] * self.m, self.v[1] * self.m, self.v[2] * self.m
+        local I = (self.mode344 ~= 0) and self.Iinv2 or self.Iinv
+        local wx = angVel_rad[0] * R[0] + angVel_rad[1] * R[1] + angVel_rad[2] * R[2]
+        local wy = angVel_rad[0] * R[3] + angVel_rad[1] * R[4] + angVel_rad[2] * R[5]
+        local wz = angVel_rad[0] * R[6] + angVel_rad[1] * R[7] + angVel_rad[2] * R[8]
+        local lx, ly, lz = wx / I[0], wy / I[1], wz / I[2]
+        self.L[0] = lx * R[0] + ly * R[3] + lz * R[6]
+        self.L[1] = lx * R[1] + ly * R[4] + lz * R[7]
+        self.L[2] = lx * R[2] + ly * R[5] + lz * R[8]
+
+        -- Initialize wheel travel from the current ground height.
+        if not self._vphysInit then
+            self._vphysInit = true
+            self:updateWheelMounts()
+            for i = 0, 3 do
+                self:postWheel(self.wheels[i])
+                self:postSusp(self.wheels[i])
+            end
+            self:keepState()
+        end
+
+        -- 3. Apply driver controls & Clutch Pedal
+        controls = controls or {}
+        if controls.aeroCfg ~= nil then self.aeroCfg = controls.aeroCfg end
+        if controls.weightShiftCfg ~= nil then self.weightShiftCfg = controls.weightShiftCfg end
+
+        -- Simulated Dynamic Weight Shift (adjusts per-wheel normal load Fz from accel Gs)
+        local wsCfg = self.weightShiftCfg
+        local rawFwdG = controls.fwdAccelG
+        if rawFwdG == nil then
+            local prevFwd = self._prevFwdSpeed or (self.forward or 0)
+            rawFwdG = ((self.forward or 0) - prevFwd) / (max(0.002, dt) * 9.81)
+        end
+        self._prevFwdSpeed = self.forward or 0
+        local rawLatG = controls.latAccelG or 0
+        local rawVertG = controls.vertAccelG or 0
+        local wsSmooth = clamp(((wsCfg and wsCfg.Smoothing) or 10.0) * dt, 0.05, 1.0)
+        self._wsFwdG  = (self._wsFwdG  or 0) + (rawFwdG  - (self._wsFwdG  or 0)) * wsSmooth
+        self._wsLatG  = (self._wsLatG  or 0) + (rawLatG  - (self._wsLatG  or 0)) * wsSmooth
+        self._wsVertG = (self._wsVertG or 0) + (rawVertG - (self._wsVertG or 0)) * wsSmooth
+
+        local wsEnabled = (wsCfg == nil) or (wsCfg.Enabled ~= false)
+        local dLong, dLat, vertMult = 0, 0, 1.0
+        if wsEnabled then
+            local cgH = (wsCfg and wsCfg.CGHeight) or 0.55
+            local wb  = max(0.5, (wsCfg and wsCfg.Wheelbase) or 2.55)
+            local tw  = max(0.5, (wsCfg and wsCfg.TrackWidth) or 1.55)
+            local maxFrac = (wsCfg and wsCfg.MaxTransferFrac) or 0.45
+            local longMul = (wsCfg and wsCfg.LongitudinalTransfer) or 1.0
+            local latMul  = (wsCfg and wsCfg.LateralTransfer) or 1.0
+            local vertMul = (wsCfg and wsCfg.VerticalTransfer) or 1.0
+            local minVert = (wsCfg and wsCfg.MinVertLoadMult) or 0.20
+            local maxVert = (wsCfg and wsCfg.MaxVertLoadMult) or 2.00
+            dLong    = clamp(-self._wsFwdG * (cgH / wb) * longMul, -maxFrac, maxFrac)
+            dLat     = clamp(-self._wsLatG * (cgH / tw) * latMul,  -maxFrac, maxFrac)
+            vertMult = clamp(1.0 + self._wsVertG * vertMul, minVert, maxVert)
+        end
+        local minLoadFrac = (wsCfg and wsCfg.MinWheelLoadFrac) or 0.15
+        local gripEffect  = (wsCfg and wsCfg.GripEffectMult ~= nil) and wsCfg.GripEffectMult or 0.65
+        local gripLong    = (wsCfg and wsCfg.GripEffectLongMult ~= nil) and wsCfg.GripEffectLongMult or 1.0
+        local gripLat     = (wsCfg and wsCfg.GripEffectLatMult  ~= nil) and wsCfg.GripEffectLatMult  or 1.0
+        local fLongM      = (wsCfg and wsCfg.FrontLongMult    ~= nil) and wsCfg.FrontLongMult    or 1.0
+        local rLongM      = (wsCfg and wsCfg.RearLongMult     ~= nil) and wsCfg.RearLongMult     or 1.0
+        local fLatM       = (wsCfg and wsCfg.FrontLateralMult ~= nil) and wsCfg.FrontLateralMult or 1.0
+        local rLatM       = (wsCfg and wsCfg.RearLateralMult  ~= nil) and wsCfg.RearLateralMult  or 1.0
+        local frontSum, rearSum, leftSum, rightSum, totalW = 0, 0, 0, 0, 0
+        local rawMultSum, activeCount = 0, 0
+        for i = 0, 3 do
+            local wObj = self.wheels[i]
+            if wObj then
+                local isFront   = (i < 2)
+                local frontSign = isFront and 1 or -1
+                local rightSign = (i == 1 or i == 2) and 1 or -1 -- 0=FL, 1=FR, 2=RR, 3=RL
+                local axLongM   = isFront and fLongM or rLongM
+                local axLatM    = isFront and fLatM  or rLatM
+                local dispMult  = wsEnabled and max(minLoadFrac, 1.0 + frontSign * dLong + rightSign * dLat) or 1.0
+                local physDelta = (frontSign * dLong * gripLong * axLongM) + (rightSign * dLat * gripLat * axLatM)
+                local physMult  = wsEnabled and max(minLoadFrac, 1.0 + physDelta * gripEffect) or 1.0
+                wObj._wsMult = physMult
+                if (wObj.load or 0) > 0.001 then
+                    rawMultSum = rawMultSum + physMult
+                    activeCount = activeCount + 1
+                end
+                local wLoad = max(0, (wObj.load or 0) * dispMult)
+                totalW = totalW + wLoad
+                if i < 2 then frontSum = frontSum + wLoad else rearSum = rearSum + wLoad end
+                if i == 0 or i == 3 then leftSum = leftSum + wLoad else rightSum = rightSum + wLoad end
+            end
+        end
+        if activeCount > 0 and rawMultSum > 0.001 then
+            local normScale = (activeCount / rawMultSum) * vertMult
+            for i = 0, 3 do
+                local wObj = self.wheels[i]
+                if wObj and (wObj.load or 0) > 0.001 then
+                    wObj._wsMult = wObj._wsMult * normScale
+                end
+            end
+        end
+        local fb = self.frontWeightBias or 0.50
+        local fPct = (totalW > 0.001) and (frontSum / totalW * 100) or clamp((fb + 0.5 * dLong) * 100, 5, 95)
+        local lPct = (totalW > 0.001) and (leftSum / totalW * 100) or clamp((0.5 - 0.5 * dLat) * 100, 5, 95)
+        self.weightShiftDebug = {
+            enabled  = wsEnabled,
+            fwdG     = self._wsFwdG,
+            latG     = self._wsLatG,
+            vertG    = self._wsVertG,
+            vertMult = vertMult,
+            dLong    = dLong,
+            dLat     = dLat,
+            frontPct = fPct,
+            rearPct  = 100 - fPct,
+            leftPct  = lPct,
+            rightPct = 100 - lPct,
+        }
+        self.ignitionRunning = (controls.ignitionRunning ~= false)
+        if not self.ignitionRunning and self.eng then
+            self.eng.w = (controls.crankRPM or 0) * 0.10471975512
+            self.rpm = controls.crankRPM or 0
+        end
+        self.vphysLoadsKN = controls.vphysLoadsKN
+        if controls.clutchPedal ~= nil then self.clutchPedal = controls.clutchPedal else self.clutchPedal = 1 end
+        if self.drv then self.drv.reverseGas = controls.reverseGas; self.drv.forwardBrake = controls.forwardBrake end
+        self:driver(
+            controls.steer or 0,
+            controls.gas or 0,
+            controls.brake or 0,
+            controls.handbrake or 0,
+            dt,
+            controls.hold and true or false,
+            controls.u16
+        )
+
+        -- 4. Frame pre-substep setup & velocity-based suspension sync
+        local hbkIn = (self.drv and self.drv.hbk) or 0
+        for i = 0, 3 do
+            self.wheels[i].hbk = (i >= 2) and hbkIn or 0
+        end
+        self:prepareFrame()
+        self:updateDriverState(dt)
+
+        for i = 0, 3 do
+            self:updateAlignment(self.wheels[i], i == 0 and self.steer.a0 or (i == 1 and self.steer.a1 or 0))
+        end
+        self:postBody()
+        for i = 0, 3 do
+            self:postWheel(self.wheels[i])
+            self:postSusp(self.wheels[i])
+        end
+        self:postEngine()
+        self:postDrive()
+        local maxSub = (controls and controls.maxSubsteps) or 4
+        local n = min(maxSub, max(1, math.ceil(dt / 0.010)))
+        local h = dt / n
+        self.substepDt = h
+
+        -- 5. Record start-of-substeps rigid-body velocities & run bounded substeps (2 max by default)
+        local vx0, vy0, vz0 = self.v[0], self.v[1], self.v[2]
+        local wx0, wy0, wz0 = self.w[0], self.w[1], self.w[2]
+        local ux, uy, uz    = R[6], R[7], R[8]
+        local fx, fy, fz    = R[0], R[1], R[2]
+        local lfx, lfy, lfz = R[3], R[4], R[5]
+
+
+
+        for i = 0, 3 do
+            local W = self.wheels[i]
+            W.absActiveTick = false
+            W.tickFx, W.tickFy = 0, 0
+        end
+
+        -- Red Fox Engine Master Clutch Control (0 = engaged/driving, 1 = disengaged)
+        self._stepHandbrake = (controls and controls.handbrake or 0)
+        self:updateSimClutch()
+
+        self:computeActiveDiff(controls)
+        self:forces()
+        for _ = 1, n do
+            -- integrate consumes these forces, then solves new ones for the next substep.
+            for i = 0, 3 do
+                local W = self.wheels[i]
+                W.tickFx = W.tickFx + W.Fx / n
+                W.tickFy = W.tickFy + W.Fy / n
+            end
+            self:integrate(h)
+            self.now = self.now + h
+            self:orthonormalize()
+            for i = 0, 3 do
+                local W = self.wheels[i]
+                if W.absActive then W.absActiveTick = true end
+            end
+        end
+
+        self:state(dt)
+        if dt > 0 then
+            self.yawAcc  = (self.w[2] - self.yawPrev) / dt
+            self.yawPrev = self.w[2]
+        end
+
+        -- 6. Remove internal gravity from the velocity delta before converting to car-frame axes
+        local dvx = self.v[0] - vx0
+        local dvy = self.v[1] - vy0
+        local dvz = (self.v[2] - vz0) + self.grav * dt
+
+        local dv_fwd_m  = dvx * fx  + dvy * fy  + dvz * fz
+        local dv_left_m = dvx * lfx + dvy * lfy + dvz * lfz
+        local dv_up_m   = dvx * ux  + dvy * uy  + dvz * uz
+
+        local dwx = self.w[0] - wx0
+        local dwy = self.w[1] - wy0
+        local dwz = self.w[2] - wz0
+        local dw_roll_rad  = dwx * fx  + dwy * fy  + dwz * fz
+        local dw_pitch_rad = dwx * lfx + dwy * lfy + dwz * lfz
+        local dw_yaw_rad   = dwx * ux  + dwy * uy  + dwz * uz
+
+        local boostPSI = self.eng and self.eng.boostPSI or 0
+
+        local g = self.gearShown or 2
+        local gName
+        if self.classicAuto and not self.manualBox and self.autoRange == 0 then
+            gName = "P"
+        elseif g == 1 then
+            gName = "N"
+        elseif g >= 2 then
+            gName = (self.classicAuto and not self.manualBox and "D" or "") .. tostring(g - 1)
+        else
+            gName = ((self.minGear or 0) == 0) and "R" or ("R" .. tostring(1 - g))
+        end
+        local peakTqKNm = 0
+        for i = 128, 136 do
+            local v = self.c[i] or 0
+            if v > peakTqKNm then peakTqKNm = v end
+        end
+        local engineLoad = clamp(math.abs(self.lastTload or (self.eng and self.eng.tload) or 0) / math.max(0.05, peakTqKNm * (self.eng and self.eng.perf or 1)), 0, 1.5)
+        return {
+            dv_fwd_m      = dv_fwd_m,
+            dv_left_m     = dv_left_m,
+            dv_up_m       = dv_up_m,
+            dw_roll_rad   = dw_roll_rad,
+            dw_pitch_rad  = dw_pitch_rad,
+            dw_yaw_rad    = dw_yaw_rad,
+            grounded      = self.grounded,
+            restState     = self.restState,
+            speed_ms      = self.speed,
+            forward_ms    = self.forward,
+            rpm           = self.rpm,
+            flywheel_rpm  = self.eng.w * RAD_TO_RPM,
+            gearIndex     = self.dt.gear,
+            gearShown     = g,
+            gearName      = gName,
+            clutch        = self.simClutch ~= nil and self.simClutch or (1.0 - (self.dt.clutch or 0)),
+            shifting      = self.dt.shifting,
+            throttle      = (self.dt.shifting ~= 0) and 0 or (self.eng and self.eng.T or (self.drv and self.drv.thr or self.throttleOut)),
+            brake         = self.drv and self.drv.brk or 0,
+            frontDiffLocked = (self.frontDiffType == 2 and self.c[112] <= 0.999) or (self.frontDiffLocked == true) or (self.frontLockActive == true) or (self.allLockActive == true),
+            rearDiffLocked  = (self.rearDiffType == 2 and self.c[112] >= 0.001) or (self.rearDiffLocked == true) or (self.rearLockActive == true) or (self.allLockActive == true),
+            allDiffLocked   = (self.allLockActive == true),
+            frontActiveLockPct = self.frontActiveLockPct or 0,
+            rearActiveLockPct  = self.rearActiveLockPct or 0,
+            torqueNm      = self:torque() * 1000,
+            engineLoad    = engineLoad,
+            boostPSI      = boostPSI,
+            slipDeg       = self:slipAngle() * 57.2957795,
+            manual        = self.manualBox,
+            a0            = self.steer.a0,
+            a1            = self.steer.a1,
+        }
+    end
+end
+
+
+initializeVehiclePhysicsBridge(SimcadeVehiclePhysics)
+
+_G.SimcadeVehiclePhysics = SimcadeVehiclePhysics
+return SimcadeVehiclePhysics

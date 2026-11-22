@@ -179,7 +179,7 @@ function M.new(data)
     self.wheels = {}
     for i = 0, 3 do
         local o, tire, su = 4 + 12 * i, 52 + 8 * floor(i / 2), 92 + 8 * floor(i / 2)
-        local W = { i = i, o = o, tire = tire, radius = c[o + 4], I = 0.009999999776482582, w = 0, ang = 0, T = 0, locked = 0, dir = 1, slip = 0, slip364 = 0, contact = 0, avgT = 0, Fx = 0, Fy = 0,
+        local W = { i = i, o = o, tire = tire, radius = c[o + 4], I = 0.0015, w = 0, ang = 0, T = 0, locked = 0, dir = 1, slip = 0, slip364 = 0, contact = 0, avgT = 0, Fx = 0, Fy = 0,
             world = vec(0, 0, 0), pt = vec(0, 0, 0), n = vec(0, 0, 1), load = 0, sliding = 0, brk = 0, hbk = 0, grip = 1, perf = 1, vel = vec(0, 0, 0),
             basis = { [0] = 1, 0, 0, 0, 1, 0, 0, 0, 1 }, at = vec(0, 0, 0), M = { [0] = 1, 0, 0, 1 }, slipX = 0, slipY = 0, usage = 0, surface = 1, bumpZ = 0,
             ground = { p = vec(0, 0, 0), n = vec(0, 0, 1), s = 1 } }
@@ -292,61 +292,106 @@ function Chassis:driver(steer, gas, brake, handbrake, dt, hold, u16)
     elseif self._vphysMode and self.manualBox then
         D.reversing = (D.gear <= 0)
         D.thr = clamp(v18, 0, 1)
-        D.brk = clamp(D.brake, 0, 1)
-        if (D.reversing and rollingForward) or (D.gear > 1 and rollingBackward) then
-            D.thr = 0
-            D.brk = clamp(max(forwardBrake, D.brake), 0, 1)
-        end
+        D.brk = SimcadeBraking.updatePedal(self, D, clamp(D.brake, 0, 1), dt)
     elseif self._vphysMode and not self.manualBox then
-        -- A pedal that brakes rollback stays in brake mode until a second press.
-        local stopped = not rollingForward and not rollingBackward
-        D.brakeLatch, D.reverseHold, D.reverseLaunch = updateDirectionBrake(
-            D.brakeLatch, D.reverseHold, D.reverseLaunch, D.brake, v18,
-            rollingForward, v16, stopped, dt)
-        D.revBrakeLatch, D.forwardHold, D.forwardLaunch = updateDirectionBrake(
-            D.revBrakeLatch, D.forwardHold, D.forwardLaunch, v18, D.brake,
-            rollingBackward, v16, stopped, dt)
-        -- A fresh press can select the gear that matches the current motion.
-        local canStartReverse = D.reverseHold > 0
-            or (not D.brakeLatch and (stopped or (not D.reversing and rollingBackward)))
-        local canStartForward = D.forwardHold > 0 or (D.reversing and not rollingBackward and not D.revBrakeLatch)
-        if canStartReverse and D.brake > 0.25 and v18 < 0.10 then
-            -- Hold this phase until S is released so launch creep cannot reapply the brake.
-            D.reversing = true
-            D.brakeLatch = false
-            D.reverseLaunch = true
-            D.reverseHold = 0
-        elseif canStartForward and v18 > 0.25 and D.brake < 0.10 then
-            D.reversing = false
-            D.revBrakeLatch = false
-            D.forwardLaunch = true
-            D.forwardHold = 0
-        end
-        local rawBrk
+        -- Clean 4-way forward / brake / reverse / brake state machine:
+        --   1) Moving forward  + S -> brake (latches until S is released at a stop)
+        --   2) Stopped         + S (unlatched) -> reverse throttle
+        --   3) Moving backward + W (in reverse) -> brake (latches until W is released at a stop)
+        --   4) Stopped or rolling backward while in forward gear + W (unlatched) -> forward throttle
+        local stopSpeed = 0.35
+        local movingForward = v16 > stopSpeed
+        local movingBackward = v16 < -stopSpeed
+        local stopped = not movingForward and not movingBackward
+        local wPressed = v18 > 0.10
+        local sPressed = D.brake > 0.10
+
+        -- Clear latches as soon as their pedal is released, or when the opposite pedal is pressed.
+        if not sPressed or wPressed then D.brakeLatch = false end
+        if not wPressed or sPressed then D.revBrakeLatch = false end
+        D.reverseHold, D.forwardHold = 0, 0
+        D.reverseLaunch, D.forwardLaunch = false, false
+
+        local rawBrk = 0
         if D.reversing then
-            D.thr = clamp(D.reverseGas ~= nil and D.reverseGas or D.brake, 0, 1)
-            rawBrk = clamp(forwardBrake, 0, 1)
-            D.gear = 0
-            local d = self.dt
-            if d.gear > 0 then
-                d.gear, d.req, d.shifting = 0, 0, 0
+            if sPressed and not wPressed then
+                if movingForward and v16 > 2.0 then
+                    -- Rolling forward fast while in reverse: brake first before driving backward.
+                    D.thr = 0
+                    rawBrk = clamp(D.brake, 0, 1)
+                    D.brakeLatch = true
+                else
+                    D.thr = clamp(D.reverseGas ~= nil and D.reverseGas or D.brake, 0, 1)
+                    rawBrk = 0
+                    D.gear = 0
+                    if self.dt.gear > 0 then self.dt.gear, self.dt.req, self.dt.shifting = 0, 0, 0 end
+                end
+            elseif wPressed and not sPressed then
+                if movingBackward then
+                    -- Braking from reverse motion: latch W until released at a stop.
+                    D.thr = 0
+                    rawBrk = clamp(forwardBrake, 0, 1)
+                    D.revBrakeLatch = true
+                elseif D.revBrakeLatch then
+                    -- Still holding W after braking to a stop from reverse.
+                    D.thr = 0
+                    rawBrk = clamp(forwardBrake, 0, 1)
+                else
+                    -- Fresh W press while stopped (or rolling forward): switch cleanly to forward!
+                    D.reversing = false
+                    D.thr = clamp(v18, 0, 1)
+                    rawBrk = 0
+                    if D.gear <= 0 then self:gearDrive() end
+                end
+            elseif wPressed and sPressed then
+                D.thr = 0
+                rawBrk = clamp(max(forwardBrake, D.brake), 0, 1)
+            else
+                D.thr = 0
+                rawBrk = 0
             end
         else
-            D.thr = clamp(v18, 0, 1)
-            rawBrk = clamp(D.brake, 0, 1)
-            if D.gear <= 0 then self:gearDrive() end
+            if wPressed and not sPressed then
+                -- In forward gear, W always accelerates forward (even if rolling back on a hill)
+                -- unless rolling backward fast (> 2.5 m/s) where braking first is safer.
+                if movingBackward and v16 < -2.5 then
+                    D.thr = 0
+                    rawBrk = clamp(forwardBrake, 0, 1)
+                    D.revBrakeLatch = true
+                else
+                    D.thr = clamp(v18, 0, 1)
+                    rawBrk = 0
+                    if D.gear <= 0 then self:gearDrive() end
+                end
+            elseif sPressed and not wPressed then
+                if movingForward then
+                    -- Braking from forward motion: latch S until released at a stop.
+                    D.thr = 0
+                    rawBrk = clamp(D.brake, 0, 1)
+                    D.brakeLatch = true
+                elseif D.brakeLatch then
+                    -- Still holding S after braking to a stop from forward.
+                    D.thr = 0
+                    rawBrk = clamp(D.brake, 0, 1)
+                else
+                    -- Fresh S press while stopped (or rolling backward): switch cleanly to reverse!
+                    D.reversing = true
+                    D.thr = clamp(D.reverseGas ~= nil and D.reverseGas or D.brake, 0, 1)
+                    rawBrk = 0
+                    D.gear = 0
+                    if self.dt.gear > 0 then self.dt.gear, self.dt.req, self.dt.shifting = 0, 0, 0 end
+                end
+            elseif wPressed and sPressed then
+                -- Allow burnout when stopped, brake when moving.
+                D.thr = stopped and clamp(v18, 0, 1) or 0
+                rawBrk = clamp(D.brake, 0, 1)
+            else
+                D.thr = 0
+                rawBrk = 0
+            end
         end
-        if (D.reversing and not D.reverseLaunch and (rollingForward or D.brakeLatch))
-            or (not D.reversing and not D.forwardLaunch and (rollingBackward or D.revBrakeLatch)) then
-            D.thr = 0
-            rawBrk = clamp(max(forwardBrake, D.brake), 0, 1)
-        end
-        if D.reverseHold > 0 or D.forwardHold > 0 then
-            -- Preserve the applied brake through the release between the two presses.
-            D.thr = 0
-        else
-            D.brk = SimcadeBraking.updatePedal(self, D, rawBrk, dt)
-        end
+
+        D.brk = SimcadeBraking.updatePedal(self, D, rawBrk, dt)
         D.reverseGas = nil
     else
         if D.brake <= 0.6000000238418579 or D.gas >= 0.5 then
@@ -876,6 +921,7 @@ function Chassis:post(h)
     end
     self:postEngine()
     self:postDrive()
+    if self._vphysMode and self.updateSimClutch then self:updateSimClutch() end
     self.stepH = h
     self:forces()
 end
@@ -1045,7 +1091,7 @@ function Chassis:postDrive()
             d.shifting = 0
         end
     elseif st == 2 then
-        E.mult = 0.699999988079071
+        E.mult = self._vphysMode and 1 or 0.699999988079071
         if d.shifting ~= 0 and d.gear ~= 1 and (self.clutchPedal or 1) > 0.5 and d.wt and d.wt > 0 then
             local targetW = clamp(d.wt, self.c[124] * RAD_RPM, self.c[126] * RAD_RPM)
             local syncRate = clamp((self.substepDt or 0.005) * 12, 0.02, 0.15)
@@ -1063,14 +1109,15 @@ function Chassis:postDrive()
         if d.q > 0 and d.qAt == 0 then d.qAt = self.now end
         E.mult = 1
         local g = d.gear
+        local clutchSlipping = self._vphysMode and (self.simClutch or 0) > 0.01
         -- A manually engaged over-rev stays coupled so the wheels can force engine speed above the limiter.
         local manualOverRev = self.manualBox and g >= 2 and (self.clutchPedal or 1) > 0.5 and d.wt > self.c[126] * RAD_RPM
         if g ~= 1 and self:stalled() then
             d.state = 0
-        elseif g ~= 1 and abs(E.w - (d.wt or 0)) > 150 and (self.clutchPedal or 1) > 0.5 and not manualOverRev then
+        elseif g ~= 1 and abs(E.w - (d.wt or 0)) > 150 and (self.clutchPedal or 1) > 0.5 and not manualOverRev and not clutchSlipping then
             d.state = 2
         end
-        if g ~= 1 and (self.clutchPedal or 1) > 0.5 and d.wt and d.wt > 0 then
+        if g ~= 1 and (self.clutchPedal or 1) > 0.5 and d.wt and d.wt > 0 and (not clutchSlipping or d.wt > E.w) then
             local lockRate = clamp((self.substepDt or 0.005) * 16, 0.04, 0.18)
             local maxW = self.manualBox and g >= 2 and max(self.c[126] * RAD_RPM, d.wt) or self.c[126] * RAD_RPM
             E.w = clamp(E.w + (d.wt - E.w) * lockRate, self.c[124] * RAD_RPM, maxW)
@@ -1097,8 +1144,10 @@ function Chassis:torque()
     local rpm = E.w * RPM
     local T = E.lim and 0 or E.mult * E.T
     local v18 = curve(E.tq, rpm) * E.perf * T * (E.inductionTorqueRatio or 1.0)
-    local v14 = -(curve(E.br, rpm) * (1 - T))
-    if self.manualBox and self.dt.gear >= 2 and (self.clutchPedal or 1) > 0.5 and rpm > self.c[126] then
+    local manualOverRev = self.manualBox and self.dt.gear >= 2 and (self.clutchPedal or 1) > 0.5 and rpm > self.c[126]
+    local brakeFrac = (E.lim or manualOverRev) and 1.0 or clamp(1.0 - (E.T or 0) / 0.15, 0, 1)
+    local v14 = -(curve(E.br, rpm) * brakeFrac)
+    if manualOverRev then
         local overRevRatio = rpm / max(1, self.c[126])
         v14 = v14 * clamp(overRevRatio * overRevRatio, 1, 16)
     end
@@ -1219,8 +1268,8 @@ function Chassis:solve()
     M, m = W3.M, W3.su.mount
     local a3, b3, c3, d3, p3, q3, y3, r3, I3, free3 = M[0], M[1], M[2], M[3], m[0], m[1], W3.Fy, W3.radius, W3.I, W3.contact ~= 0 and W3.sliding == 0 and W3.locked == 0
     local d, c, E = self.dt, self.c, self.eng
-    -- Gear selection can persist while the automatic clutch is open at a stop.
-    local lock = d.state == 3 and (self.simClutch or 0) < 1
+    -- Gear selection can persist while the automatic clutch is open or slipping at low RPM.
+    local lock = d.state == 3 and ((self._vphysMode and (self.simClutch or 0) <= 0.01) or (not self._vphysMode and (self.simClutch or 0) < 1))
     local c127, v7 = c[127], nil
     if lock then
         v7 = 1 / c127
@@ -1462,7 +1511,7 @@ function Chassis:afterSolve()
     if self._vphysMode and d.gear ~= 1 and self.grounded > 0 then
         local dw = self:shaftW() - E.w
         local lim = abs(self:torque())
-        if d.state == 3 and (self.simClutch or 0) < 1 then
+        if d.state == 3 and (self.simClutch or 0) <= 0.01 then
             E.tload = E.tload + clamp(dw * self.c[113] * 0.65, -lim, lim)
         end
         if E.T > 0.1 then
@@ -2060,8 +2109,13 @@ local function initializeVehiclePhysicsBridge(PhysicsApi)
                 W.Fx = -peakLongKN * vFwd * scale
                 W.Fy = -peakLatKN * vLat * scale
             else
-                local lonShape = evaluateMagicFormula(spec.Long_B, spec.Long_C, spec.Long_E, abs(kappa))
-                W.Fx = peakLongKN * lonShape * ((kappa >= 0) and 1 or -1)
+                local slipSign = (abs(kappa) > 0.01) and ((kappa >= 0) and 1 or -1) or ((reqFx >= 0) and 1 or -1)
+                local evalKappa = overGripSpin and max(abs(kappa), 0.16) or abs(kappa)
+                local lonShape = evaluateMagicFormula(spec.Long_B, spec.Long_C, spec.Long_E, evalKappa)
+                if overGripSpin and abs(kappa) < 0.16 then
+                    lonShape = max(lonShape, 0.92)
+                end
+                W.Fx = peakLongKN * lonShape * slipSign
                 if excessSpin > 0 then
                     local scrubSpeed = sqrt(slipVel * slipVel + vLat * vLat)
                     local spinBlend = min(1, excessSpin / spinThreshold)
@@ -2173,6 +2227,52 @@ local function initializeVehiclePhysicsBridge(PhysicsApi)
             self.tireSimSpecs.rear.nominalLoadKN  = cornerKN
         end
         self:updateWheelMounts()
+    end
+
+    function Chassis:updateSimClutch()
+        local d = self.dt
+        local speedKmh = abs(self.forward or 0) * 3.6
+        local stopSpd = self.stoppedPhaseBrakeSpeed or 5
+        local thrIn = (self.drv and self.drv.thr) or 0
+        local brkIn = (self.drv and self.drv.brk) or 0
+        local hasThrInput = thrIn > 0.05
+        local simClutch = 0
+        if d.gear == 1 or d.state == 0 or d.state == 1 or d.shifting ~= 0 or (self.clutchPedal == 0) or ((self._stepHandbrake or 0) > 0.5) then
+            simClutch = 1
+        elseif self.clutchType == "torque_converter" then
+            local rpmNow = self.eng.w * RAD_TO_RPM
+            local idleRPM = self.c[124] or 800
+            local stallRPM = max(idleRPM + 200, self.tcStallRPM or 2200)
+            local cap = clamp((rpmNow - idleRPM) / (stallRPM - idleRPM), 0, 1)
+            local creep = clamp(self.tcCreepTorque or 0.12, 0, 0.5)
+            local engage = clamp(creep + (1.0 - creep) * cap, 0, 1)
+            if brkIn > 0.05 and not hasThrInput and speedKmh <= stopSpd then
+                engage = creep * 0.25
+            end
+            simClutch = 1.0 - engage
+        elseif self.clutchType == "centrifugal" then
+            local rpmNow = self.eng.w * RAD_TO_RPM
+            local engRPM = self.centrifugalEngageRPM or 1800
+            local fullRPM = max(engRPM + 100, self.centrifugalFullRPM or 3200)
+            local engage = clamp((rpmNow - engRPM) / (fullRPM - engRPM), 0, 1)
+            simClutch = 1.0 - engage
+        else
+            if brkIn > 0.05 and not hasThrInput and speedKmh <= stopSpd then
+                simClutch = 1
+            elseif brkIn > 0.05 and not hasThrInput and speedKmh <= (stopSpd + 15) then
+                simClutch = 1.0 - clamp((speedKmh - stopSpd) / 15.0, 0, 1)
+            elseif not hasThrInput and speedKmh <= stopSpd then
+                simClutch = 1
+            end
+            if simClutch < 1 and (not self.manualBox or self.useClutchLerpInManual) then
+                local rpmNow = self.eng.w * RAD_TO_RPM
+                local redline = max(1000, self.c[126] or 8000)
+                local lerpLim = (d.gear <= 0 or (self.drv and self.drv.reversing)) and (self.clutchLerpReverse or 0.5) or (self.clutchLerp or 0.4)
+                local rpmClutch = max(0, lerpLim - (rpmNow / redline))
+                simClutch = max(simClutch, rpmClutch)
+            end
+        end
+        self.simClutch = clamp(simClutch, 0, 1)
     end
 
     -- Synchronize the solver state from GMod VPhysics and advance across 0.0044s substeps
@@ -2379,49 +2479,8 @@ local function initializeVehiclePhysicsBridge(PhysicsApi)
         end
 
         -- Red Fox Engine Master Clutch Control (0 = engaged/driving, 1 = disengaged)
-        local d = self.dt
-        local speedKmh = abs(self.forward) * 3.6
-        local stopSpd = self.stoppedPhaseBrakeSpeed or 5
-        local thrIn = (self.drv and self.drv.thr) or 0
-        local brkIn = (self.drv and self.drv.brk) or 0
-        local hasThrInput = thrIn > 0.05
-        local simClutch = 0
-        if d.gear == 1 or d.state == 0 or d.state == 1 or d.shifting ~= 0 or (self.clutchPedal == 0) or ((controls and controls.handbrake or 0) > 0.5) then
-            simClutch = 1
-        elseif self.clutchType == "torque_converter" then
-            local rpmNow = self.eng.w * RAD_TO_RPM
-            local idleRPM = self.c[124] or 800
-            local stallRPM = max(idleRPM + 200, self.tcStallRPM or 2200)
-            local cap = clamp((rpmNow - idleRPM) / (stallRPM - idleRPM), 0, 1)
-            local creep = clamp(self.tcCreepTorque or 0.12, 0, 0.5)
-            local engage = clamp(creep + (1.0 - creep) * cap, 0, 1)
-            if brkIn > 0.05 and not hasThrInput and speedKmh <= stopSpd then
-                engage = creep * 0.25
-            end
-            simClutch = 1.0 - engage
-        elseif self.clutchType == "centrifugal" then
-            local rpmNow = self.eng.w * RAD_TO_RPM
-            local engRPM = self.centrifugalEngageRPM or 1800
-            local fullRPM = max(engRPM + 100, self.centrifugalFullRPM or 3200)
-            local engage = clamp((rpmNow - engRPM) / (fullRPM - engRPM), 0, 1)
-            simClutch = 1.0 - engage
-        else
-            if brkIn > 0.05 and not hasThrInput and speedKmh <= stopSpd then
-                simClutch = 1
-            elseif brkIn > 0.05 and not hasThrInput and speedKmh <= (stopSpd + 15) then
-                simClutch = 1.0 - clamp((speedKmh - stopSpd) / 15.0, 0, 1)
-            elseif not hasThrInput and speedKmh <= stopSpd then
-                simClutch = 1
-            end
-            if simClutch < 1 and (not self.manualBox or self.useClutchLerpInManual) then
-                local rpmNow = self.eng.w * RAD_TO_RPM
-                local redline = max(1000, self.c[126] or 8000)
-                local lerpLim = (d.gear <= 0 or (self.drv and self.drv.reversing)) and (self.clutchLerpReverse or 0.5) or (self.clutchLerp or 0.4)
-                local rpmClutch = max(0, lerpLim - (rpmNow / redline))
-                simClutch = max(simClutch, rpmClutch)
-            end
-        end
-        self.simClutch = clamp(simClutch, 0, 1)
+        self._stepHandbrake = (controls and controls.handbrake or 0)
+        self:updateSimClutch()
 
         self:computeActiveDiff(controls)
         self:forces()

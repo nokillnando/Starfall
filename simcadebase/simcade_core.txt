@@ -67,6 +67,7 @@ function SimcadeCore.init(CONFIG)
     local kFrontLk  = CONTROLS_CFG.FrontLock     or (KEY and KEY.K)
     local kRearLk   = CONTROLS_CFG.RearLock      or (KEY and KEY.L)
     local kAllLk    = CONTROLS_CFG.AllLock       or (KEY and KEY.J)
+    local kParkBrk  = CONTROLS_CFG.ParkingBrake  or (KEY and KEY.P)
 
     -- ========================================================================
     -- CLIENT SIDE
@@ -126,17 +127,22 @@ function SimcadeCore.init(CONFIG)
                 net.writeUInt(7, 4)
                 net.writeBool(true)
                 SimcadeCore.sendPacket()
-            elseif btn == kFrontLk then
+            elseif ENGINE_CFG.ParkingBrakeToggle ~= false and btn == kParkBrk then
+                net.start("Simcade_ClientKeyEvent")
+                net.writeUInt(11, 4)
+                net.writeBool(true)
+                SimcadeCore.sendPacket()
+            elseif ENGINE_CFG.DiffLockToggleable ~= false and btn == kFrontLk then
                 net.start("Simcade_ClientKeyEvent")
                 net.writeUInt(8, 4)
                 net.writeBool(true)
                 SimcadeCore.sendPacket()
-            elseif btn == kRearLk then
+            elseif ENGINE_CFG.DiffLockToggleable ~= false and btn == kRearLk then
                 net.start("Simcade_ClientKeyEvent")
                 net.writeUInt(9, 4)
                 net.writeBool(true)
                 SimcadeCore.sendPacket()
-            elseif btn == kAllLk then
+            elseif ENGINE_CFG.DiffLockToggleable ~= false and btn == kAllLk then
                 net.start("Simcade_ClientKeyEvent")
                 net.writeUInt(10, 4)
                 net.writeBool(true)
@@ -708,6 +714,11 @@ function SimcadeCore.init(CONFIG)
                     sendDriverPrint(drv, string.format("%s: %s", label, state and "LOCKED" or "AUTO/UNLOCKED"))
                 end
             end
+        elseif code == 11 then
+            if ENGINE_CFG.ParkingBrakeToggle ~= false then
+                ctrlState.parkingBrake = not ctrlState.parkingBrake
+                sendDriverPrint(drv, ctrlState.parkingBrake and "Parking Brake: ENGAGED" or "Parking Brake: RELEASED")
+            end
         end
     end)
 
@@ -846,8 +857,9 @@ function SimcadeCore.init(CONFIG)
             local sMan = keyLabel(kManual, "M")
             local sRst = keyLabel(kGearRst, "R")
             local sCam = keyLabel(kCam, "V")
+            local sPrk = keyLabel(kParkBrk, "P")
             sendDriverPrint(Driver, "Controls:")
-            sendDriverPrint(Driver, "WASD=Drive | Shift=Full Thr | Alt=Clutch | Space=Handbrake")
+            sendDriverPrint(Driver, string.format("WASD=Drive | Shift=Full Thr | Alt=Clutch | Space=Handbrake | %s=ParkBrake", sPrk))
             sendDriverPrint(Driver, string.format("%s=Ignition | %s=Manual (M1/M2=Shift, %s=Reset) | %s=Camera", sIgn, sMan, sRst, sCam))
             if ENGINE_CFG.ClassicAuto then
                 sendDriverPrint(Driver, "Automatic: GearUp / GearDown (default M1 / M2) select P, R, N, D")
@@ -875,8 +887,35 @@ function SimcadeCore.init(CONFIG)
         local rawThrottle        = ctrl.rawThrottle
         local rawBrake           = ctrl.rawBrake
         local rawHandbrake       = ctrl.rawHandbrake
-        if not hasDriver and ctrlState.autoParkHandbrake then
-            rawHandbrake = 1
+        local currentSpeedKmh    = Phys:getVelocity():getLength() * 3600 * 0.0000254
+        local holdMaxSpeed       = math.max(0.5, tonumber(ENGINE_CFG.AutoHoldBrakeSpeed) or tonumber(ENGINE_CFG.StoppedPhaseBrakeSpeed) or 3)
+        local wantsReverseLaunch = physicsCar and not physicsCar.manualBox and not physicsCar.classicAuto
+            and rawBrake > 0.05 and currentSpeedKmh <= holdMaxSpeed and not (physicsCar.drv and physicsCar.drv.brakeLatch)
+        local hasDrivePedal      = rawThrottle > 0.05 or wantsReverseLaunch or (physicsCar and physicsCar.drv and physicsCar.drv.reversing and rawBrake > 0.05)
+        if hasDriver then
+            if ctrlState.parkingBrake and ENGINE_CFG.AutoReleaseParkingBrake == true and hasDrivePedal then
+                ctrlState.parkingBrake = false
+                sendDriverPrint(Driver, "Parking Brake: RELEASED")
+            end
+            if ENGINE_CFG.AutoHoldBrake == true then
+                if hasDrivePedal then
+                    ctrlState.autoHoldActive = false
+                elseif currentSpeedKmh <= holdMaxSpeed and rawBrake <= 0.05 then
+                    ctrlState.autoHoldActive = true
+                elseif currentSpeedKmh > holdMaxSpeed + 2 then
+                    ctrlState.autoHoldActive = false
+                end
+            else
+                ctrlState.autoHoldActive = false
+            end
+            if ctrlState.parkingBrake or ctrlState.autoHoldActive then
+                rawHandbrake = 1
+            end
+        else
+            ctrlState.autoHoldActive = false
+            if ctrlState.autoParkHandbrake or ctrlState.parkingBrake then
+                rawHandbrake = 1
+            end
         end
         local clutchDown         = ctrl.clutchDown
         local steerInput         = ctrl.steerTarget
@@ -1790,6 +1829,7 @@ function SimcadeCore.init(CONFIG)
                 if not SimcadePrediction.send(Driver, Base, Pod, physicsCar, comWorld, driverFwd, driverUp,
                     velWorld, angVelWorldRad, wheelGrounds, vphysLoadsKN, simMass, activeCompound, ignRes,
                     not isPhysgunHeld and (not Phys.isMoveable or Phys:isMoveable()) and
+                        not ctrlState.parkingBrake and not ctrlState.autoHoldActive and
                         (wireInputs.EngineThrottle or 0) <= 0 and (wireInputs.EngineBrake or 0) <= 0 and
                         (wireInputs.Handbrake or 0) <= 0 and (wireInputs.Clutch or 0) <= 0.5 and
                         (wireInputs.GearUp or 0) <= 0 and (wireInputs.GearDown or 0) <= 0,

@@ -74,20 +74,23 @@ function SimcadeSteering.updateInput(chassis, input, dt)
         end
     end
     local rearAngle = rearLoad > 0 and rearSlip / rearLoad or 0
-    local rearBlend = clamp((rearAngle - corrStart) / span, 0, 1)
+    local effectiveDriftAngle = max(rearAngle, slipAng * 0.85)
+    local rearBlend = clamp((effectiveDriftAngle - corrStart) / span, 0, 1)
     local speedKmh = math.sqrt(fwdMs * fwdMs + leftMs * leftMs) * 3.6
     local speedBlend = clamp((speedKmh - 8) / 10, 0, 1)
-    local sideBlend = clamp((abs(smLat) - highSlipThreshold) / max(1, highSlipThreshold), 0, 1)
+    local sideFloor = min(highSlipThreshold, 1.2)
+    local sideBlend = clamp((abs(smLat) - sideFloor) / max(1, highSlipThreshold), 0, 1)
     local driftBlend = corrScale * rearBlend * speedBlend * sideBlend
     local countersteerCorrection = ((slipCorr / slipResistance) * dt66 + yawDamp) * driftBlend * stabFactor
 
     local rawIn = clamp(input, -1, 1)
     local curvedIn = rawIn * rawIn * rawIn * (1.0 - linBlend) + rawIn * linBlend
     local curDeg = D.u16Deg or 0
-    -- Reserve directional key rates for an established slide. Rear slip alone
-    -- can also be substantial in ordinary cornering.
-    local manualBlend = clamp((rearAngle - math.rad(8)) / math.rad(8), 0, 1)
-    manualBlend = manualBlend * manualBlend * (3 - 2 * manualBlend) * driftBlend
+    -- Ramp directional drift key rates smoothly from mild slide (~4 deg) to full drift (~12 deg).
+    local manualRamp = clamp((effectiveDriftAngle - math.rad(4)) / math.rad(8), 0, 1)
+    local manualBlend = manualRamp * manualRamp * (3 - 2 * manualRamp) * speedBlend * sideBlend
+    chassis.steerDriftBlend = driftBlend
+    chassis.steerManualDriftBlend = manualBlend
     -- A positive key steers left; positive smLat means travel to the right.
     local countersteering = rawIn * smLat * spdDir < 0
     local driftRate = countersteering and (sc.DriftCountersteerMultiplier or 1)

@@ -477,6 +477,10 @@ CONFIG.ENGINE_CFG = {
     ABSReleaseRatio        = 0.15,      -- Brake torque fraction kept during release pulse (0.05-0.25 = clean release, >=0.65 = weak release/allows lockup)
     HandbrakeTorque        = 2400,      -- Rear handbrake torque (Nm)
     HandbrakeLockWheels    = true,      -- Lock rear wheels immediately when handbrake is pulled
+    ParkingBrakeToggle     = true,      -- Allow toggling the parking brake on/off with CONTROLS_CFG.ParkingBrake
+    AutoReleaseParkingBrake = true,     -- Automatically release the toggled parking brake when pressing throttle
+    AutoHoldBrake          = false,     -- Automatically hold the parking brake while stopped (releases on throttle)
+    AutoHoldBrakeSpeed     = 3,         -- Max speed (km/h) at which AutoHoldBrake engages when off-throttle
     AutoHandbrakeOnExitSpeed = 15,      -- Auto-engage handbrake when driver exits at <= this speed (km/h; 0 = off)
 
     -- ------------------------------------------------------------------------
@@ -525,9 +529,13 @@ CONFIG.CONTROLS_CFG = {
     Headlights    = KEY.H,            -- Cycle Headlights (Off / Low / High)
     FullThrottle  = IN_KEY.SPEED,     -- Hold with W for 100% throttle (W alone = 50%)
     Handbrake     = IN_KEY.JUMP,      -- Handbrake
+    ParkingBrake  = KEY.P,            -- Toggle Parking Brake (stays engaged without holding Space)
     Clutch        = IN_KEY.WALK,      -- Clutch pedal
     GearUp        = IN_KEY.ATTACK,    -- Next PRND range or manual upshift (M1)
     GearDown      = IN_KEY.ATTACK2,   -- Previous PRND range or manual downshift (M2)
+    FrontLock     = KEY.K,            -- Toggle Front Diff Lock (when DiffLockToggleable = true)
+    RearLock      = KEY.L,            -- Toggle Rear Diff Lock (when DiffLockToggleable = true)
+    AllLock       = KEY.J,            -- Toggle All / Center Diff Lock (when DiffLockToggleable = true)
 }
 
 CONFIG.CAMERA_CFG = {
