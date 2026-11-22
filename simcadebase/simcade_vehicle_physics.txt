@@ -294,11 +294,13 @@ function Chassis:driver(steer, gas, brake, handbrake, dt, hold, u16)
         D.thr = clamp(v18, 0, 1)
         D.brk = SimcadeBraking.updatePedal(self, D, clamp(D.brake, 0, 1), dt)
     elseif self._vphysMode and not self.manualBox then
-        -- Clean 4-way forward / brake / reverse / brake state machine:
-        --   1) Moving forward  + S -> brake (latches until S is released at a stop)
-        --   2) Stopped         + S (unlatched) -> reverse throttle
-        --   3) Moving backward + W (in reverse) -> brake (latches until W is released at a stop)
-        --   4) Stopped or rolling backward while in forward gear + W (unlatched) -> forward throttle
+        -- Symmetric 4-way forward / brake / reverse / brake state machine:
+        --   - Pressing W while moving backward (or S while moving forward) always applies full
+        --     service brakes to a stop and holds them (latch) regardless of current gear.
+        --   - Releasing the latched pedal opens a 0.5s launch window so a second press launches
+        --     cleanly even if gravity nudges the car on a steep hill during the release.
+        --   - Once launched (forwardLaunch / reverseLaunch), holding the pedal stays in throttle
+        --     without oscillating back into brake.
         local stopSpeed = 0.35
         local movingForward = v16 > stopSpeed
         local movingBackward = v16 < -stopSpeed
@@ -306,89 +308,87 @@ function Chassis:driver(steer, gas, brake, handbrake, dt, hold, u16)
         local wPressed = v18 > 0.10
         local sPressed = D.brake > 0.10
 
-        -- Clear latches as soon as their pedal is released, or when the opposite pedal is pressed.
-        if not sPressed or wPressed then D.brakeLatch = false end
-        if not wPressed or sPressed then D.revBrakeLatch = false end
-        D.reverseHold, D.forwardHold = 0, 0
-        D.reverseLaunch, D.forwardLaunch = false, false
+        D.forwardHold = max(0, (D.forwardHold or 0) - dt)
+        D.reverseHold = max(0, (D.reverseHold or 0) - dt)
+
+        if not sPressed then
+            if D.brakeLatch and (stopped or not movingForward or v16 < 1.5) then
+                D.reverseHold = 0.50
+            end
+            D.brakeLatch = false
+            D.reverseLaunch = false
+        elseif wPressed then
+            D.brakeLatch = false
+            D.reverseLaunch = false
+            D.reverseHold = 0
+        end
+
+        if not wPressed then
+            if D.revBrakeLatch and (stopped or not movingBackward or v16 > -1.5) then
+                D.forwardHold = 0.50
+            end
+            D.revBrakeLatch = false
+            D.forwardLaunch = false
+        elseif sPressed then
+            D.revBrakeLatch = false
+            D.forwardLaunch = false
+            D.forwardHold = 0
+        end
 
         local rawBrk = 0
-        if D.reversing then
-            if sPressed and not wPressed then
-                if movingForward and v16 > 2.0 then
-                    -- Rolling forward fast while in reverse: brake first before driving backward.
-                    D.thr = 0
-                    rawBrk = clamp(D.brake, 0, 1)
-                    D.brakeLatch = true
-                else
-                    D.thr = clamp(D.reverseGas ~= nil and D.reverseGas or D.brake, 0, 1)
-                    rawBrk = 0
-                    D.gear = 0
-                    if self.dt.gear > 0 then self.dt.gear, self.dt.req, self.dt.shifting = 0, 0, 0 end
-                end
-            elseif wPressed and not sPressed then
-                if movingBackward then
-                    -- Braking from reverse motion: latch W until released at a stop.
-                    D.thr = 0
-                    rawBrk = clamp(forwardBrake, 0, 1)
-                    D.revBrakeLatch = true
-                elseif D.revBrakeLatch then
-                    -- Still holding W after braking to a stop from reverse.
-                    D.thr = 0
-                    rawBrk = clamp(forwardBrake, 0, 1)
-                else
-                    -- Fresh W press while stopped (or rolling forward): switch cleanly to forward!
-                    D.reversing = false
-                    D.thr = clamp(v18, 0, 1)
-                    rawBrk = 0
-                    if D.gear <= 0 then self:gearDrive() end
-                end
-            elseif wPressed and sPressed then
-                D.thr = 0
-                rawBrk = clamp(max(forwardBrake, D.brake), 0, 1)
-            else
-                D.thr = 0
+        if wPressed and sPressed then
+            -- Both pedals: allow burnout at a stop, otherwise full brake.
+            D.thr = stopped and clamp(v18, 0, 1) or 0
+            rawBrk = clamp(max(forwardBrake, D.brake), 0, 1)
+        elseif wPressed then
+            if D.forwardLaunch or (D.forwardHold > 0 and not D.revBrakeLatch) then
+                -- Committed to forward acceleration: stay in throttle without bouncing into brake.
+                D.reversing = false
+                D.forwardLaunch = true
+                D.forwardHold = 0
+                D.thr = clamp(v18, 0, 1)
                 rawBrk = 0
+                if D.gear <= 0 then self:gearDrive() end
+            elseif D.revBrakeLatch or movingBackward then
+                -- Moving backward (in any gear) or holding W after braking to a stop: full brake & hold.
+                D.thr = 0
+                rawBrk = clamp(forwardBrake, 0, 1)
+                D.revBrakeLatch = true
+            else
+                -- Stopped or moving forward: drive forward.
+                D.reversing = false
+                D.forwardLaunch = true
+                D.thr = clamp(v18, 0, 1)
+                rawBrk = 0
+                if D.gear <= 0 then self:gearDrive() end
+            end
+        elseif sPressed then
+            if D.reverseLaunch or (D.reverseHold > 0 and not D.brakeLatch) then
+                -- Committed to reverse acceleration: stay in throttle without bouncing into brake.
+                D.reversing = true
+                D.reverseLaunch = true
+                D.reverseHold = 0
+                D.thr = clamp(D.reverseGas ~= nil and D.reverseGas or D.brake, 0, 1)
+                rawBrk = 0
+                D.gear = 0
+                if self.dt.gear > 0 then self.dt.gear, self.dt.req, self.dt.shifting = 0, 0, 0 end
+            elseif D.brakeLatch or movingForward then
+                -- Moving forward (in any gear) or holding S after braking to a stop: full brake & hold.
+                D.thr = 0
+                rawBrk = clamp(D.brake, 0, 1)
+                D.brakeLatch = true
+            else
+                -- Stopped or moving backward: drive reverse.
+                D.reversing = true
+                D.reverseLaunch = true
+                D.thr = clamp(D.reverseGas ~= nil and D.reverseGas or D.brake, 0, 1)
+                rawBrk = 0
+                D.gear = 0
+                if self.dt.gear > 0 then self.dt.gear, self.dt.req, self.dt.shifting = 0, 0, 0 end
             end
         else
-            if wPressed and not sPressed then
-                -- In forward gear, W always accelerates forward (even if rolling back on a hill)
-                -- unless rolling backward fast (> 2.5 m/s) where braking first is safer.
-                if movingBackward and v16 < -2.5 then
-                    D.thr = 0
-                    rawBrk = clamp(forwardBrake, 0, 1)
-                    D.revBrakeLatch = true
-                else
-                    D.thr = clamp(v18, 0, 1)
-                    rawBrk = 0
-                    if D.gear <= 0 then self:gearDrive() end
-                end
-            elseif sPressed and not wPressed then
-                if movingForward then
-                    -- Braking from forward motion: latch S until released at a stop.
-                    D.thr = 0
-                    rawBrk = clamp(D.brake, 0, 1)
-                    D.brakeLatch = true
-                elseif D.brakeLatch then
-                    -- Still holding S after braking to a stop from forward.
-                    D.thr = 0
-                    rawBrk = clamp(D.brake, 0, 1)
-                else
-                    -- Fresh S press while stopped (or rolling backward): switch cleanly to reverse!
-                    D.reversing = true
-                    D.thr = clamp(D.reverseGas ~= nil and D.reverseGas or D.brake, 0, 1)
-                    rawBrk = 0
-                    D.gear = 0
-                    if self.dt.gear > 0 then self.dt.gear, self.dt.req, self.dt.shifting = 0, 0, 0 end
-                end
-            elseif wPressed and sPressed then
-                -- Allow burnout when stopped, brake when moving.
-                D.thr = stopped and clamp(v18, 0, 1) or 0
-                rawBrk = clamp(D.brake, 0, 1)
-            else
-                D.thr = 0
-                rawBrk = 0
-            end
+            D.thr = 0
+            rawBrk = 0
         end
 
         D.brk = SimcadeBraking.updatePedal(self, D, rawBrk, dt)

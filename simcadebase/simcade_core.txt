@@ -889,9 +889,11 @@ function SimcadeCore.init(CONFIG)
         local rawHandbrake       = ctrl.rawHandbrake
         local currentSpeedKmh    = Phys:getVelocity():getLength() * 3600 * 0.0000254
         local holdMaxSpeed       = math.max(0.5, tonumber(ENGINE_CFG.AutoHoldBrakeSpeed) or tonumber(ENGINE_CFG.StoppedPhaseBrakeSpeed) or 3)
-        local wantsReverseLaunch = physicsCar and not physicsCar.manualBox and not physicsCar.classicAuto
+        local inNeutralOrPark    = physicsCar and ((physicsCar.dt and physicsCar.dt.gear == 1) or (physicsCar.classicAuto and not physicsCar.manualBox and physicsCar.autoRange == 0))
+        local canAutoRelease     = (not ctrl.clutchDown) and (not inNeutralOrPark)
+        local wantsReverseLaunch = canAutoRelease and physicsCar and not physicsCar.manualBox and not physicsCar.classicAuto
             and rawBrake > 0.05 and currentSpeedKmh <= holdMaxSpeed and not (physicsCar.drv and physicsCar.drv.brakeLatch)
-        local hasDrivePedal      = rawThrottle > 0.05 or wantsReverseLaunch or (physicsCar and physicsCar.drv and physicsCar.drv.reversing and rawBrake > 0.05)
+        local hasDrivePedal      = canAutoRelease and (rawThrottle > 0.05 or wantsReverseLaunch or (physicsCar and physicsCar.drv and physicsCar.drv.reversing and rawBrake > 0.05))
         if hasDriver then
             if ctrlState.parkingBrake and ENGINE_CFG.AutoReleaseParkingBrake == true and hasDrivePedal then
                 ctrlState.parkingBrake = false
@@ -1497,7 +1499,8 @@ function SimcadeCore.init(CONFIG)
                 deltaAngVel = deltaAngVel + Vector((dKey - aKey) * airStr.x * dt, (wKey - sKey) * airStr.y * dt, 0)
             end
             local inPark = physicsCar.classicAuto and not physicsCar.manualBox and physicsCar.autoRange == 0
-            local canHold = groundedCount >= 2 and (inPark or rawThrottle < 0.05) and (physicsCar.drv.thr or 0) < 0.05
+            local drivetrainOpen = inPark or clutchDown or (physicsCar.dt and physicsCar.dt.gear == 1) or rawHandbrake > 0.5
+            local canHold = groundedCount >= 2 and (drivetrainOpen or (rawThrottle < 0.05 and (physicsCar.drv.thr or 0) < 0.05))
             local supportedLoad, brakedLoad = 0, 0
             for _, w in ipairs(groundedSuspWheels) do
                 w.holdBrake = math.max(physicsCar.drv.brk or 0, w.isFront and 0 or rawHandbrake)

@@ -95,7 +95,7 @@ return function(L, cfg)
 
             local st = ctx.state or {}
             local isRev = (out and out.gearShown == 0) or st.reversing or false
-            local isBrk = (not isRev) and ((st.brake or 0) > 0.05)
+            local isBrk = (st.brake or 0) > 0.05
 
             ctx.setWireOutput("ReverseLight", isRev and 1 or 0)
             ctx.setWireOutput("ReverseLightColor", isRev and (L.ReverseWireLightColor or Vector(255, 255, 255)) or Vector(0, 0, 0))
