@@ -4,6 +4,7 @@
 --@include simcadebase/simcade_loader.txt
 --@include simcadebase/addons/brake_temperature.txt
 --@include simcadebase/addons/backfire_antilag.txt
+--@include simcadebase/addons/seat_indicator.txt
 
 local CONFIG = {}
 -- Advance only after applying the required settings for the new config format.
@@ -1021,6 +1022,25 @@ CONFIG.ADDON_MODULES = {
             WheelRPMToSpeed = 0.15, -- km/h per RPM for external wheel props
             CoolRate = 0.08, SpeedCoolScale = 0.15,
             StoppedCoolMult = 0.5, -- passive cooling below 2 km/h
+        },
+    },
+    {
+        file = "simcadebase/addons/seat_indicator.txt",
+        enabled = true, -- LVS-style seat indicator (billboard text + 3D Bezier + ghost glow; no HUD/enterVehicle permission needed)
+        options = {
+            AutoDetectSeats   = true,  -- Auto-find constrained/parented passenger seats on Base (or wire PassengerSeats Array to override)
+            MaxDistance       = 130,   -- Max distance (units) to show seat indicator
+            AimRadius         = 24,    -- Ray-to-seat-center tolerance (units)
+            ThroughWalls      = true,  -- Render through vehicle bodywork ($ignorez)
+            ShowLabel         = true,  -- Floating "[E] Enter / Driver" billboard (uses render.offscreen, no HUD permission)
+            ShowCurve         = true,  -- Animated LVS-style 3D cubic Bezier curve
+            ShowSeatGhost     = true,  -- Pulsing translucent highlight on the targeted seat
+            ShowOccupied      = true,  -- Show "OCCUPIED" indicator on occupied seats
+            CurveSegments          = 24,    -- Fixed holo pool size for the 3D Bezier curve
+            LabelOffsetZ      = 16,    -- Height above seat center for the floating label
+            AllowEnterVehicle      = true,  -- Press [E] while aiming at a seat to enter via enterVehicle (when permitted)
+            RequestEnterPermission = true,  -- Prompt once for player.enterVehicle permission if not yet granted
+            -- SeatLabels     = { "Driver", "Shotgun", "Rear Left", "Rear Right" }, -- Optional custom names by seat order
         },
     },
 }
