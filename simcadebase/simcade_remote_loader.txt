@@ -310,12 +310,58 @@ local function boot(config)
         if requiredSchema ~= schema then
             return failBoot("Release r" .. revision .. " requires config v" .. required .. ", vehicle uses v" .. schema .. ".")
         end
-        fetchURL(releaseBase .. "/" .. revision .. "/core.bin", MAX_BYTES, function(coreData)
+
+        local function activateCore(coreData)
             if bit.sha256(coreData) ~= digest then
                 return failBoot("Release checksum mismatch")
             end
             finishWithCore(coreData, "core r" .. revision)
-        end)
+        end
+
+        local function fetchBundle(onMissing)
+            fetchURL(releaseBase .. "/" .. revision .. "/core.bin", MAX_BYTES, activateCore, onMissing)
+        end
+
+        local function fetchFromSources(onMissing)
+            fetchURL(releaseBase .. "/" .. revision .. "/sources.txt", #modules * 120, function(index)
+                local tokens = index:gmatch("%S+")
+                local hashes = {}
+                for i, path in ipairs(modules) do
+                    local indexedPath, hash = tokens(), tokens()
+                    if indexedPath ~= path or not validDigest(hash) then
+                        return failBoot("Invalid source index for r" .. revision)
+                    end
+                    hashes[i] = hash
+                end
+                if tokens() then return failBoot("Unexpected files in source index") end
+
+                local records, total = {}, 0
+                local function fetchMod(i)
+                    local path = modules[i]
+                    if not path then
+                        return activateCore(table.concat(records))
+                    end
+                    local hash = hashes[i]
+                    fetchURL(releaseBase .. "/source/" .. hash .. ".txt", MAX_BYTES - total, function(src)
+                        if bit.sha256(src) ~= hash then
+                            return failBoot("Checksum mismatch for " .. path)
+                        end
+                        local record = tostring(#src) .. "\n" .. src
+                        total = total + #record
+                        if total > MAX_BYTES then return failBoot("Release exceeds size limit") end
+                        records[i] = record
+                        timer.simple(0, function() fetchMod(i + 1) end)
+                    end)
+                end
+                fetchMod(1)
+            end, onMissing)
+        end
+
+        if opt.format == "source" then
+            fetchFromSources(function() fetchBundle() end)
+        else
+            fetchBundle(function() fetchFromSources() end)
+        end
     end
 
     print("[Simcade Remote] Downloading Simcade core (config v" .. schema .. ")...")
