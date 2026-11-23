@@ -177,10 +177,8 @@ def main():
             source_directory.mkdir(exist_ok=True)
             for blob in blobs.iterdir():
                 blob.replace(source_directory / blob.name)
-        manifest_bytes = f"{revision} {hashlib.sha256(package).hexdigest()} {schema[1]}\n".encode()
         manifest = staging / "latest.txt"
-        manifest.write_bytes(manifest_bytes)
-        schema_latest = output / f"latest_v{schema[1]}.txt"
+        manifest.write_bytes(f"{revision} {hashlib.sha256(package).hexdigest()} {schema[1]}\n".encode())
         if args.overwrite:
             backup = destination.rename(output / f".backup-{uuid.uuid4().hex}")
             try:
@@ -200,9 +198,6 @@ def main():
         else:
             release.rename(destination)
             manifest.replace(latest)
-        schema_manifest = staging / schema_latest.name
-        schema_manifest.write_bytes(manifest_bytes)
-        schema_manifest.replace(schema_latest)
         if stamp_local:
             updated_loader = re.sub(local_revision_pattern, f"local LOCAL_REVISION = {revision}".encode(), loader_bytes)
             staged_loader = loader_path.with_suffix(f".{uuid.uuid4().hex}.tmp")
@@ -215,7 +210,7 @@ def main():
         shutil.rmtree(staging)
     if include_source:
         print(f"Upload the files under {output / 'source'} first. Unchanged files share the same URL across releases.")
-    print(f"Upload {destination} before {latest} and {schema_latest}. Preserve the exact file bytes.")
+    print(f"Upload {destination} before {latest}. Preserve the exact file bytes.")
     if stamp_local:
         print(f"Bundled core is now r{revision}. Existing chips keep their uploaded fallback.")
 
