@@ -252,9 +252,26 @@ function SimcadeSuspension.applyCurbBlock(phys, w, up, axle, dt, mass, wheels, g
     local probeHeight = clamp(radius * (cfg.curbProbeHeightRatio or 0.14), 0.1,
         math.max(0.1, cfg.curbProbeMaxHeight or 4.5))
     local wallHeight = radius * clamp(cfg.curbWallHeightRatio or 0.82, 0.1, 1.5)
+    local minHeight = math.max(0.25, cfg.curbMinHeight or 1.75)
     local best, bestClosing = nil, -1
     local filterSize = #filter
     local minMass = math.max(35, mass * 0.15)
+
+    -- Previous tick's road plane (before the tread may have stepped onto a lip).
+    -- Used to prevent recessed grooves (e.g. rail flangeways) from inflating curb height
+    -- and to detect smooth/chamfered tread rises. Preserve it across static entity
+    -- transitions (e.g. func_lod crossing planks <-> worldspawn).
+    local previous = w.curbRoadPoint
+    local previousNormal = w.curbRoadNormal
+    if previous and w.curbRoadSupport then
+        if isValid(w.curbRoadSupport) then
+            previous = w.curbRoadSupport:localToWorld(previous)
+            previousNormal = w.curbRoadSupport:localToWorldVector(previousNormal)
+        else
+            previous = nil
+        end
+    end
+    local prevAlign = (previous and previousNormal) and previousNormal:dot(up) or 0
 
     local function probe(axis, extent, rollingProbe)
         local speed = velocity:dot(axis)
@@ -296,7 +313,42 @@ function SimcadeSuspension.applyCurbBlock(phys, w, up, axle, dt, mass, wheels, g
             local roadAlign = road.HitNormal:dot(up)
             if roadAlign <= 0.55 then return end
             height = math.min(wallHeight, (top.HitPos - road.HitPos):dot(road.HitNormal) / roadAlign)
-            if height <= 0.25 then return end
+            -- Clamp against the preceding road plane so recessed grooves (like rail
+            -- flangeways) right in front of a flush rail/plank can't fake a tall curb.
+            if previous and prevAlign > 0.55 then
+                local riseFromPrev = (top.HitPos - previous):dot(previousNormal) / prevAlign
+                height = math.min(height, riseFromPrev)
+            end
+            if height <= minHeight then return end
+            -- A narrow groove/trench right in front of a flush plank or rail can drop
+            -- `outside` far below the road. Sample further back along the approach.
+            local approachDist = math.min(6.0, math.max(3.0, radius * 0.55))
+            local approachPos = tr.HitPos + normal * approachDist
+            local approach = supportTrace(approachPos + up * (wallHeight + 0.1 - rayHeight),
+                approachPos - up * (radius + rayHeight), filter, minMass)
+            if approach and approach.Hit and not approach.StartSolid then
+                local appAlign = approach.HitNormal:dot(up)
+                if appAlign > 0.55 then
+                    local riseFromApproach = (top.HitPos - approach.HitPos):dot(approach.HitNormal) / appAlign
+                    height = math.min(height, riseFromApproach)
+                end
+            end
+            if height <= minHeight then return end
+            -- Ignore thin strips (e.g. bare rail heads) that immediately drop back to
+            -- road level a few units behind the struck face.
+            if height < wallHeight then
+                local farDepth = math.min(4.0, math.max(2.5, radius * 0.30))
+                local farInside = tr.HitPos - normal * farDepth
+                local farTop = supportTrace(farInside + up * (wallHeight + 0.1 - rayHeight),
+                    farInside - up * (radius + rayHeight), filter, minMass)
+                if farTop and farTop.Hit and not farTop.StartSolid and farTop.HitNormal:dot(up) > 0.55 then
+                    local farRise = (farTop.HitPos - road.HitPos):dot(road.HitNormal) / roadAlign
+                    if previous and prevAlign > 0.55 then
+                        farRise = math.min(farRise, (farTop.HitPos - previous):dot(previousNormal) / prevAlign)
+                    end
+                    if farRise < minHeight * 0.5 then return end
+                end
+            end
         end
         local wall = height >= wallHeight
         local chord = math.sqrt(math.max(0, height * (2 * radius - height)))
@@ -314,14 +366,6 @@ function SimcadeSuspension.applyCurbBlock(phys, w, up, axle, dt, mass, wheels, g
     -- The tread can step onto the top between updates, or cross a chamfer
     -- without ever seeing a vertical face. Compare actual support points
     -- against the preceding road plane to exclude travel along a uniform grade.
-    local previous = w.curbRoadPoint
-    local previousNormal = w.curbRoadNormal
-    if previous and w.support and w.curbRoadSupport == w.support then
-        previous = w.support:localToWorld(previous)
-        previousNormal = w.support:localToWorldVector(previousNormal)
-    elseif w.curbRoadSupport then
-        previous = nil
-    end
     w.curbRoadSupport = w.support
     w.curbRoadPoint = w.support and w.support:worldToLocal(w.contactPos) or w.contactPos
     w.curbRoadNormal = w.support and w.support:worldToLocalVector(w.hitNormal) or w.hitNormal
@@ -331,7 +375,7 @@ function SimcadeSuspension.applyCurbBlock(phys, w, up, axle, dt, mass, wheels, g
         and math.abs(rolling) > math.abs(velocity:dot(side)) then
         local travel = w.contactPos - previous
         local height = travel:dot(previousNormal) / math.max(0.55, previousNormal:dot(up))
-        if height > 0.25 and height < wallHeight and travel:dot(forward) * rolling > 0 then
+        if height > minHeight and height < wallHeight and travel:dot(forward) * rolling > 0 then
             -- Check for a riser between the samples. A change of road normal
             -- alone can produce an apparent rise over a long physics tick.
             local edge = supportTrace(previous + up * (height * 0.5),

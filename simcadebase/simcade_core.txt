@@ -299,7 +299,9 @@ function SimcadeCore.init(CONFIG)
     ctrlState.wheelPage, ctrlState.fxPage = 1, 1
     ctrlState.wheelBaselines, ctrlState.wheelKeyframes = {}, {}
     local prevHadTireFx = false
-    local debugRaysEnabled = (TIRE_CFG.ShowSuspensionRays == true)
+    local HUD_CFG = CONFIG.HUD_CFG or {}
+    local debugHudMaster = (HUD_CFG.debugEnabled ~= nil) and (HUD_CFG.debugEnabled == true) or (HUD_CFG.debugEnabled == nil and HUD_CFG.enabled ~= false)
+    local debugRaysEnabled = debugHudMaster and (TIRE_CFG.ShowSuspensionRays == true)
 
     local function getSimMass(physMass)
         local vm = VEHICLE_CFG.VirtualMassKG
@@ -2261,8 +2263,8 @@ function SimcadeCore.init(CONFIG)
             end)
         end
 
-        local wantsWheelDbg = (TIRE_CFG.ShowTireDebug == true or TIRE_CFG.ShowPacejkaGraph == true or TIRE_CFG.ShowTelemetry3D == true or (ctrlState._weightShiftCfg and ctrlState._weightShiftCfg.ShowDebug == true))
-        if #hudTargets > 0 and (wantsWheelDbg or SUSPENSION_CFG.showAxleDebug or debugRaysEnabled) and now >= nextWheelDebugNetTime then
+        local wantsWheelDbg = debugHudMaster and (TIRE_CFG.ShowTireDebug == true or TIRE_CFG.ShowPacejkaGraph == true or TIRE_CFG.ShowTelemetry3D == true or (ctrlState._weightShiftCfg and ctrlState._weightShiftCfg.ShowDebug == true))
+        if #hudTargets > 0 and debugHudMaster and (wantsWheelDbg or SUSPENSION_CFG.showAxleDebug or debugRaysEnabled) and now >= nextWheelDebugNetTime then
             queue("wheel", 0.08, nextWheelDebugNetTime, function()
                 local first, sendCount = firstDebugWheel, debugCount
                 local full = resetWheelDebug or now >= (ctrlState.wheelKeyframes[first] or 0)

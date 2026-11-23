@@ -559,8 +559,9 @@ CONFIG.CAMERA_CFG = {
 }
 
 CONFIG.HUD_CFG = {
-    enabled    = false,               -- Master switch for SimcadeHUD rendering
-    showSpeedo = false,               -- Set false to disable the default speed/RPM/gear HUD and use your own
+    enabled      = true,             -- Master switch for vehicle HUD (speedo + addon HUDs)
+    showSpeedo   = false,             -- Set false to disable the default speed/RPM/gear HUD and use your own
+    debugEnabled = false,             -- Master switch for all debug/telemetry overlays (independent of HUD_CFG.enabled)
 }
 
 -- Telemetry and debug overlays
