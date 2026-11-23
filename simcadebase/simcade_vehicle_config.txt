@@ -1,15 +1,19 @@
 --@name Simcade Vehicle Config
 --@author RedFox
 --@shared
---@include simcadebase/simcade_loader.txt
---@include simcadebase/addons/brake_temperature.txt
---@include simcadebase/addons/backfire_antilag.txt
---@include simcadebase/addons/seat_indicator.txt
---@include simcadebase/addons/vehicle_radio.txt
+-- Online thin loader (keeps AdvDupe2 tiny; downloads core + un-included addons from GitHub):
+--@include simcadebase/simcade_remote_loader.txt
+-- To switch back to full offline mode, comment the line above (add a space: "-- @include ...")
+-- and remove the space before "@include" on the lines below:
+-- @include simcadebase/simcade_loader.txt
+-- @include simcadebase/addons/brake_temperature.txt
+-- @include simcadebase/addons/backfire_antilag.txt
+-- @include simcadebase/addons/seat_indicator.txt
+-- @include simcadebase/addons/vehicle_radio.txt
 --disable includes and addons not needed to slightly reduce dupe file size
 local CONFIG = {}
 -- Advance only after applying the required settings for the new config format.
-CONFIG.SCHEMA_VERSION = 4
+CONFIG.SCHEMA_VERSION = 5
 
 CONFIG.CORE_UPDATE = {
     enabled = true,
@@ -1100,4 +1104,7 @@ CONFIG.ADDON_MODULES = {
 CONFIG.ADDONS = {}
 
 
-require("simcadebase/simcade_loader.txt")(CONFIG)
+local loader = (getScript and getScript("simcadebase/simcade_loader.txt"))
+    and "simcadebase/simcade_loader.txt"
+    or  "simcadebase/simcade_remote_loader.txt"
+require(loader)(CONFIG)
