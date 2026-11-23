@@ -3,10 +3,10 @@
 
 --[[
     Lightweight remote loader for SimcadeBase (~5 KB in AdvDupe2).
-    Zero core/addon --@include directives:
+    Zero core/addon include directives:
       - Server fetches the latest matching core release (core.bin) + any enabled
-        addons in CONFIG.ADDON_MODULES that are NOT locally --@include'd.
-      - Any addon that IS locally --@include'd in your vehicle config takes
+        addons in CONFIG.ADDON_MODULES that are NOT locally included.
+      - Any addon that IS locally included in your vehicle config takes
         priority (great for custom per-car addons or testing local edits).
       - Streams the compiled bundle once to each client via net.writeStream
         (clients do not need http.get permission to load core or addons).
@@ -138,7 +138,7 @@ local function boot(config)
     local loadedAddons = {}
     local function start(compiledCore, compiledAddons)
         local function requireAddon(path)
-            -- Local --@include always takes priority over remote copy
+            -- Local include always takes priority over remote copy
             if getScript and getScript(path) then
                 return require(path)
             end
@@ -250,7 +250,7 @@ local function boot(config)
         send()
     end
 
-    -- Determine which enabled addons are NOT locally --@include'd and need remote fetching
+    -- Determine which enabled addons are NOT locally included and need remote fetching
     local remoteAddonsToFetch = {}
     local seenAddon = {}
     local function queueAddon(path, customURL)
