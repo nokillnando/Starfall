@@ -181,8 +181,18 @@ function SimcadeCamera.initClient(cfg)
         camState.targetAng = nil
     end)
 
+    local function isMouseBlockedByUI()
+        if SimcadeCamera._blockMouseInput then return true end
+        if input and input.isCursorVisible then
+            local ok, vis = pcall(input.isCursorVisible)
+            if ok and vis then return true end
+        end
+        return false
+    end
+
     hook.add("mouseMoved", "SimcadeCam_MouseLook", function(dx, dy)
         if camState.camMode == 0 then return end
+        if isMouseBlockedByUI() then return end
         if not isInThisVehicle() then return end
         local thresh = CAM.mouseThreshold or 2
         if math.abs(dx) < thresh and math.abs(dy) < thresh then return end
@@ -198,6 +208,7 @@ function SimcadeCamera.initClient(cfg)
     end)
 
     hook.add("mouseWheeled", "SimcadeCam_Zoom", function(delta)
+        if isMouseBlockedByUI() then return end
         if not isInThisVehicle() then return end
         if camState.camMode == 1 then
             local maxD = clamp((CAM.maxDist or CAM.chaseDist or 190) - delta * 14, 90, 450)

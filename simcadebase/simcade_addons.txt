@@ -11,7 +11,8 @@ local function safeCall(tag, fn, ...)
         SimcadeAddons._loggedErrors = SimcadeAddons._loggedErrors or {}
         if not SimcadeAddons._loggedErrors[tag] then
             SimcadeAddons._loggedErrors[tag] = true
-            print("[SimcadeAddons] Error in " .. tostring(tag) .. ": " .. tostring(res))
+            local msg = (type(res) == "table" and res.message) and res.message or tostring(res)
+            print("[SimcadeAddons] Error in " .. tostring(tag) .. ": " .. tostring(msg))
         end
         return false, nil
     end

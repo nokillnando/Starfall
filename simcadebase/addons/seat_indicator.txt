@@ -545,7 +545,19 @@ return function(options)
 
             hook.add("renderoffscreen", "SimcadeSeatInd_RT", drawLabelRT)
 
+            local lastSeatThink = 0
             hook.add("think", "SimcadeSeatInd_Think", function()
+                local now = timer.curtime()
+                local minInterval = isVisible and 0.033 or 0.08
+                if now - lastSeatThink < minInterval then return end
+                lastSeatThink = now
+
+                local qMax = quotaMax and quotaMax() or 0
+                if qMax > 0 then
+                    if quotaTotalAverage and quotaTotalAverage() > qMax * 0.65 then return end
+                    if quotaTotalUsed and quotaTotalUsed() > qMax * 0.65 then return end
+                end
+
                 local lp = player()
                 if #seats == 0 or not isValid(lp) or not lp:isAlive() or lp:inVehicle() then
                     targetedSeat = nil

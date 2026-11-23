@@ -1,0 +1,1681 @@
+--@name Simcade Vehicle Radio Addon (rRadio-Style Catalog + Seamless Cabin/3D Audio)
+--@shared
+
+--[[
+    Vehicle Radio Addon for SimcadeBase:
+      - Ready-made country/station catalog lazy-loaded per country via http.get
+        (defaulting to simcadebase/radio_catalog on raw.githubusercontent.com)
+        plus a built-in offline preset list.
+      - Driver-controlled by default (configurable via DriverOnly).
+      - Customizable keybinds (CONTROLS_CFG or addon options):
+          RadioMenu    (default KEY.N)      -> Open/close station selector
+          RadioToggle  (default KEY.B)      -> Power radio On/Off (resumes last station)
+          RadioVolDown (default KEY.COMMA)     -> Volume down
+          RadioVolUp   (default KEY.PERIOD)    -> Volume up
+      - Seamless Cabin <-> 3D Audio switching for both driver and passengers:
+          * Seated in driver or any detected passenger seat -> 2D full-volume cabin audio
+          * Outside the vehicle -> 3D world-positioned audio with distance falloff & occlusion
+          * Switches live on the same BASS channel with zero stream restart or audio gap.
+      - Optional chat commands for driver: !radio <url> [name], !radio stop, !radio vol <0-100>
+      - Optional Wire ports: RadioToggle, RadioVolume, RadioURL (inputs) and
+        RadioPlaying, RadioVolumeOut, RadioStation (outputs).
+]]
+
+local DEFAULT_PRESETS = {
+    { "SomaFM - Groove Salad",     "https://ice1.somafm.com/groovesalad-128-mp3" },
+    { "SomaFM - Synthwave (DEF CON)", "https://ice1.somafm.com/defcon-128-mp3" },
+    { "SomaFM - Vaporwaves",       "https://ice1.somafm.com/vaporwaves-128-mp3" },
+    { "SomaFM - Lush",             "https://ice1.somafm.com/lush-128-mp3" },
+    { "SomaFM - Beat Blender",     "https://ice1.somafm.com/beatblender-128-mp3" },
+    { "SomaFM - Secret Agent",     "https://ice1.somafm.com/secretagent-128-mp3" },
+    { "SomaFM - Metal Detector",   "https://ice1.somafm.com/metal-128-mp3" },
+    { "SomaFM - Folk Forward",     "https://ice1.somafm.com/folkfwd-128-mp3" },
+    { "SomaFM - Deep Space One",   "https://ice1.somafm.com/deepspaceone-128-mp3" },
+    { "SomaFM - Drone Zone",       "https://ice1.somafm.com/dronezone-128-mp3" },
+    { "Nightride FM - Synthwave",  "https://stream.nightride.fm/nightride.mp3" },
+    { "Nightride FM - Chillsynth", "https://stream.nightride.fm/chillsynth.mp3" },
+    { "Nightride FM - Darksynth",  "https://stream.nightride.fm/darksynth.mp3" },
+    { "Nightride FM - Datawave",   "https://stream.nightride.fm/datawave.mp3" },
+    { "Nightride FM - Spacesynth", "https://stream.nightride.fm/spacesynth.mp3" },
+    { "FIP Radio (France)",        "https://icecast.radiofrance.fr/fip-midfi.mp3" },
+    { "Radio Paradise - Main Mix", "https://stream.radioparadise.com/aac-128" },
+    { "Radio Paradise - Rock Mix", "https://stream.radioparadise.com/rock-128" },
+}
+
+return function(options, config)
+    options = options or {}
+    config  = config  or {}
+
+    local clamp = math.clamp or function(v, a, b) return v < a and a or (v > b and b or v) end
+    local round = math.round or function(v) return math.floor(v + 0.5) end
+    local function trimStr(s)
+        return (tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+    end
+    local function startsWith(s, prefix)
+        return string.sub(s, 1, #prefix) == prefix
+    end
+
+    local controlsCfg = config.CONTROLS_CFG or {}
+
+    local function resolveKey(ctrlName, optVal, defaultKey)
+        local c = controlsCfg[ctrlName]
+        if c == false then return nil end
+        if c ~= nil then return c end
+        if optVal == false then return nil end
+        if optVal ~= nil then return optVal end
+        return defaultKey
+    end
+
+    local CatalogBaseURL       = tostring(options.CatalogBaseURL or "https://raw.githubusercontent.com/nokillnando/Starfall/main/simcadebase/radio_catalog"):gsub("/+$", "")
+    local DriverOnly           = options.DriverOnly ~= false
+    local DefaultVolume        = math.clamp(tonumber(options.DefaultVolume) or 0.65, 0, 1)
+    local VolumeStep           = math.clamp(tonumber(options.VolumeStep) or 0.10, 0.01, 0.5)
+    local FullVolumeDistance   = math.max(tonumber(options.FullVolumeDistance) or 120, 10)
+    local MaxHearingDistance   = math.max(tonumber(options.MaxHearingDistance) or 950, FullVolumeDistance + 10)
+    local FalloffExponent      = math.max(tonumber(options.FalloffExponent) or 1.35, 0.1)
+    local OcclusionEnabled     = options.OcclusionEnabled ~= false
+    local OcclusionGain        = math.clamp(tonumber(options.OcclusionGain) or 0.35, 0.05, 1)
+    local SourceOffset         = options.SourceOffset or Vector(0, 0, 20)
+    local CrossfadeTime        = math.max(tonumber(options.CrossfadeTime) or 0.35, 0.02)
+    local ShowNowPlayingHUD    = options.ShowNowPlayingHUD ~= false
+    local HUDAutoHideSeconds   = math.max(tonumber(options.HUDAutoHideSeconds) or 5.0, 0)
+    local RequestHUDPermission = options.RequestHUDPermission ~= false
+    local EnableChatCommand    = options.EnableChatCommand ~= false
+    local Presets              = (type(options.Presets) == "table" and #options.Presets > 0) and options.Presets or DEFAULT_PRESETS
+
+    local MenuKey    = resolveKey("RadioMenu",    options.MenuKey,    KEY and KEY.N)
+    local ToggleKey  = resolveKey("RadioToggle",  options.ToggleKey,  KEY and KEY.B)
+    local VolDownKey = resolveKey("RadioVolDown", options.VolDownKey, KEY and KEY.COMMA)
+    local VolUpKey   = resolveKey("RadioVolUp",   options.VolUpKey,   KEY and KEY.PERIOD)
+
+    local NET_STATE = "Simcade_Radio_State"
+    local NET_SEATS = "Simcade_Radio_Seats"
+    local NET_REQ   = "Simcade_Radio_Req"
+    local NET_CMD   = "Simcade_Radio_Cmd"
+
+    local CMD_PLAY    = 1
+    local CMD_STOP    = 2
+    local CMD_TOGGLE  = 3
+    local CMD_SETVOL  = 4
+    local CMD_STEPVOL = 5
+
+    -- ========================================================================
+    -- SERVER
+    -- ========================================================================
+    if SERVER then
+        local ctxRef = nil
+        local seats = {}
+        local lastSeatSig = ""
+        local lastWireToggle = 0
+
+        local state = {
+            playing = false,
+            url     = "",
+            name    = "",
+            country = "",
+            volume  = DefaultVolume,
+            seq     = 0,
+        }
+
+        local lastStation = {
+            url     = "",
+            name    = "",
+            country = "",
+        }
+
+        local function isSeatEntity(ent)
+            if not isValid(ent) then return false end
+            local okV, isV = pcall(function() return ent:isVehicle() end)
+            if okV and isV then return true end
+            local okC, cls = pcall(function() return ent:getClass() end)
+            return okC and cls == "prop_vehicle_prisoner_pod"
+        end
+
+        local function collectVehicleSeats()
+            local list = {}
+            local seen = {}
+            local pod  = (ctxRef and isValid(ctxRef.pod))  and ctxRef.pod  or (wire and wire.ports and wire.ports.Pod)
+            local base = (ctxRef and isValid(ctxRef.base)) and ctxRef.base or (wire and wire.ports and wire.ports.Base)
+
+            local function addSeat(ent)
+                if not isValid(ent) or seen[ent] then return end
+                if isSeatEntity(ent) then
+                    seen[ent] = true
+                    list[#list + 1] = ent
+                end
+            end
+
+            if isValid(pod) then addSeat(pod) end
+
+            if isValid(base) then
+                local okCon, conList = pcall(function() return base:getAllConstrained() end)
+                if okCon and type(conList) == "table" then
+                    for _, ent in pairs(conList) do
+                        addSeat(ent)
+                        local okCh, ch = pcall(function() return ent:getChildren() end)
+                        if okCh and type(ch) == "table" then
+                            for _, child in pairs(ch) do addSeat(child) end
+                        end
+                    end
+                end
+                local okCh, baseCh = pcall(function() return base:getChildren() end)
+                if okCh and type(baseCh) == "table" then
+                    for _, child in pairs(baseCh) do
+                        addSeat(child)
+                        local okSub, subCh = pcall(function() return child:getChildren() end)
+                        if okSub and type(subCh) == "table" then
+                            for _, sub in pairs(subCh) do addSeat(sub) end
+                        end
+                    end
+                end
+            end
+
+            return list, base, pod
+        end
+
+        local function sendSeats(targetPly)
+            local base = (ctxRef and isValid(ctxRef.base)) and ctxRef.base or (wire and wire.ports and wire.ports.Base)
+            local pod  = (ctxRef and isValid(ctxRef.pod))  and ctxRef.pod  or (wire and wire.ports and wire.ports.Pod)
+            pcall(function()
+                net.start(NET_SEATS)
+                net.writeEntity(isValid(base) and base or entity(0))
+                net.writeEntity(isValid(pod) and pod or entity(0))
+                local count = math.min(#seats, 63)
+                net.writeUInt(count, 6)
+                for i = 1, count do
+                    net.writeEntity(seats[i])
+                end
+                if isValid(targetPly) then
+                    net.send(targetPly)
+                else
+                    net.send()
+                end
+            end)
+        end
+
+        local function refreshSeats(forceSend)
+            local newSeats, base, pod = collectVehicleSeats()
+            local sigParts = {
+                isValid(base) and tostring(base:entIndex()) or "0",
+                isValid(pod) and tostring(pod:entIndex()) or "0",
+            }
+            for i = 1, #newSeats do
+                sigParts[#sigParts + 1] = tostring(newSeats[i]:entIndex())
+            end
+            local sig = table.concat(sigParts, "|")
+            if forceSend or sig ~= lastSeatSig then
+                lastSeatSig = sig
+                seats = newSeats
+                sendSeats(nil)
+            end
+        end
+
+        local function updateWireOutputs()
+            if not ctxRef then return end
+            pcall(ctxRef.setWireOutput, "RadioPlaying", state.playing and 1 or 0)
+            pcall(ctxRef.setWireOutput, "RadioVolumeOut", round(state.volume * 100))
+            pcall(ctxRef.setWireOutput, "RadioStation", state.playing and state.name or "")
+        end
+
+        local function sendState(targetPly)
+            pcall(function()
+                net.start(NET_STATE)
+                net.writeBool(state.playing)
+                net.writeFloat(state.volume)
+                net.writeUInt(state.seq % 65535, 16)
+                net.writeString(state.name)
+                net.writeString(state.url)
+                net.writeString(state.country)
+                if isValid(targetPly) then
+                    net.send(targetPly)
+                else
+                    net.send()
+                end
+            end)
+        end
+
+        local function sanitizeURL(url)
+            if type(url) ~= "string" then return nil end
+            url = trimStr(url)
+            if #url < 8 or #url > 512 then return nil end
+            if not (string.match(url, "^https?://[%S]+$")) then return nil end
+            return url
+        end
+
+        local function playStation(url, name, country)
+            local clean = sanitizeURL(url)
+            if not clean then return false end
+            name = tostring(name or "Custom Stream")
+            if #name > 96 then name = string.sub(name, 1, 96) end
+            country = tostring(country or "")
+            if #country > 64 then country = string.sub(country, 1, 64) end
+
+            state.playing = true
+            state.url     = clean
+            state.name    = name
+            state.country = country
+            state.seq     = state.seq + 1
+
+            lastStation.url     = clean
+            lastStation.name    = name
+            lastStation.country = country
+
+            updateWireOutputs()
+            sendState(nil)
+            return true
+        end
+
+        local function stopRadio()
+            if not state.playing then return end
+            state.playing = false
+            state.seq     = state.seq + 1
+            updateWireOutputs()
+            sendState(nil)
+        end
+
+        local function toggleRadio()
+            if state.playing then
+                stopRadio()
+            elseif lastStation.url ~= "" then
+                playStation(lastStation.url, lastStation.name, lastStation.country)
+            elseif Presets[1] then
+                playStation(Presets[1][2], Presets[1][1], "Presets")
+            end
+        end
+
+        local function setVolume(vol)
+            local clamped = math.clamp(tonumber(vol) or DefaultVolume, 0, 1)
+            clamped = math.round(clamped * 100) / 100
+            if math.abs(clamped - state.volume) < 0.005 then return end
+            state.volume = clamped
+            updateWireOutputs()
+            sendState(nil)
+        end
+
+        local function canPlayerControl(ply)
+            if not isValid(ply) then return false end
+            local pod = (ctxRef and isValid(ctxRef.pod)) and ctxRef.pod or (wire and wire.ports and wire.ports.Pod)
+            if DriverOnly then
+                if not isValid(pod) then return false end
+                local okD, drv = pcall(function() return pod:getDriver() end)
+                return okD and drv == ply
+            end
+            if not ply:inVehicle() then return false end
+            local okV, veh = pcall(function() return ply:getVehicle() end)
+            if not (okV and isValid(veh)) then return false end
+            if isValid(pod) and veh == pod then return true end
+            for i = 1, #seats do
+                if seats[i] == veh then return true end
+            end
+            return false
+        end
+
+        return {
+            name = "VehicleRadio",
+            OnInit = function(ctx)
+                ctxRef = ctx
+
+                ctx.addWireInput("RadioToggle", "Number", function(_, val)
+                    local n = tonumber(val) or 0
+                    if n > 0 and lastWireToggle <= 0 then
+                        toggleRadio()
+                    end
+                    lastWireToggle = n
+                end)
+                ctx.addWireInput("RadioVolume", "Number", function(_, val)
+                    local n = tonumber(val)
+                    if n then
+                        if n > 1 then n = n / 100 end
+                        setVolume(n)
+                    end
+                end)
+                ctx.addWireInput("RadioURL", "String", function(_, url)
+                    if type(url) == "string" and trimStr(url) ~= "" then
+                        playStation(url, "Wire Stream", "Wire")
+                    else
+                        stopRadio()
+                    end
+                end)
+
+                ctx.addWireOutput("RadioPlaying", "Number")
+                ctx.addWireOutput("RadioVolumeOut", "Number")
+                ctx.addWireOutput("RadioStation", "String")
+                timer.simple(0.5, updateWireOutputs)
+
+                net.receive(NET_REQ, function(_, ply)
+                    if not isValid(ply) then return end
+                    if #seats == 0 then refreshSeats(false) end
+                    sendSeats(ply)
+                    sendState(ply)
+                end)
+
+                net.receive(NET_CMD, function(_, ply)
+                    if not canPlayerControl(ply) then return end
+                    local cmd = net.readUInt(4)
+                    if cmd == CMD_PLAY then
+                        local url     = net.readString()
+                        local name    = net.readString()
+                        local country = net.readString()
+                        playStation(url, name, country)
+                    elseif cmd == CMD_STOP then
+                        stopRadio()
+                    elseif cmd == CMD_TOGGLE then
+                        toggleRadio()
+                    elseif cmd == CMD_SETVOL then
+                        setVolume(net.readFloat())
+                    elseif cmd == CMD_STEPVOL then
+                        setVolume(state.volume + net.readFloat())
+                    end
+                end)
+
+                if EnableChatCommand then
+                    pcall(hook.add, "PlayerSay", "SimcadeRadio_Chat_" .. tostring(chip():entIndex()), function(ply, text)
+                        if not canPlayerControl(ply) then return end
+                        if type(text) ~= "string" then return end
+                        local trimmed = trimStr(text)
+                        local low = string.lower(trimmed)
+                        if not startsWith(low, "!radio") then return end
+
+                        local arg = trimStr(string.sub(trimmed, 7))
+                        local argLow = string.lower(arg)
+                        if arg == "" or argLow == "toggle" then
+                            toggleRadio()
+                            return ""
+                        elseif argLow == "stop" or argLow == "off" then
+                            stopRadio()
+                            return ""
+                        elseif startsWith(argLow, "vol ") then
+                            local v = tonumber(trimStr(string.sub(arg, 5)))
+                            if v then
+                                if v > 1 then v = v / 100 end
+                                setVolume(v)
+                            end
+                            return ""
+                        else
+                            local url, customName = string.match(arg, "^(%S+)%s*(.*)$")
+                            if url and sanitizeURL(url) then
+                                local label = (customName and customName ~= "") and customName or "Custom Stream"
+                                playStation(url, label, "Custom")
+                                return ""
+                            end
+                        end
+                    end)
+                end
+
+                timer.simple(1.0, function() refreshSeats(true) end)
+                timer.simple(3.0, function()
+                    if #seats == 0 then refreshSeats(true) end
+                end)
+            end,
+            OnCleanup = function()
+                hook.remove("PlayerSay", "SimcadeRadio_Chat_" .. tostring(chip():entIndex()))
+            end,
+        }
+    end
+
+    -- ========================================================================
+    -- CLIENT
+    -- ========================================================================
+    local chipId = tostring(chip():entIndex())
+    local baseEnt = nil
+    local podEnt  = nil
+    local vehicleSeats = {}
+    local vehicleSeatSet = {}
+
+    local radioState = {
+        playing = false,
+        url     = "",
+        name    = "",
+        country = "",
+        volume  = DefaultVolume,
+        seq     = 0,
+    }
+
+    -- Audio engine state
+    local activeChannel   = nil
+    local activeURL       = ""
+    local activeIs3D      = nil
+    local activeGain      = 0
+    local fadeAlpha       = 0
+    local pendingMode3D   = nil
+    local fadingChannels  = {} -- { { ch = bass, gain = number, is3D = bool } }
+    local loadNonce       = 0
+    local streamPhase     = "idle" -- "idle" | "connecting" | "playing" | "error"
+    local streamError     = ""
+    local rangeUnloaded   = false
+    local lastOccTrace    = 0
+    local occTarget       = 1
+    local occCurrent      = 1
+    local lastAudioTick   = timer.curtime()
+    local eqBars          = { 0, 0, 0, 0, 0 }
+
+    -- HUD toast visibility
+    local hudLastActivity = 0
+    local hudPermPrompted = false
+    local bassPermPrompted = false
+    local needBassPermPrompt = false
+
+    local function hasBassPermission(url)
+        if hasPermission then
+            if url then
+                local okU, allowedU, reasonU = pcall(hasPermission, "bass.loadURL", url)
+                if okU then return allowedU, reasonU end
+            end
+            local ok, allowed, reason = pcall(hasPermission, "bass.loadURL")
+            if ok then return allowed, reason end
+        end
+        return true, nil
+    end
+
+    local cachedCanPlay2D = nil
+    local function refreshPlay2DPermission()
+        if hasPermission then
+            local ok, allowed = pcall(hasPermission, "bass.play2D")
+            if ok then
+                cachedCanPlay2D = allowed == true
+                return cachedCanPlay2D
+            end
+        end
+        cachedCanPlay2D = false
+        return false
+    end
+
+    local function hasPlay2DPermission()
+        if cachedCanPlay2D == nil then
+            return refreshPlay2DPermission()
+        end
+        return cachedCanPlay2D
+    end
+
+    -- Catalog state (lazy-loaded per country)
+    local catalogState   = "idle" -- "idle" | "loading" | "ready" | "error"
+    local catalogError   = ""
+    local countriesList  = {} -- { { key, name, count }, ... }
+    local countryCache   = {} -- key -> { status = "loading"|"ready"|"error", stations = { {name, url}, ... }, err = "" }
+
+    -- Menu UI state
+    local menuOpen        = false
+    local viewMode        = "countries" -- "countries" | "stations"
+    local selectedCountry = nil -- { key = ..., name = ... }
+    local searchText      = ""
+    local searchFocused   = false
+    local scrollOffset    = 0
+    local filteredRows    = {}
+    local filteredDirty   = true
+    local draggingSlider  = false
+    local draggingScroll  = false
+    local lastMouseLeft   = false
+    local keyHoldShift    = false
+
+    -- Fonts
+    local fontTitle, fontMed, fontSmall, fontTiny
+
+    local function ensureFonts()
+        if fontTitle or not (render and render.createFont) then return end
+        pcall(function()
+            fontTitle = render.createFont("Roboto", 20, 700, true)
+            fontMed   = render.createFont("Roboto", 16, 600, true)
+            fontSmall = render.createFont("Roboto", 14, 500, true)
+            fontTiny  = render.createFont("Roboto", 12, 500, true)
+        end)
+    end
+
+    local function getKeyLabel(k, fallback)
+        if k and input and input.getKeyName then
+            local ok, n = pcall(input.getKeyName, k)
+            if ok and n and n ~= "" then return string.upper(n) end
+        end
+        return fallback or "?"
+    end
+
+    local function isLocalPlayerInThisVehicle()
+        local lp = player()
+        if not (isValid(lp) and lp:inVehicle()) then return false end
+        local veh = lp.getVehicle and lp:getVehicle() or nil
+        if not isValid(veh) then return false end
+        if isValid(podEnt) and veh == podEnt then return true end
+        if vehicleSeatSet[veh] then return true end
+        if isValid(baseEnt) and veh.getParent and veh:getParent() == baseEnt then return true end
+        return false
+    end
+
+    local function isLocalPlayerDriver()
+        local lp = player()
+        if not (isValid(lp) and lp:inVehicle()) then return false end
+        local veh = lp.getVehicle and lp:getVehicle() or nil
+        if not isValid(veh) then return false end
+        if isValid(podEnt) then return veh == podEnt end
+        local st = SimcadeHUD and SimcadeHUD.getState and SimcadeHUD.getState() or nil
+        if st and isValid(st.pod) then return veh == st.pod end
+        return false
+    end
+
+    local function canLocalPlayerControl()
+        if DriverOnly then return isLocalPlayerDriver() end
+        return isLocalPlayerInThisVehicle()
+    end
+
+    local function sendCmd(cmd, a, b, c)
+        pcall(function()
+            net.start(NET_CMD)
+            net.writeUInt(cmd, 4)
+            if cmd == CMD_PLAY then
+                net.writeString(tostring(a or ""))
+                net.writeString(tostring(b or "Station"))
+                net.writeString(tostring(c or ""))
+            elseif cmd == CMD_SETVOL or cmd == CMD_STEPVOL then
+                net.writeFloat(tonumber(a) or 0)
+            end
+            net.send()
+        end)
+    end
+
+    -- ========================================================================
+    -- Audio Engine (Seamless Cabin <-> 3D)
+    -- ========================================================================
+    local function stopChannelSafe(ch)
+        if ch and isValid(ch) then
+            pcall(function() ch:stop() end)
+        end
+    end
+
+    local function demoteActiveToFading()
+        if activeChannel and isValid(activeChannel) then
+            fadingChannels[#fadingChannels + 1] = {
+                ch = activeChannel,
+                gain = activeGain,
+                is3D = activeIs3D == true,
+            }
+            while #fadingChannels > 3 do
+                local old = table.remove(fadingChannels, 1)
+                stopChannelSafe(old.ch)
+            end
+        end
+        activeChannel = nil
+        activeURL = ""
+        activeIs3D = nil
+        activeGain = 0
+        fadeAlpha = 0
+    end
+
+    local function getAudioSourcePos()
+        if isValid(baseEnt) then
+            return baseEnt:localToWorld(SourceOffset)
+        end
+        if isValid(podEnt) then return podEnt:getPos() end
+        return chip():getPos()
+    end
+
+    local function computeDistanceGain(dist)
+        if dist >= MaxHearingDistance then return 0 end
+        if dist <= FullVolumeDistance then return 1 end
+        local raw   = (FullVolumeDistance / math.max(dist, 1)) ^ FalloffExponent
+        local floor = (FullVolumeDistance / MaxHearingDistance) ^ FalloffExponent
+        local denom = 1 - floor
+        if denom <= 0 then return 0 end
+        return clamp((raw - floor) / denom, 0, 1)
+    end
+
+    local function startStream(url, want2D, keepCurrent)
+        if not (bass and bass.loadURL) then
+            streamPhase = "error"
+            streamError = "BASS unavailable"
+            return
+        end
+        local allowed, denyReason = hasBassPermission(url)
+        if not allowed then
+            streamPhase = "error"
+            streamError = (type(denyReason) == "string" and denyReason ~= "") and denyReason or "Allow bass.loadURL permission"
+            local satisfied = false
+            if permissionRequestSatisfied then
+                local okS, sat = pcall(permissionRequestSatisfied)
+                if okS then satisfied = sat == true end
+            end
+            if (not satisfied) and (not bassPermPrompted) then
+                needBassPermPrompt = true
+            end
+            return
+        end
+        if want2D == nil then
+            want2D = isLocalPlayerInThisVehicle() and hasPlay2DPermission()
+        elseif want2D and not hasPlay2DPermission() then
+            -- StarfallEx restricts 2D BASS ("bass.play2D") to the owner by default;
+            -- non-owners use a 3D channel anchored overhead of eyePos() for seamless cabin audio.
+            want2D = false
+        end
+        local want3D = not want2D
+        if activeURL == url and activeChannel and isValid(activeChannel) and activeIs3D == want3D then
+            pendingMode3D = nil
+            return
+        end
+
+        if not keepCurrent then
+            demoteActiveToFading()
+            streamPhase = "connecting"
+            streamError = ""
+        end
+
+        loadNonce = loadNonce + 1
+        local myNonce = loadNonce
+        pendingMode3D = want3D
+        rangeUnloaded = false
+
+        local flags = want3D and "3d noblock noplay" or "noblock noplay"
+        local okCall, callErr = pcall(bass.loadURL, url, flags, function(ch, errCode, errName)
+            if myNonce ~= loadNonce or not radioState.playing or radioState.url ~= url then
+                stopChannelSafe(ch)
+                return
+            end
+            pendingMode3D = nil
+            if not (ch and isValid(ch)) then
+                if not keepCurrent then
+                    streamPhase = "error"
+                    streamError = tostring(errName or errCode or "Stream error")
+                end
+                return
+            end
+
+            if keepCurrent and activeChannel and isValid(activeChannel) then
+                demoteActiveToFading()
+            end
+
+            activeChannel = ch
+            activeURL     = url
+            activeIs3D    = want3D
+            fadeAlpha     = 0
+            activeGain    = 0
+            pcall(function()
+                ch:setVolume(0)
+                if want3D then
+                    -- Keep BASS native fade wide so we don't double-attenuate on top of computeDistanceGain
+                    if ch.setFade then ch:setFade(1000, 100000) end
+                    local initPos = isLocalPlayerInThisVehicle()
+                        and (((eyePos and eyePos()) or player():getShootPos()) + Vector(0, 0, 50))
+                        or getAudioSourcePos()
+                    ch:setPos(initPos)
+                end
+                ch:play()
+            end)
+            streamPhase = "playing"
+        end)
+        if not okCall then
+            pendingMode3D = nil
+            if not keepCurrent then
+                streamPhase = "error"
+                streamError = (type(callErr) == "table" and callErr.message) and callErr.message or tostring(callErr or "Load blocked")
+            end
+        end
+    end
+
+    local function stopAllAudio()
+        loadNonce = loadNonce + 1
+        pendingMode3D = nil
+        demoteActiveToFading()
+        streamPhase = "idle"
+        streamError = ""
+        rangeUnloaded = false
+    end
+
+    local OVERHEAD_OFFSET = Vector(0, 0, 50)
+    local FFT_BANDS       = { 2, 5, 10, 18, 30 }
+    local AUDIO_TICK_RATE = 0.05 -- 20 Hz audio/distance/FFT updates (keeps client CPU tiny)
+
+    local function updateAudio(dt, now)
+        local lp = player()
+        if not isValid(lp) then return end
+
+        local inCabin = isLocalPlayerInThisVehicle()
+        local want2D  = inCabin and hasPlay2DPermission()
+        local want3D  = not want2D
+        local srcPos  = getAudioSourcePos()
+        local listenerPos = (eyePos and eyePos()) or lp:getShootPos()
+        local overheadPos = listenerPos + OVERHEAD_OFFSET
+        local dist    = listenerPos:getDistance(srcPos)
+
+        -- Update fading-out channels
+        for i = #fadingChannels, 1, -1 do
+            local f = fadingChannels[i]
+            if not (f.ch and isValid(f.ch)) then
+                table.remove(fadingChannels, i)
+            else
+                f.gain = math.max(0, f.gain - dt / CrossfadeTime)
+                f.ch:setVolume(f.gain)
+                if f.is3D and f.ch.setPos then
+                    f.ch:setPos(inCabin and overheadPos or srcPos)
+                end
+                if f.gain <= 0.002 then
+                    stopChannelSafe(f.ch)
+                    table.remove(fadingChannels, i)
+                end
+            end
+        end
+
+        -- Range-based lazy load/unload for bystanders
+        if radioState.playing and radioState.url ~= "" then
+            local unloadDist = MaxHearingDistance * 2.2
+            local reloadDist = MaxHearingDistance * 1.5
+            if (not inCabin) and dist > unloadDist then
+                if activeChannel and isValid(activeChannel) then
+                    demoteActiveToFading()
+                end
+                pendingMode3D = nil
+                rangeUnloaded = true
+                return
+            elseif rangeUnloaded and (inCabin or dist <= reloadDist) then
+                rangeUnloaded = false
+                startStream(radioState.url, want2D, false)
+            elseif (not activeChannel or not isValid(activeChannel)) and streamPhase ~= "connecting" and streamPhase ~= "error" and pendingMode3D == nil then
+                startStream(radioState.url, want2D, false)
+            end
+        end
+
+        if not (activeChannel and isValid(activeChannel)) then
+            for i = 1, 5 do eqBars[i] = eqBars[i] * math.max(0, 1 - dt * 10) end
+            return
+        end
+
+        -- If player has bass.play2D, crossfade between true 2D stereo (cabin) and 3D (exterior).
+        -- Otherwise keep the single 3D channel and move it seamlessly between overheadPos and srcPos.
+        if activeIs3D ~= want3D and pendingMode3D ~= want3D and radioState.playing and radioState.url ~= "" then
+            startStream(radioState.url, want2D, true)
+        end
+
+        local distGain = 1
+        if not inCabin then
+            distGain = computeDistanceGain(dist)
+            if OcclusionEnabled and distGain > 0.01 then
+                if now - lastOccTrace >= 0.25 then
+                    lastOccTrace = now
+                    local blocked = false
+                    if trace and trace.line then
+                        local okTr, tr = pcall(trace.line, listenerPos, srcPos, { lp, baseEnt, podEnt })
+                        if okTr and tr and tr.Hit and not tr.StartSolid then
+                            blocked = true
+                        end
+                    end
+                    occTarget = blocked and OcclusionGain or 1
+                end
+                local a = 1 - math.exp(-dt * 8)
+                occCurrent = occCurrent + (occTarget - occCurrent) * a
+            else
+                occCurrent = 1
+            end
+        else
+            occTarget = 1
+            occCurrent = 1
+        end
+
+        fadeAlpha = math.min(1, fadeAlpha + dt / CrossfadeTime)
+        local targetGain = radioState.volume * distGain * occCurrent * fadeAlpha
+        local smooth = 1 - math.exp(-dt * 14)
+        activeGain = activeGain + (targetGain - activeGain) * smooth
+
+        if activeIs3D and activeChannel.setPos then
+            activeChannel:setPos(inCabin and overheadPos or srcPos)
+        end
+        activeChannel:setVolume(activeGain)
+
+        -- Only compute FFT when the player is inside the vehicle and the now-playing HUD bar is visible
+        local hudVisible = inCabin and ShowNowPlayingHUD and (menuOpen or HUDAutoHideSeconds == 0 or (now - hudLastActivity) <= (HUDAutoHideSeconds + 0.6))
+        if hudVisible and activeChannel.getFFT then
+            local okF, fft = pcall(activeChannel.getFFT, activeChannel, 0)
+            if okF and type(fft) == "table" then
+                for i = 1, 5 do
+                    local raw = tonumber(fft[FFT_BANDS[i]]) or 0
+                    local v = clamp(math.sqrt(raw) * 2.2, 0.05, 1)
+                    eqBars[i] = eqBars[i] + (v - eqBars[i]) * math.min(1, dt * 16)
+                end
+            end
+        end
+    end
+
+    -- ========================================================================
+    -- Lazy-Loaded GitHub Station Catalog
+    -- ========================================================================
+    local function rebuildFilteredRows()
+        filteredDirty = false
+        filteredRows = {}
+        local q = string.lower(trimStr(searchText))
+
+        if viewMode == "countries" then
+            if q == "" or string.find("built-in presets", q, 1, true) then
+                filteredRows[#filteredRows + 1] = {
+                    kind  = "country",
+                    key   = "__presets__",
+                    name  = "Built-in Presets (Offline)",
+                    count = #Presets,
+                }
+            end
+            for i = 1, #countriesList do
+                local c = countriesList[i]
+                if q == "" or string.find(c.lowerName, q, 1, true) then
+                    filteredRows[#filteredRows + 1] = {
+                        kind  = "country",
+                        key   = c.key,
+                        name  = c.name,
+                        count = c.count,
+                    }
+                end
+            end
+        else
+            local list = nil
+            if selectedCountry and selectedCountry.key == "__presets__" then
+                list = Presets
+            elseif selectedCountry then
+                local entry = countryCache[selectedCountry.key]
+                if entry and entry.status == "ready" then
+                    list = entry.stations
+                end
+            end
+            if list then
+                for i = 1, #list do
+                    local st = list[i]
+                    local sName = st[1] or ""
+                    local sUrl  = st[2] or ""
+                    if q == "" or string.find(string.lower(sName), q, 1, true) then
+                        filteredRows[#filteredRows + 1] = {
+                            kind = "station",
+                            name = sName,
+                            url  = sUrl,
+                        }
+                    end
+                end
+            end
+        end
+        scrollOffset = 0
+    end
+
+    local function fetchCatalogIndex()
+        if catalogState == "loading" or catalogState == "ready" then return end
+        if not (http and http.get and json and json.decode) then
+            catalogState = "error"
+            catalogError = "HTTP/JSON unavailable"
+            return
+        end
+        catalogState = "loading"
+        catalogError = ""
+
+        local function tryFetch()
+            if not http.canRequest() then
+                timer.simple(0.25, tryFetch)
+                return
+            end
+            local ok, err = pcall(http.get, CatalogBaseURL .. "/index.json", function(body, _, _, code)
+                if code ~= 200 or not body or body == "" then
+                    catalogState = "error"
+                    catalogError = "HTTP " .. tostring(code)
+                    return
+                end
+                local okJ, parsed = pcall(json.decode, body)
+                if not okJ or type(parsed) ~= "table" then
+                    catalogState = "error"
+                    catalogError = "Invalid catalog index"
+                    return
+                end
+                countriesList = {}
+                for i = 1, #parsed do
+                    local row = parsed[i]
+                    if type(row) == "table" and row[1] and row[2] then
+                        countriesList[#countriesList + 1] = {
+                            key       = tostring(row[1]),
+                            name      = tostring(row[2]),
+                            lowerName = string.lower(tostring(row[2])),
+                            count     = tonumber(row[3]) or 0,
+                        }
+                    end
+                end
+                catalogState = "ready"
+                filteredDirty = true
+            end, function(reason)
+                catalogState = "error"
+                catalogError = tostring(reason or "Fetch failed")
+            end)
+            if not ok then
+                catalogState = "error"
+                catalogError = tostring(err)
+            end
+        end
+        tryFetch()
+    end
+
+    local function fetchCountryStations(countryKey)
+        if countryKey == "__presets__" then
+            filteredDirty = true
+            return
+        end
+        local existing = countryCache[countryKey]
+        if existing and (existing.status == "ready" or existing.status == "loading") then
+            filteredDirty = true
+            return
+        end
+        if not (http and http.get and json and json.decode) then
+            countryCache[countryKey] = { status = "error", stations = {}, err = "HTTP unavailable" }
+            return
+        end
+
+        countryCache[countryKey] = { status = "loading", stations = {}, err = "" }
+
+        local function tryFetch()
+            if not http.canRequest() then
+                timer.simple(0.25, tryFetch)
+                return
+            end
+            local url = CatalogBaseURL .. "/countries/" .. countryKey .. ".json"
+            local ok, err = pcall(http.get, url, function(body, _, _, code)
+                if code ~= 200 or not body or body == "" then
+                    countryCache[countryKey] = { status = "error", stations = {}, err = "HTTP " .. tostring(code) }
+                    return
+                end
+                local okJ, parsed = pcall(json.decode, body)
+                if not okJ or type(parsed) ~= "table" then
+                    countryCache[countryKey] = { status = "error", stations = {}, err = "Invalid JSON" }
+                    return
+                end
+                countryCache[countryKey] = { status = "ready", stations = parsed, err = "" }
+                if selectedCountry and selectedCountry.key == countryKey then
+                    filteredDirty = true
+                end
+            end, function(reason)
+                countryCache[countryKey] = { status = "error", stations = {}, err = tostring(reason or "Fetch failed") }
+            end)
+            if not ok then
+                countryCache[countryKey] = { status = "error", stations = {}, err = tostring(err) }
+            end
+        end
+        tryFetch()
+    end
+
+    -- ========================================================================
+    -- Menu Open / Close & Keyboard Input
+    -- ========================================================================
+    local function setMenuOpen(open)
+        if open == menuOpen then return end
+        menuOpen = open
+        searchFocused = false
+        draggingSlider = false
+        draggingScroll = false
+
+        if SimcadeCamera then
+            SimcadeCamera._blockMouseInput = open and true or false
+        end
+
+        if input and input.enableCursor then
+            pcall(input.enableCursor, open)
+        end
+
+        if open then
+            hudLastActivity = timer.curtime()
+            fetchCatalogIndex()
+            filteredDirty = true
+        end
+    end
+
+    local KEY_CHAR_MAP = {}
+    if KEY then
+        for i = 0, 25 do
+            local ch = string.char(97 + i)
+            local k = KEY[string.upper(ch)]
+            if k then KEY_CHAR_MAP[k] = ch end
+        end
+        for i = 0, 9 do
+            local k = KEY["KEY_" .. tostring(i)] or KEY["PAD_" .. tostring(i)]
+            if k then KEY_CHAR_MAP[k] = tostring(i) end
+        end
+        if KEY.SPACE then KEY_CHAR_MAP[KEY.SPACE] = " " end
+        if KEY.MINUS then KEY_CHAR_MAP[KEY.MINUS] = "-" end
+        if KEY.PERIOD then KEY_CHAR_MAP[KEY.PERIOD] = "." end
+    end
+
+    -- ========================================================================
+    -- HUD Drawing (rRadio-Style Menu + Now-Playing Toast)
+    -- ========================================================================
+    local COL_BG          = Color(18, 21, 28, 242)
+    local COL_PANEL       = Color(26, 31, 42, 245)
+    local COL_ROW         = Color(32, 38, 52, 220)
+    local COL_ROW_HOVER   = Color(45, 56, 76, 245)
+    local COL_ROW_ACTIVE  = Color(28, 72, 102, 245)
+    local COL_ACCENT      = Color(64, 188, 255, 255)
+    local COL_ACCENT_DIM  = Color(42, 118, 165, 220)
+    local COL_STOP        = Color(220, 72, 72, 235)
+    local COL_STOP_HOVER  = Color(245, 92, 92, 255)
+    local COL_PLAY        = Color(62, 195, 128, 235)
+    local COL_TEXT        = Color(240, 244, 252, 255)
+    local COL_TEXT_DIM    = Color(152, 164, 186, 255)
+    local COL_BORDER      = Color(58, 70, 94, 200)
+
+    local function pointInRect(px, py, x, y, w, h)
+        return px >= x and px <= (x + w) and py >= y and py <= (y + h)
+    end
+
+    local function drawBox(r, x, y, w, h)
+        if render.drawRoundedBox and r and r > 0 then
+            render.drawRoundedBox(r, x, y, w, h)
+        else
+            render.drawRect(x, y, w, h)
+        end
+    end
+
+    local function drawNowPlayingBar(sw, sh)
+        if not ShowNowPlayingHUD then return end
+        local inVehicle = isLocalPlayerInThisVehicle()
+        if not inVehicle then return end
+
+        local now = timer.curtime()
+        local alphaFrac = 1
+        if HUDAutoHideSeconds > 0 and not menuOpen then
+            local elapsed = now - hudLastActivity
+            if elapsed > HUDAutoHideSeconds then
+                local fadeOut = 1 - (elapsed - HUDAutoHideSeconds) / 0.6
+                if fadeOut <= 0 then return end
+                alphaFrac = fadeOut
+            end
+        end
+
+        ensureFonts()
+        local w, h = 360, 56
+        local x = (sw - w) * 0.5
+        local y = sh - h - 22
+
+        local function colA(c, mult)
+            return Color(c.r, c.g, c.b, math.floor(c.a * alphaFrac * (mult or 1)))
+        end
+
+        render.setColor(colA(COL_BG))
+        drawBox(8, x, y, w, h)
+
+        -- Top accent strip (animated tuning bar while connecting)
+        if radioState.playing and streamPhase == "connecting" then
+            render.setColor(colA(COL_ACCENT_DIM))
+            render.drawRect(x + 2, y + 2, w - 4, 3)
+            local bw = w * 0.28
+            local t = (math.sin(now * 4.5) * 0.5 + 0.5)
+            render.setColor(colA(COL_ACCENT))
+            render.drawRect(x + 2 + t * (w - 4 - bw), y + 2, bw, 3)
+        elseif radioState.playing and streamPhase == "error" then
+            render.setColor(colA(COL_STOP))
+            render.drawRect(x + 2, y + 2, w - 4, 3)
+        elseif radioState.playing then
+            render.setColor(colA(COL_ACCENT))
+            render.drawRect(x + 2, y + 2, w - 4, 3)
+        else
+            render.setColor(colA(COL_BORDER))
+            render.drawRect(x + 2, y + 2, w - 4, 3)
+        end
+
+        -- Text
+        local title = radioState.playing and (radioState.name ~= "" and radioState.name or "Radio") or "Radio Off"
+        if #title > 34 then title = string.sub(title, 1, 31) .. "..." end
+
+        local statusTxt
+        if not radioState.playing then
+            statusTxt = "OFF  |  [" .. getKeyLabel(MenuKey, "N") .. "] Stations  [" .. getKeyLabel(ToggleKey, "B") .. "] Power"
+        elseif streamPhase == "connecting" then
+            statusTxt = "TUNING...  |  Vol " .. tostring(math.round(radioState.volume * 100)) .. "%"
+        elseif streamPhase == "error" then
+            statusTxt = "ERROR: " .. streamError
+        else
+            local loc = (radioState.country ~= "" and (radioState.country .. "  |  ") or "")
+            statusTxt = loc .. "Vol " .. tostring(math.round(radioState.volume * 100)) .. "%"
+        end
+
+        if fontMed then render.setFont(fontMed) end
+        render.setColor(colA(COL_TEXT))
+        render.drawSimpleText(x + 14, y + 12, title, 0, 0)
+
+        if fontTiny then render.setFont(fontTiny) end
+        render.setColor(colA(COL_TEXT_DIM))
+        render.drawSimpleText(x + 14, y + 34, statusTxt, 0, 0)
+
+        -- 5-bar FFT Equalizer on the right
+        if radioState.playing and streamPhase == "playing" then
+            local eqW, eqGap, eqMaxH = 5, 3, 28
+            local eqStartX = x + w - 14 - (5 * eqW + 4 * eqGap)
+            local eqBaseY  = y + h - 12
+            for i = 1, 5 do
+                local bh = math.max(3, math.floor(eqBars[i] * eqMaxH))
+                render.setColor(colA(COL_ACCENT))
+                render.drawRect(eqStartX + (i - 1) * (eqW + eqGap), eqBaseY - bh, eqW, bh)
+            end
+        end
+    end
+
+    local function drawMenu(sw, sh)
+        if not menuOpen then return end
+        if not canLocalPlayerControl() then
+            setMenuOpen(false)
+            return
+        end
+
+        ensureFonts()
+        if filteredDirty then rebuildFilteredRows() end
+
+        local mx, my = 0, 0
+        if input and input.getCursorPos then
+            local okM, cx, cy = pcall(input.getCursorPos)
+            if okM and cx and cy then mx, my = cx, cy end
+        end
+
+        local mouseDown = false
+        if input and input.isMouseDown then
+            local m1 = (MOUSE and (MOUSE.MOUSE1 or MOUSE.LEFT)) or 107
+            local okD, d = pcall(input.isMouseDown, m1)
+            if okD then mouseDown = d end
+        end
+        local clicked = mouseDown and not lastMouseLeft
+        if not mouseDown then
+            draggingSlider = false
+            draggingScroll = false
+        end
+
+        local w = math.min(540, sw - 40)
+        local h = math.min(580, sh - 80)
+        local x = math.floor((sw - w) * 0.5)
+        local y = math.floor((sh - h) * 0.5)
+        local pad = 12
+
+        -- Main frame
+        render.setColor(COL_BG)
+        drawBox(10, x, y, w, h)
+        render.setColor(COL_BORDER)
+        render.drawRectOutline(x, y, w, h, 1)
+
+        -- Header
+        local headerH = 42
+        render.setColor(COL_PANEL)
+        drawBox(8, x + 1, y + 1, w - 2, headerH)
+
+        if fontTitle then render.setFont(fontTitle) end
+        render.setColor(COL_ACCENT)
+        local hdrTitle = "VEHICLE RADIO"
+        if viewMode == "stations" and selectedCountry then
+            hdrTitle = selectedCountry.name
+            if #hdrTitle > 28 then hdrTitle = string.sub(hdrTitle, 1, 25) .. "..." end
+        end
+        render.drawSimpleText(x + pad, y + headerH * 0.5, hdrTitle, 0, 1)
+
+        -- Close [X] button
+        local btnSize = 26
+        local closeX = x + w - pad - btnSize
+        local closeY = y + (headerH - btnSize) * 0.5
+        local hoverClose = pointInRect(mx, my, closeX, closeY, btnSize, btnSize)
+        render.setColor(hoverClose and COL_STOP_HOVER or COL_ROW)
+        drawBox(5, closeX, closeY, btnSize, btnSize)
+        if fontSmall then render.setFont(fontSmall) end
+        render.setColor(COL_TEXT)
+        render.drawSimpleText(closeX + btnSize * 0.5, closeY + btnSize * 0.5, "X", 1, 1)
+        if clicked and hoverClose then
+            setMenuOpen(false)
+            lastMouseLeft = mouseDown
+            return
+        end
+
+        -- Back button (in stations view)
+        if viewMode == "stations" then
+            local backW = 64
+            local backX = closeX - backW - 8
+            local hoverBack = pointInRect(mx, my, backX, closeY, backW, btnSize)
+            render.setColor(hoverBack and COL_ROW_HOVER or COL_ROW)
+            drawBox(5, backX, closeY, backW, btnSize)
+            render.setColor(COL_TEXT)
+            render.drawSimpleText(backX + backW * 0.5, closeY + btnSize * 0.5, "< Back", 1, 1)
+            if clicked and hoverBack then
+                viewMode = "countries"
+                selectedCountry = nil
+                searchText = ""
+                searchFocused = false
+                filteredDirty = true
+            end
+        end
+
+        -- Search bar
+        local searchY = y + headerH + 10
+        local searchH = 30
+        local clearW  = searchText ~= "" and 54 or 0
+        local searchW = w - pad * 2 - (clearW > 0 and (clearW + 6) or 0)
+        local hoverSearch = pointInRect(mx, my, x + pad, searchY, searchW, searchH)
+        render.setColor(COL_PANEL)
+        drawBox(6, x + pad, searchY, searchW, searchH)
+        render.setColor(searchFocused and COL_ACCENT or COL_BORDER)
+        render.drawRectOutline(x + pad, searchY, searchW, searchH, 1)
+
+        if fontSmall then render.setFont(fontSmall) end
+        if searchText == "" and not searchFocused then
+            render.setColor(COL_TEXT_DIM)
+            render.drawSimpleText(x + pad + 10, searchY + searchH * 0.5, "Click to filter...", 0, 1)
+        else
+            render.setColor(COL_TEXT)
+            local cursor = (searchFocused and (math.floor(timer.curtime() * 2) % 2 == 0)) and "|" or ""
+            render.drawSimpleText(x + pad + 10, searchY + searchH * 0.5, searchText .. cursor, 0, 1)
+        end
+
+        if clicked then
+            if hoverSearch then
+                searchFocused = true
+            elseif clearW > 0 and pointInRect(mx, my, x + pad + searchW + 6, searchY, clearW, searchH) then
+                searchText = ""
+                searchFocused = false
+                filteredDirty = true
+            else
+                searchFocused = false
+            end
+        end
+
+        if clearW > 0 then
+            local cx = x + pad + searchW + 6
+            local hoverClr = pointInRect(mx, my, cx, searchY, clearW, searchH)
+            render.setColor(hoverClr and COL_ROW_HOVER or COL_ROW)
+            drawBox(6, cx, searchY, clearW, searchH)
+            render.setColor(COL_TEXT)
+            render.drawSimpleText(cx + clearW * 0.5, searchY + searchH * 0.5, "Clear", 1, 1)
+        end
+
+        -- List container (virtualized)
+        local footerH = 74
+        local listY = searchY + searchH + 10
+        local listH = h - (listY - y) - footerH - 10
+        local scrollBarW = 10
+        local listW = w - pad * 2 - scrollBarW - 6
+        local rowH  = 34
+        local rowGap = 4
+        local rowStep = rowH + rowGap
+        local visibleRows = math.max(1, math.floor((listH + rowGap) / rowStep))
+        local totalRows = #filteredRows
+        local maxScroll = math.max(0, totalRows - visibleRows)
+        scrollOffset = math.clamp(scrollOffset, 0, maxScroll)
+
+        render.setColor(COL_PANEL)
+        drawBox(6, x + pad, listY, listW, listH)
+
+        -- Status message if loading or empty
+        local statusMsg = nil
+        if viewMode == "countries" and catalogState == "loading" and totalRows <= 1 then
+            statusMsg = "Loading station catalog..."
+        elseif viewMode == "stations" and selectedCountry and selectedCountry.key ~= "__presets__" then
+            local entry = countryCache[selectedCountry.key]
+            if not entry or entry.status == "loading" then
+                statusMsg = "Loading " .. selectedCountry.name .. " stations..."
+            elseif entry.status == "error" then
+                statusMsg = "Failed to load: " .. tostring(entry.err)
+            elseif totalRows == 0 then
+                statusMsg = "No stations match filter."
+            end
+        elseif totalRows == 0 then
+            statusMsg = "No matches."
+        end
+
+        if statusMsg then
+            if fontMed then render.setFont(fontMed) end
+            render.setColor(COL_TEXT_DIM)
+            render.drawSimpleText(x + pad + listW * 0.5, listY + listH * 0.5, statusMsg, 1, 1)
+        else
+            local startIdx = math.floor(scrollOffset) + 1
+            local endIdx = math.min(totalRows, startIdx + visibleRows - 1)
+            for idx = startIdx, endIdx do
+                local row = filteredRows[idx]
+                local ry = listY + 4 + (idx - startIdx) * rowStep
+                if ry + rowH > listY + listH then break end
+
+                local rx = x + pad + 4
+                local rw = listW - 8
+                local hovered = pointInRect(mx, my, rx, ry, rw, rowH)
+                local isPlayingThis = (row.kind == "station" and radioState.playing and radioState.url == row.url)
+
+                if isPlayingThis then
+                    render.setColor(COL_ROW_ACTIVE)
+                elseif hovered then
+                    render.setColor(COL_ROW_HOVER)
+                else
+                    render.setColor(COL_ROW)
+                end
+                drawBox(5, rx, ry, rw, rowH)
+
+                if isPlayingThis then
+                    render.setColor(COL_ACCENT)
+                    render.drawRect(rx, ry + 4, 4, rowH - 8)
+                end
+
+                if fontSmall then render.setFont(fontSmall) end
+                render.setColor(isPlayingThis and COL_ACCENT or COL_TEXT)
+                local label = row.name or ""
+                if #label > 44 then label = string.sub(label, 1, 41) .. "..." end
+                render.drawSimpleText(rx + 12, ry + rowH * 0.5, label, 0, 1)
+
+                if row.kind == "country" then
+                    if fontTiny then render.setFont(fontTiny) end
+                    render.setColor(COL_TEXT_DIM)
+                    render.drawSimpleText(rx + rw - 10, ry + rowH * 0.5, tostring(row.count) .. " >", 2, 1)
+                elseif isPlayingThis then
+                    if fontTiny then render.setFont(fontTiny) end
+                    render.setColor(COL_ACCENT)
+                    render.drawSimpleText(rx + rw - 10, ry + rowH * 0.5, streamPhase == "connecting" and "TUNING" or "PLAYING", 2, 1)
+                end
+
+                if clicked and hovered then
+                    if row.kind == "country" then
+                        selectedCountry = { key = row.key, name = row.name }
+                        viewMode = "stations"
+                        searchText = ""
+                        searchFocused = false
+                        fetchCountryStations(row.key)
+                        filteredDirty = true
+                    elseif row.kind == "station" then
+                        local cName = selectedCountry and selectedCountry.name or ""
+                        sendCmd(CMD_PLAY, row.url, row.name, cName)
+                    end
+                end
+            end
+        end
+
+        -- Scrollbar
+        local sbX = x + pad + listW + 6
+        render.setColor(COL_PANEL)
+        drawBox(4, sbX, listY, scrollBarW, listH)
+        if maxScroll > 0 then
+            local thumbH = math.max(24, math.floor(listH * (visibleRows / totalRows)))
+            local thumbY = listY + math.floor((scrollOffset / maxScroll) * (listH - thumbH))
+            local hoverSB = pointInRect(mx, my, sbX - 4, listY, scrollBarW + 8, listH)
+            if clicked and hoverSB then draggingScroll = true end
+            if draggingScroll and mouseDown then
+                local frac = math.clamp((my - listY - thumbH * 0.5) / math.max(1, listH - thumbH), 0, 1)
+                scrollOffset = math.round(frac * maxScroll)
+            end
+            render.setColor((hoverSB or draggingScroll) and COL_ACCENT or COL_ACCENT_DIM)
+            drawBox(4, sbX, thumbY, scrollBarW, thumbH)
+        end
+
+        -- Footer (Power/Stop + Volume Slider + Keybinds)
+        local footY = y + h - footerH
+        render.setColor(COL_PANEL)
+        drawBox(8, x + 1, footY, w - 2, footerH - 1)
+
+        -- Stop / Power button
+        local stopW, stopH = 104, 34
+        local stopX = x + pad
+        local stopY = footY + 12
+        local hoverStop = pointInRect(mx, my, stopX, stopY, stopW, stopH)
+        if radioState.playing then
+            render.setColor(hoverStop and COL_STOP_HOVER or COL_STOP)
+        else
+            render.setColor(hoverStop and COL_ACCENT or COL_PLAY)
+        end
+        drawBox(6, stopX, stopY, stopW, stopH)
+        if fontMed then render.setFont(fontMed) end
+        render.setColor(COL_TEXT)
+        render.drawSimpleText(stopX + stopW * 0.5, stopY + stopH * 0.5, radioState.playing and "STOP" or "POWER ON", 1, 1)
+        if clicked and hoverStop then
+            sendCmd(CMD_TOGGLE)
+        end
+
+        -- Volume slider
+        local slX = stopX + stopW + 18
+        local slW = w - (slX - x) - pad - 48
+        local slY = stopY + 14
+        local slH = 8
+        local hoverSlider = pointInRect(mx, my, slX - 6, slY - 10, slW + 12, slH + 20)
+        if clicked and hoverSlider then draggingSlider = true end
+        if draggingSlider and mouseDown then
+            local v = math.clamp((mx - slX) / math.max(1, slW), 0, 1)
+            local rounded = math.round(v * 20) / 20
+            if math.abs(rounded - radioState.volume) >= 0.04 then
+                radioState.volume = rounded
+                sendCmd(CMD_SETVOL, rounded)
+            end
+        end
+
+        render.setColor(COL_ROW)
+        drawBox(4, slX, slY, slW, slH)
+        render.setColor(COL_ACCENT)
+        drawBox(4, slX, slY, math.floor(slW * radioState.volume), slH)
+        local knobX = slX + math.floor(slW * radioState.volume)
+        render.setColor(COL_TEXT)
+        render.drawFilledCircle(knobX, slY + slH * 0.5, 7)
+
+        if fontSmall then render.setFont(fontSmall) end
+        render.setColor(COL_TEXT)
+        render.drawSimpleText(slX + slW + 10, slY + slH * 0.5, tostring(math.round(radioState.volume * 100)) .. "%", 0, 1)
+
+        -- Bottom hint bar
+        if fontTiny then render.setFont(fontTiny) end
+        render.setColor(COL_TEXT_DIM)
+        local hint = string.format(
+            "[%s] Menu   [%s] On/Off   [%s/%s] Volume   |   Chat: !radio <url>",
+            getKeyLabel(MenuKey, "N"),
+            getKeyLabel(ToggleKey, "B"),
+            getKeyLabel(VolDownKey, ","),
+            getKeyLabel(VolUpKey, ".")
+        )
+        render.drawSimpleText(x + w * 0.5, footY + footerH - 12, hint, 1, 1)
+
+        lastMouseLeft = mouseDown
+    end
+
+    return {
+        name = "VehicleRadio",
+        OnClientInit = function()
+            if setupPermissionRequest then
+                -- Only pass valid StarfallEx permission IDs (invalid IDs cause setupPermissionRequest to fail).
+                pcall(setupPermissionRequest, { "bass.loadURL" }, "Play Vehicle Radio audio streams.", true)
+            end
+
+            local function trySendBassPermPrompt()
+                if bassPermPrompted or not sendPermissionRequest then return false end
+                if not (render and render.isHUDActive and render.isHUDActive()) then return false end
+                if hasBassPermission(radioState.url ~= "" and radioState.url or nil) then
+                    needBassPermPrompt = false
+                    return false
+                end
+                local ok = pcall(sendPermissionRequest)
+                if ok then
+                    bassPermPrompted = true
+                    needBassPermPrompt = false
+                    return true
+                end
+                return false
+            end
+
+            -- SimcadeCore calls enableHud(ply, true) when a driver or passenger enters a seat,
+            -- which triggers hudconnected and lets sendPermissionRequest() open the prompt automatically.
+            hook.add("hudconnected", "SimcadeRadio_HudConn_" .. chipId, function()
+                bassPermPrompted = false
+                timer.simple(0.3, function()
+                    if radioState.playing and radioState.url ~= "" and not hasBassPermission(radioState.url) then
+                        needBassPermPrompt = true
+                        trySendBassPermPrompt()
+                    end
+                end)
+            end)
+
+            hook.add("permissionrequest", "SimcadeRadio_Perm_" .. chipId, function()
+                refreshPlay2DPermission()
+                if hasBassPermission(radioState.url ~= "" and radioState.url or nil) then
+                    needBassPermPrompt = false
+                end
+                if radioState.playing and radioState.url ~= "" and hasBassPermission(radioState.url) then
+                    if not (activeChannel and isValid(activeChannel)) then
+                        startStream(radioState.url, nil, false)
+                    end
+                end
+            end)
+
+            net.receive(NET_SEATS, function()
+                local b = net.readEntity()
+                local p = net.readEntity()
+                baseEnt = isValid(b) and b or nil
+                podEnt  = isValid(p) and p or nil
+                local count = net.readUInt(6)
+                vehicleSeats = {}
+                vehicleSeatSet = {}
+                for i = 1, count do
+                    local s = net.readEntity()
+                    if isValid(s) then
+                        vehicleSeats[#vehicleSeats + 1] = s
+                        vehicleSeatSet[s] = true
+                    end
+                end
+            end)
+
+            net.receive(NET_STATE, function()
+                local playing = net.readBool()
+                local volume  = net.readFloat()
+                local seq     = net.readUInt(16)
+                local name    = net.readString()
+                local url     = net.readString()
+                local country = net.readString()
+
+                local prevPlaying = radioState.playing
+                local prevURL     = radioState.url
+
+                radioState.playing = playing
+                radioState.volume  = math.clamp(volume, 0, 1)
+                radioState.seq     = seq
+                radioState.name    = name
+                radioState.url     = url
+                radioState.country = country
+                hudLastActivity    = timer.curtime()
+
+                if playing and url ~= "" then
+                    if (not prevPlaying) or prevURL ~= url or not (activeChannel and isValid(activeChannel)) then
+                        startStream(url)
+                    end
+                else
+                    stopAllAudio()
+                end
+            end)
+
+            local function requestSync()
+                pcall(function()
+                    net.start(NET_REQ)
+                    net.send()
+                end)
+            end
+            requestSync()
+            timer.simple(1.5, function()
+                if not isValid(baseEnt) then requestSync() end
+            end)
+
+            local function isCpuBusy(limit)
+                local qMax = quotaMax and quotaMax() or 0
+                if qMax <= 0 then return false end
+                if quotaTotalAverage and quotaTotalAverage() > qMax * limit then return true end
+                if quotaTotalUsed and quotaTotalUsed() > qMax * limit then return true end
+                if quotaAverage and quotaAverage() > qMax * limit then return true end
+                return false
+            end
+
+            hook.add("think", "SimcadeRadio_Think_" .. chipId, function()
+                if menuOpen and not canLocalPlayerControl() then
+                    setMenuOpen(false)
+                end
+                if not radioState.playing and #fadingChannels == 0 then
+                    return
+                end
+                local now = timer.curtime()
+                local dt = now - lastAudioTick
+                if dt < AUDIO_TICK_RATE then return end
+                lastAudioTick = now
+                if isCpuBusy(0.60) then return end
+                updateAudio(math.min(dt, 0.15), now)
+                if needBassPermPrompt and (not bassPermPrompted) and radioState.playing then
+                    trySendBassPermPrompt()
+                end
+            end)
+
+            hook.add("drawhud", "SimcadeRadio_HUD_" .. chipId, function()
+                if not menuOpen and not ShowNowPlayingHUD then return end
+                local sw, sh
+                if render.getResolution then
+                    sw, sh = render.getResolution()
+                elseif render.getGameResolution then
+                    sw, sh = render.getGameResolution()
+                end
+                if not sw or not sh then return end
+                drawNowPlayingBar(sw, sh)
+                drawMenu(sw, sh)
+            end)
+
+            hook.add("mouseWheeled", "SimcadeRadio_Wheel_" .. chipId, function(delta)
+                if not menuOpen then return end
+                scrollOffset = scrollOffset - delta * 3
+            end)
+
+            hook.add("inputPressed", "SimcadeRadio_KeyDown_" .. chipId, function(btn)
+                local lp = player()
+                if not isValid(lp) then return end
+                if lp:isTyping() then return end
+                if gui and gui.isConsoleVisible then
+                    local okC, cvis = pcall(gui.isConsoleVisible)
+                    if okC and cvis then return end
+                end
+
+                if KEY and (btn == KEY.LSHIFT or btn == KEY.RSHIFT) then
+                    keyHoldShift = true
+                end
+
+                -- Typing inside the menu search filter
+                if menuOpen and searchFocused then
+                    if KEY and btn == KEY.ESCAPE then
+                        searchFocused = false
+                        return
+                    elseif KEY and btn == KEY.BACKSPACE then
+                        if #searchText > 0 then
+                            searchText = string.sub(searchText, 1, #searchText - 1)
+                            filteredDirty = true
+                        end
+                        return
+                    elseif KEY and (btn == KEY.ENTER or btn == KEY.PAD_ENTER) then
+                        searchFocused = false
+                        return
+                    else
+                        local ch = KEY_CHAR_MAP[btn]
+                        if ch and #searchText < 32 then
+                            searchText = searchText .. (keyHoldShift and string.upper(ch) or ch)
+                            filteredDirty = true
+                        end
+                        return
+                    end
+                end
+
+                if menuOpen and KEY and btn == KEY.ESCAPE then
+                    setMenuOpen(false)
+                    return
+                end
+
+                if not canLocalPlayerControl() then return end
+
+                if MenuKey and btn == MenuKey then
+                    setMenuOpen(not menuOpen)
+                elseif ToggleKey and btn == ToggleKey then
+                    hudLastActivity = timer.curtime()
+                    sendCmd(CMD_TOGGLE)
+                elseif VolDownKey and btn == VolDownKey then
+                    hudLastActivity = timer.curtime()
+                    sendCmd(CMD_STEPVOL, -VolumeStep)
+                elseif VolUpKey and btn == VolUpKey then
+                    hudLastActivity = timer.curtime()
+                    sendCmd(CMD_STEPVOL, VolumeStep)
+                end
+            end)
+
+            hook.add("inputReleased", "SimcadeRadio_KeyUp_" .. chipId, function(btn)
+                if KEY and (btn == KEY.LSHIFT or btn == KEY.RSHIFT) then
+                    keyHoldShift = false
+                end
+            end)
+        end,
+        OnCleanup = function()
+            setMenuOpen(false)
+            stopAllAudio()
+            for i = 1, #fadingChannels do
+                stopChannelSafe(fadingChannels[i].ch)
+            end
+            fadingChannels = {}
+            hook.remove("think", "SimcadeRadio_Think_" .. chipId)
+            hook.remove("drawhud", "SimcadeRadio_HUD_" .. chipId)
+            hook.remove("mouseWheeled", "SimcadeRadio_Wheel_" .. chipId)
+            hook.remove("inputPressed", "SimcadeRadio_KeyDown_" .. chipId)
+            hook.remove("inputReleased", "SimcadeRadio_KeyUp_" .. chipId)
+            hook.remove("permissionrequest", "SimcadeRadio_Perm_" .. chipId)
+            hook.remove("hudconnected", "SimcadeRadio_HudConn_" .. chipId)
+        end,
+    }
+end

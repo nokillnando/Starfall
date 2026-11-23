@@ -5,10 +5,11 @@
 --@include simcadebase/addons/brake_temperature.txt
 --@include simcadebase/addons/backfire_antilag.txt
 --@include simcadebase/addons/seat_indicator.txt
+--@include simcadebase/addons/vehicle_radio.txt
 
 local CONFIG = {}
 -- Advance only after applying the required settings for the new config format.
-CONFIG.SCHEMA_VERSION = 3
+CONFIG.SCHEMA_VERSION = 4
 
 CONFIG.CORE_UPDATE = {
     enabled = true,
@@ -537,6 +538,10 @@ CONFIG.CONTROLS_CFG = {
     RearLock      = KEY.L,            -- Toggle Rear Diff Lock (when DiffLockToggleable = true)
     AllLock       = KEY.J,            -- Toggle All / Center Diff Lock (when DiffLockToggleable = true)
     Horn          = KEY.G,            -- Hold to sound horn (uses SOUND_CFG.Horn)
+    RadioMenu     = KEY.N,            -- Open / close Vehicle Radio station selector
+    RadioToggle   = KEY.B,            -- Toggle Vehicle Radio On / Off
+    RadioVolDown  = KEY.COMMA,        -- Decrease Vehicle Radio volume
+    RadioVolUp    = KEY.PERIOD,       -- Increase Vehicle Radio volume
 }
 
 CONFIG.CAMERA_CFG = {
@@ -1064,6 +1069,27 @@ CONFIG.ADDON_MODULES = {
             AllowEnterVehicle      = true,  -- Press [E] while aiming at a seat to enter via enterVehicle (when permitted)
             RequestEnterPermission = true,  -- Prompt once for player.enterVehicle permission if not yet granted
             -- SeatLabels     = { "Driver", "Shotgun", "Rear Left", "Rear Right" }, -- Optional custom names by seat order
+        },
+    },
+    {
+        file = "simcadebase/addons/vehicle_radio.txt",
+        enabled = true, -- rRadio-style vehicle radio with lazy-loaded country catalog + seamless Cabin <-> 3D audio
+        options = {
+            CatalogBaseURL       = "https://raw.githubusercontent.com/nokillnando/Starfall/main/simcadebase/radio_catalog",
+            DriverOnly           = true,  -- Only the driver can change stations / volume / power
+            DefaultVolume        = 0.65,  -- Initial radio volume (0.0 .. 1.0)
+            VolumeStep           = 0.10,  -- Volume step per RadioVolDown / RadioVolUp press
+            FullVolumeDistance   = 120,   -- 3D audio full-volume radius outside the vehicle (units)
+            MaxHearingDistance   = 950,   -- 3D audio max hearing distance outside the vehicle (units)
+            FalloffExponent      = 1.35,  -- Distance rolloff curve outside the vehicle
+            OcclusionEnabled     = true,  -- Attenuate 3D radio when behind walls/props
+            OcclusionGain        = 0.35,  -- Volume multiplier when occluded
+            SourceOffset         = Vector(0, 0, 20), -- Local offset on Base for 3D audio source
+            CrossfadeTime        = 0.35,  -- Fade duration (seconds) when switching or stopping stations
+            ShowNowPlayingHUD    = true,  -- Compact now-playing bar + 5-bar FFT equalizer in vehicle
+            HUDAutoHideSeconds   = 5.0,   -- Auto-hide HUD bar after N seconds (0 = always visible in vehicle)
+            RequestHUDPermission = true,  -- Prompt once for render.hud permission when opening the menu
+            EnableChatCommand    = true,  -- Allow driver to use !radio <url> [name], !radio stop, !radio vol <0-100>
         },
     },
 }
