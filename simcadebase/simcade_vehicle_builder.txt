@@ -189,8 +189,10 @@ function SimcadeVehicleBuilder.buildCarData(vehicleCfg, tireCfg, suspCfg, engine
         local row = 92 + 8 * axle
         local isFront = (axle == 0)
         local aSusp = getAxleSusp(isFront)
-        local rideH_m  = max(8, aSusp.rideHeight or 24) * IN_TO_M
-        local airTrav_m = max(0, (aSusp.airTravel ~= nil and aSusp.airTravel or 6) * IN_TO_M)
+        local rideH_in = max(8, aSusp.rideHeight or 24)
+        local airTrav_in = max(-(rideH_in - 2), aSusp.airTravel ~= nil and aSusp.airTravel or 6)
+        local rideH_m  = rideH_in * IN_TO_M
+        local airTrav_m = airTrav_in * IN_TO_M
         c[row + 5] = clamp(rideH_m * 0.95, 0.18, 1.50)
         c[row + 6] = -airTrav_m
     end

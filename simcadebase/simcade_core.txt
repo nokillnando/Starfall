@@ -1259,7 +1259,7 @@ function SimcadeCore.init(CONFIG)
         for index, w in ipairs(runtimeWheels) do
             local axleSusp = SimcadeSuspension.getAxleCfg(SUSPENSION_CFG, w.isFront)
             local rideHeight = math.max(8, axleSusp.rideHeight or 24)
-            local airTravel  = math.max(0, axleSusp.airTravel ~= nil and axleSusp.airTravel or 6)
+            local airTravel  = math.max(-(rideHeight - 2), axleSusp.airTravel ~= nil and axleSusp.airTravel or 6)
             w.rideHeight, w.airTravel = rideHeight, airTravel
 
             local radius = w.radius
@@ -1447,7 +1447,7 @@ function SimcadeCore.init(CONFIG)
             for _, w in ipairs(runtimeWheels) do
                 local axleSusp = SimcadeSuspension.getAxleCfg(SUSPENSION_CFG, w.isFront)
                 local bumpLim = math.max(4, axleSusp.bumpLimit or w.rideHeight or 24)
-                local airLim  = math.max(0, w.airTravel or 6)
+                local airLim  = (w.airTravel ~= nil) and w.airTravel or 6
                 local prevC   = w.prevCompIn or 0
                 local curC    = w.compIn or 0
                 if not w.soundReadyAt then w.soundReadyAt = nowSuspSnd + 0.4 end
@@ -1609,6 +1609,7 @@ function SimcadeCore.init(CONFIG)
                     suspParams.dt            = hSub
                     suspParams.arrestDt      = dt
                     suspParams.axleSusp      = w._axleSusp
+                    suspParams.weightShare   = w.isFront and (frontBias * 2) or ((1.0 - frontBias) * 2)
                     local _, force, rateK
                     if w.beamMate then
                         force, rateK = SimcadeSuspension.beamSeatForce(w, suspParams, rate, dvz, dwr, dwp)

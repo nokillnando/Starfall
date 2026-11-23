@@ -117,7 +117,9 @@ function P.initClient(cfg)
                 local idx = front and (w.pos.y < 0 and 1 or 0) or (w.pos.y < 0 and 2 or 3)
                 local axle = SimcadeSuspension.getAxleCfg(cfg.SUSPENSION_CFG, front)
                 local radius = w.radius or 15
-                local travel = math.max(8, axle.rideHeight or 24) + math.max(0, axle.airTravel or 6)
+                local rideH = math.max(8, axle.rideHeight or 24)
+                local airTrav = math.max(-(rideH - 2), axle.airTravel ~= nil and axle.airTravel or 6)
+                local travel = rideH + airTrav
                 local span = axle.solidAxle and math.clamp(axle.springSpanRatio or 0.75, 0, 1) or 1
                 mounts[i] = {
                     index = idx, radius = radius, width = w.width or 9, isRear = not front,

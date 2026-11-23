@@ -97,7 +97,9 @@ function SimcadeSuspension.travelCamber(cfg, compression, height, droop)
     local rest = height * clamp(cfg.restCompression or 0.45, 0.15, 0.85)
     local travel = compression - rest
     if travel < 0 then
-        return (cfg.droopCamberDeg or 0) * clamp(-travel / (rest + droop), 0, 1)
+        local span = rest + droop
+        if span <= 0.01 then return 0 end
+        return (cfg.droopCamberDeg or 0) * clamp(-travel / span, 0, 1)
     end
     local bump = math.min(cfg.bumpLimit or height, height - 2)
     if bump <= rest then return 0 end
@@ -499,7 +501,10 @@ function SimcadeSuspension.computeWheelForce(params)
         springForceV = springForceV + (cornerMassV * gravity * 0.65) * (over * over)
     end
 
-    local maxForceMult = (velComp <= 0) and 2.5 or 4.2
+    local weightShare = math.max(0.25, params.weightShare or 1.0)
+    local maxForceMult = (velComp <= 0)
+        and (2.5 * weightShare * math.max(1.0, math.sqrt(math.max(0.25, stiffnessMult))))
+        or  (4.2 * weightShare * math.max(1.0, stiffnessMult))
     springForceV = clamp(springForceV, 0, cornerMassV * gravity * maxForceMult)
 
     -- Inelastic bottom-out arrest in top 15% of travel: absorbs downward slam without rebounding upward
@@ -507,7 +512,7 @@ function SimcadeSuspension.computeWheelForce(params)
     if compIn > bumpStart and cornerVelZ < -5 then
         local arrestDt = math.max(0.001, params.arrestDt or dt)
         local arrestFrac = clamp((compIn - bumpStart) / math.max(1, rideHeight - bumpStart), 0.35, 1.0)
-        local arrestForce = clamp((-cornerVelZ) * cornerMassV / arrestDt, 0, cornerMassV * gravity * 10.0) * arrestFrac
+        local arrestForce = clamp((-cornerVelZ) * cornerMassV * weightShare / arrestDt, 0, cornerMassV * gravity * 10.0 * weightShare) * arrestFrac
         springForceV = springForceV + arrestForce
     end
 
