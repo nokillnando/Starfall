@@ -146,6 +146,37 @@ function SimcadeSuspension.solveBeam(left, right, cfg)
     return math.deg(math.asin(sinRoll))
 end
 
+-- World-space velocity of the supporting surface at the wheel's contact patch (Source in/s).
+-- Uses VPhysics point velocity for free props (zero lag) and local-point tracking for
+-- parented, frozen, or brush supports moved kinematically.
+function SimcadeSuspension.supportVelocity(w, dt)
+    local support = w.support
+    if not w.isGrounded or not support or not isValid(support) then
+        w.prevSupport, w.prevSupportLocal, w.prevSupportWorld = nil, nil, nil
+        return Vector(0, 0, 0)
+    end
+    local pos = w.contactPos
+    local kinematicVel
+    if w.prevSupport == support and w.prevSupportLocal and w.prevSupportWorld and dt > 0 then
+        kinematicVel = (support:localToWorld(w.prevSupportLocal) - w.prevSupportWorld) / dt
+    end
+    w.prevSupport = support
+    w.prevSupportLocal = support:worldToLocal(pos)
+    w.prevSupportWorld = pos
+
+    local parent = support.getParent and support:getParent()
+    local body = support.getPhysicsObject and support:getPhysicsObject()
+    if isValid(body) and (not body.isMoveable or body:isMoveable()) and not isValid(parent) then
+        local physVel = body:getVelocityAtPoint(pos)
+        if physVel:getLengthSqr() > 0.25 or not kinematicVel then
+            return physVel
+        end
+        return kinematicVel
+    end
+    if kinematicVel then return kinematicVel end
+    return (support.getVelocity and support:getVelocity()) or Vector(0, 0, 0)
+end
+
 -- Tangential contact impulses in Source units. Store anchors on the support so a
 -- stationary tire can ride a moving prop. Forces at the patches also resist yaw.
 function SimcadeSuspension.staticGripImpulse(w, tire, canPark, brake, forward, left, com, vel, omega, mass, brakeMass, scale, gravity, dt, base)
@@ -161,8 +192,7 @@ function SimcadeSuspension.staticGripImpulse(w, tire, canPark, brake, forward, l
     -- can move across a stationary wheel as the suspension settles on a curb.
     local tracked = anchored and base:localToWorld(w.restChassisPoint) or patch
     local anchor = anchored and (supportValid and support:localToWorld(w.restAnchor) or w.restAnchor) or patch
-    local supportVel = supportValid and support:getVelocity() or Vector()
-    if anchored and supportValid then supportVel = (anchor - w.lastRestWorld) / dt end
+    local supportVel = supportValid and (w.supportVel or (anchored and (anchor - w.lastRestWorld) / dt) or support:getVelocity()) or Vector()
     local velocity = vel + omega:cross(tracked - com) - supportVel
     velocity = velocity - n * velocity:dot(n)
     local heading = forward * (tire.axleY or 1) - left * (tire.axleX or 0)
@@ -207,7 +237,9 @@ function SimcadeSuspension.staticGripImpulse(w, tire, canPark, brake, forward, l
         anchor = tracked + lateral * (anchor - tracked):dot(lateral)
     end
     local err = anchor - tracked
-    local acceleration = err * (48 * dt) - velocity * (1 - math.exp(-18 * dt)) + Vector(0, 0, gravity * dt)
+    local posGain = math.min(6.0, 0.25 / dt)
+    local velGain = 1 - math.exp(-55 * dt)
+    local acceleration = err * posGain - velocity * velGain + Vector(0, 0, gravity * dt)
     local demand = acceleration * mass - w.suspImpulseVec * scale
     local targetX = fx
     local requestedX = fx
@@ -219,7 +251,8 @@ function SimcadeSuspension.staticGripImpulse(w, tire, canPark, brake, forward, l
     local bank = (Vector(0, 0, gravity * mass * dt) - w.suspImpulseVec * scale):dot(lateral)
     local spareAccel = math.max(0, sideLimit * knImpulse - math.abs(bank)) / (mass * dt)
     local captureSpeedSq = 2 * spareAccel * contactLength
-    local adhesion = clamp(1 - sideSpeed^2 / math.max(0.001, captureSpeedSq), 0, 1)
+    local sideRatioSq = sideSpeed^2 / math.max(0.001, captureSpeedSq)
+    local adhesion = clamp(1 - sideRatioSq * sideRatioSq, 0, 1)
     local requestedY = demand:dot(lateral) / knImpulse
     local targetY = clamp(requestedY, -sideLimit, sideLimit)
     local correction = rolling * (targetX - fx) + lateral * (targetY - fy)
@@ -244,7 +277,11 @@ function SimcadeSuspension.applyCurbBlock(phys, w, up, axle, dt, mass, wheels, g
     local side = up:cross(forward)
     local hub = w.mountPos + up * math.min(w.compIn - w.rideHeight, -2)
     local velocity = phys:getVelocityAtPoint(hub)
-    if w.support then velocity = velocity - w.support:getVelocity() end
+    if w.supportVel then
+        velocity = velocity - w.supportVel
+    elseif w.support then
+        velocity = velocity - w.support:getVelocity()
+    end
     local reachScale = math.max(0, cfg.curbProbeDistMult or 1)
     if reachScale == 0 then return end
     -- Include the lower end of this tick's travel when the tread has just

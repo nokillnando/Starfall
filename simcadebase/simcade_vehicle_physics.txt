@@ -182,7 +182,7 @@ function M.new(data)
         local W = { i = i, o = o, tire = tire, radius = c[o + 4], I = 0.0015, w = 0, ang = 0, T = 0, locked = 0, dir = 1, slip = 0, slip364 = 0, contact = 0, avgT = 0, Fx = 0, Fy = 0,
             world = vec(0, 0, 0), pt = vec(0, 0, 0), n = vec(0, 0, 1), load = 0, sliding = 0, brk = 0, hbk = 0, grip = 1, perf = 1, vel = vec(0, 0, 0),
             basis = { [0] = 1, 0, 0, 0, 1, 0, 0, 0, 1 }, at = vec(0, 0, 0), M = { [0] = 1, 0, 0, 1 }, slipX = 0, slipY = 0, usage = 0, surface = 1, bumpZ = 0,
-            ground = { p = vec(0, 0, 0), n = vec(0, 0, 1), s = 1 } }
+            ground = { p = vec(0, 0, 0), n = vec(0, 0, 1), v = vec(0, 0, 0), s = 1 } }
         W.su = { i = i, row = su, x = 0, mount = vec(c[o] - c[0], c[o + 1] - c[1], c[o + 2] - c[2]), mountZ = c[o + 2], ["local"] = vec(0, 0, 0) }
         self.wheels[i] = W
     end
@@ -837,14 +837,19 @@ function Chassis:integrate(h)
         local v19 = -curve(self.T.ang_damp, wl)
         dL[0] = dL[0] + v19 * self.L[0]; dL[1] = dL[1] + v19 * self.L[1]; dL[2] = dL[2] + v19 * self.L[2]
     end
-    local v29 = len(v0) / 4
+    local gv = self.groundVel
+    local rvx, rvy, rvz = v0[0] - (gv and gv[0] or 0), v0[1] - (gv and gv[1] or 0), v0[2] - (gv and gv[2] or 0)
+    local v29 = sqrt(rvx * rvx + rvy * rvy + rvz * rvz) / 4
     local v21 = wl / 2
     if v21 > v29 then v29 = v21 end
     local dE = curve(self.T.rest, v29) <= self.E and -10 or 0.10000000149011612
     if self.damp336 ~= 0 then
         local a, b = -(2 * self.E), -(8 * self.E)
         dL[0] = dL[0] + a * self.L[0]; dL[1] = dL[1] + a * self.L[1]; dL[2] = dL[2] + a * self.L[2]
-        dP[0] = dP[0] + b * self.P[0]; dP[1] = dP[1] + b * self.P[1]; dP[2] = dP[2] + b * self.P[2]
+        local gm = self.m
+        dP[0] = dP[0] + b * (self.P[0] - gm * (gv and gv[0] or 0))
+        dP[1] = dP[1] + b * (self.P[1] - gm * (gv and gv[1] or 0))
+        dP[2] = dP[2] + b * (self.P[2] - gm * (gv and gv[2] or 0))
     end
     if self.limit512 ~= 0 then
         if clamp(self.Tq[2], -self.limit512, self.limit512) ~= self.Tq[2] then
@@ -1018,8 +1023,15 @@ function Chassis:postSusp(W)
     M2[0], M2[1], M2[2], M2[3] = ca, sa, -sa, ca
     local r0, r1, r2 = sl[0] * R[0] + sl[1] * R[3] + sl[2] * R[6], sl[0] * R[1] + sl[1] * R[4] + sl[2] * R[7], sl[0] * R[2] + sl[1] * R[5] + sl[2] * R[8]
     local w, v = self.w, self.v
+    local gv = G.v
     local wv = W.vel
-    wv[0], wv[1], wv[2] = (w[1] * r2 - w[2] * r1) + v[0], (w[2] * r0 - w[0] * r2) + v[1], (w[0] * r1 - w[1] * r0) + v[2]
+    if gv then
+        wv[0] = (w[1] * r2 - w[2] * r1) + v[0] - gv[0]
+        wv[1] = (w[2] * r0 - w[0] * r2) + v[1] - gv[1]
+        wv[2] = (w[0] * r1 - w[1] * r0) + v[2] - gv[2]
+    else
+        wv[0], wv[1], wv[2] = (w[1] * r2 - w[2] * r1) + v[0], (w[2] * r0 - w[0] * r2) + v[1], (w[0] * r1 - w[1] * r0) + v[2]
+    end
     local nsa = -sa
     local B = W.basis
     B[0], B[1], B[2] = ca * R[0] + sa * R[3] + 0 * R[6], ca * R[1] + sa * R[4] + 0 * R[7], ca * R[2] + sa * R[5] + 0 * R[8]
@@ -1682,8 +1694,10 @@ function Chassis:state(dt)
     local g0, g1, g2 = v[0] * R[0] + v[1] * R[3] + v[2] * R[6], v[0] * R[1] + v[1] * R[4] + v[2] * R[7], v[0] * R[2] + v[1] * R[5] + v[2] * R[8]
     local Ps, pos = self.Pos, self.pos
     Ps[0], Ps[1], Ps[2] = pos[0] - g0, pos[1] - g1, pos[2] - g2
-    self.speed = len(self.v)
-    self.forward = self.v[2] * R[2] + self.v[1] * R[1] + self.v[0] * R[0]
+    local gv = self.groundVel
+    local rvx, rvy, rvz = self.v[0] - (gv and gv[0] or 0), self.v[1] - (gv and gv[1] or 0), self.v[2] - (gv and gv[2] or 0)
+    self.speed = sqrt(rvx * rvx + rvy * rvy + rvz * rvz)
+    self.forward = rvz * R[2] + rvy * R[1] + rvx * R[0]
     local g = 0
     do local i = 0
         if self.wheels[i].contact ~= 0 then g = g + 1 end
@@ -2298,6 +2312,7 @@ local function initializeVehiclePhysicsBridge(PhysicsApi)
         self._vphysMode = true
 
         -- 1. Update wheel ground planes from Base raycasts
+        local gvx, gvy, gvz, gvc = 0, 0, 0, 0
         if wheelGrounds then
             for i = 0, 3 do
                 local g = wheelGrounds[i]
@@ -2305,10 +2320,26 @@ local function initializeVehiclePhysicsBridge(PhysicsApi)
                     local wg = self.wheels[i].ground
                     wg.p[0], wg.p[1], wg.p[2] = g.p[0], g.p[1], g.p[2]
                     wg.n[0], wg.n[1], wg.n[2] = g.n[0], g.n[1], g.n[2]
+                    local gv = g.v
+                    if gv then
+                        wg.v[0], wg.v[1], wg.v[2] = gv[0], gv[1], gv[2]
+                    else
+                        wg.v[0], wg.v[1], wg.v[2] = 0, 0, 0
+                    end
                     wg.s = g.s or 1
                     wg.matType = g.matType
+                    if wg.s ~= 0 then
+                        gvx, gvy, gvz = gvx + wg.v[0], gvy + wg.v[1], gvz + wg.v[2]
+                        gvc = gvc + 1
+                    end
                 end
             end
+        end
+        if not self.groundVel then self.groundVel = { [0] = 0, 0, 0 } end
+        if gvc > 0 then
+            self.groundVel[0], self.groundVel[1], self.groundVel[2] = gvx / gvc, gvy / gvc, gvz / gvc
+        else
+            self.groundVel[0], self.groundVel[1], self.groundVel[2] = 0, 0, 0
         end
 
         -- 2. Copy GMod VPhysics rigid-body pose and velocity into the solver body
@@ -2316,8 +2347,9 @@ local function initializeVehiclePhysicsBridge(PhysicsApi)
         for k = 0, 8 do self.R[k] = R[k] end
         self.v[0], self.v[1], self.v[2] = vel_m[0], vel_m[1], vel_m[2]
         self.w[0], self.w[1], self.w[2] = angVel_rad[0], angVel_rad[1], angVel_rad[2]
-        self.speed = sqrt(self.v[0] * self.v[0] + self.v[1] * self.v[1] + self.v[2] * self.v[2])
-        self.forward = self.v[0] * R[0] + self.v[1] * R[1] + self.v[2] * R[2]
+        local rvx, rvy, rvz = self.v[0] - self.groundVel[0], self.v[1] - self.groundVel[1], self.v[2] - self.groundVel[2]
+        self.speed = sqrt(rvx * rvx + rvy * rvy + rvz * rvz)
+        self.forward = rvx * R[0] + rvy * R[1] + rvz * R[2]
 
         local groundedHint = 0
         for i = 0, 3 do

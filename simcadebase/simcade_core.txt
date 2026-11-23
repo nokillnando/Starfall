@@ -1344,6 +1344,7 @@ function SimcadeCore.init(CONFIG)
             if w.isGrounded then
                 groundedCount = groundedCount + 1
                 if w.inWater then waterWheelsCount = waterWheelsCount + 1 end
+                w.supportVel = SimcadeSuspension.supportVelocity(w, dt)
                 if not isPhysgunHeld then
                     SimcadeSuspension.applyCurbBlock(Phys, w, driverUp, w.curbAxle, dt, physMass, numWheels, gravity, SUSPENSION_CFG, traceFilter)
                 else
@@ -1352,12 +1353,15 @@ function SimcadeCore.init(CONFIG)
             else
                 w.curbNormal, w.curbRoadPoint = nil, nil
                 w.inWater, w.support, w.upAlign, w.surfId = false, nil, 1, 0
+                w.supportVel = SimcadeSuspension.supportVelocity(w, dt)
             end
             local gp = w.solverGround or (w.mountPos - driverUp * 4000)
             local gn = w.isGrounded and w.hitNormal or driverUp
+            local gv = w.supportVel
             wheelGrounds[w.physicsIndex] = {
                 p = { [0] = gp.x * IN_TO_M, gp.y * IN_TO_M, gp.z * IN_TO_M },
                 n = { [0] = gn.x, gn.y, gn.z },
+                v = gv and { [0] = gv.x * IN_TO_M, gv.y * IN_TO_M, gv.z * IN_TO_M } or { [0] = 0, 0, 0 },
                 s = w.surfId or 0, matType = w.matType,
             }
         end
@@ -1508,10 +1512,8 @@ function SimcadeCore.init(CONFIG)
                 maxSpringFrequency = math.max(maxSpringFrequency, math.sqrt(math.max(0, stiffness) * gravity / deflection))
                 local c0 = w.compIn or 0
                 local patchVelocity = velWorld + angVelWorldRad:cross(w.contactPos - comWorld)
-                if w.support then
-                    local body = w.support:getPhysicsObject()
-                    local supportVelocity = isValid(body) and body:getVelocityAtPoint(w.contactPos) or w.support:getVelocity()
-                    patchVelocity = patchVelocity - supportVelocity
+                if w.supportVel then
+                    patchVelocity = patchVelocity - w.supportVel
                 end
                 -- A switch from the curb top to the pavement changes spring travel
                 -- instantly. Only motion into the current surface drives the damper.
@@ -1770,7 +1772,7 @@ function SimcadeCore.init(CONFIG)
             local yawDeltaLocal = Base:worldToLocalVector(driverUp * physicsStep.dw_yaw_rad) * (180 / math.pi)
             local deltaAngVel = rollDamping + resolvedLocalRight * dampPitch + yawDeltaLocal
 
-            if #groundedSuspWheels >= 3 and math.abs(steerInput) < 0.05 and rawHandbrake < 0.1 and kmh > 8 then
+            if #groundedSuspWheels >= 3 and math.abs(steerInput) < 0.05 and rawHandbrake < 0.1 and (physicsStep.speed_ms or 0) * 3.6 > 8 then
                 local yawStabRate = (STEERING_CFG.yawStabilityAssist or 0.38) * 4.5
                 deltaAngVel.z = deltaAngVel.z - angVelLocal.z * (1.0 - math.exp(-yawStabRate * dt))
             end
