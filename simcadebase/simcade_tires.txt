@@ -205,30 +205,34 @@ function SimcadeTires.buildAxleSpec(axleCfg, compoundName, cornerLoadKN, tireCfg
         return merged
     end
 
-    local widthMm = (axleCfg and axleCfg.Width) or 245
-    local direct  = (tireCfg and tireCfg.UseDirectMultipliers) and true or false
-    local ovDef   = direct and 1.0 or 1.38
-    local laDef   = direct and 1.0 or 1.25
-    local loDef   = direct and 1.0 or 1.35
-    local glOv    = (tireCfg and (tireCfg.Grip or tireCfg.OverallGripMultiplier)) or 1.0
-    local glLa    = (tireCfg and (tireCfg.LateralGrip or tireCfg.LateralGripMultiplier)) or 1.0
-    local glLo    = (tireCfg and (tireCfg.LongitudinalGrip or tireCfg.LongitudinalGripMultiplier)) or 1.0
-    local ovMult  = (axleCfg and (axleCfg.Grip or axleCfg.OverallGripMultiplier)) or ovDef
-    local laMult  = (axleCfg and (axleCfg.LateralGrip or axleCfg.LateralGripMultiplier)) or laDef
-    local loMult  = (axleCfg and (axleCfg.LongitudinalGrip or axleCfg.LongitudinalGripMultiplier)) or loDef
-    local gBias   = (axleCfg and axleCfg.GripBias) or 1.0
+    local widthMm     = (axleCfg and axleCfg.Width) or 245
+    local aspectVal   = (axleCfg and (axleCfg.Aspect or axleCfg.AspectRatio)) or 50
+    local aspectStiff = 50 / math.max(10, aspectVal)
+    local direct      = (tireCfg and tireCfg.UseDirectMultipliers) and true or false
+    local ovDef       = direct and 1.0 or 1.38
+    local laDef       = direct and 1.0 or 1.25
+    local loDef       = direct and 1.0 or 1.35
+    local glOv        = (tireCfg and (tireCfg.Grip or tireCfg.OverallGripMultiplier)) or 1.0
+    local glLa        = (tireCfg and (tireCfg.LateralGrip or tireCfg.LateralGripMultiplier)) or 1.0
+    local glLo        = (tireCfg and (tireCfg.LongitudinalGrip or tireCfg.LongitudinalGripMultiplier)) or 1.0
+    local ovMult      = (axleCfg and (axleCfg.Grip or axleCfg.OverallGripMultiplier)) or ovDef
+    local laMult      = (axleCfg and (axleCfg.LateralGrip or axleCfg.LateralGripMultiplier)) or laDef
+    local loMult      = (axleCfg and (axleCfg.LongitudinalGrip or axleCfg.LongitudinalGripMultiplier)) or loDef
+    local gBias       = (axleCfg and axleCfg.GripBias) or 1.0
 
     local widthFactor = clamp((widthMm / 245) ^ 0.18, 0.88, 1.15)
     local baseFactor  = widthFactor * gBias
+    local latStiff    = aspectStiff
+    local longStiff   = (1.0 + (aspectStiff - 1.0) * 0.5) * math.sqrt(math.max(0.5, widthFactor))
 
     return {
         compoundName    = cName,
         CoF             = pick("CoF", 1.72),
-        Lat_B           = pick("Lat_B", 10.0),
+        Lat_B           = pick("Lat_B", 10.0) * latStiff,
         Lat_C           = pick("Lat_C", 1.35),
         Lat_E           = pick("Lat_E", 0.10),
         camberStiffness = math.max(0, pick("CamberStiffness", 0.65)),
-        Long_B          = pick("Long_B", 12.0),
+        Long_B          = pick("Long_B", 12.0) * longStiff,
         Long_C          = pick("Long_C", 1.55),
         Long_E          = pick("Long_E", 0.60),
         LoadSens        = pick("LoadSens", 0.12),

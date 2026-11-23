@@ -42,7 +42,6 @@ function SimcadeCore.init(CONFIG)
     local AERO_CFG       = CONFIG.AERO_CFG or {}
     local WHEELS         = CONFIG.WHEELS or {}
     local WHEEL_DEFAULTS = CONFIG.WHEEL_DEFAULTS or {}
-    local REVERSE_CFG    = CONFIG.REVERSE_CFG or {}
     local CONTROLS_CFG   = CONFIG.CONTROLS_CFG or {}
     local CAMERA_CFG     = CONFIG.CAMERA_CFG or {}
     local ACTIVE_DIFF_CFG = CONFIG.ACTIVE_DIFF_CFG or {}

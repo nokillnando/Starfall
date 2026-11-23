@@ -1842,23 +1842,28 @@ local function initializeVehiclePhysicsBridge(PhysicsApi)
         car.fwdGearSpeeds          = (engineCfg and (engineCfg.ForwardGearSpeeds or engineCfg.GearSpeeds)) or nil
         car.gearSpeeds             = (engineCfg and engineCfg.gearSpeeds) or nil
         car.reverseGearSpeeds      = data.reverseGearSpeeds
+        local function normLockRatio(val, def)
+            val = tonumber(val)
+            if not val then return def end
+            return clamp((val > 1) and (val / 100) or val, 0, 1)
+        end
         car.frontDiffType     = (engineCfg and engineCfg.FrontDiffType ~= nil) and engineCfg.FrontDiffType or 1
         car.frontLSDStiffness = (engineCfg and engineCfg.FrontLSDStiffness) or 3.0
-        car.frontLSDLockRatio = ((engineCfg and engineCfg.FrontLSDLockRatio) or 90) / 100
+        car.frontLSDLockRatio = normLockRatio(engineCfg and engineCfg.FrontLSDLockRatio, 0.90)
         car.frontLSDPreload   = (engineCfg and engineCfg.FrontLSDPreload) or 15.0
         car.rearDiffType      = (engineCfg and engineCfg.RearDiffType ~= nil) and engineCfg.RearDiffType or 1
         car.rearLSDStiffness  = (engineCfg and engineCfg.RearLSDStiffness) or 3.0
-        car.rearLSDLockRatio  = ((engineCfg and engineCfg.RearLSDLockRatio) or 90) / 100
+        car.rearLSDLockRatio  = normLockRatio(engineCfg and engineCfg.RearLSDLockRatio, 0.90)
         car.rearLSDPreload    = (engineCfg and engineCfg.RearLSDPreload) or 15.0
         car.centerDiffType    = (engineCfg and engineCfg.CenterDiffType ~= nil) and engineCfg.CenterDiffType or 0
         car.diffLockCfg       = {
             toggleable     = (not engineCfg) or (engineCfg.DiffLockToggleable ~= false),
             frontType      = (engineCfg and engineCfg.FrontLockType) or 2,
             frontStiffness = (engineCfg and engineCfg.FrontLockStiffness) or 30.0,
-            frontRatio     = ((engineCfg and engineCfg.FrontLockRatio) or 95) / 100,
+            frontRatio     = normLockRatio(engineCfg and engineCfg.FrontLockRatio, 0.95),
             rearType       = (engineCfg and engineCfg.RearLockType) or 2,
             rearStiffness  = (engineCfg and engineCfg.RearLockStiffness) or 30.0,
-            rearRatio      = ((engineCfg and engineCfg.RearLockRatio) or 95) / 100,
+            rearRatio      = normLockRatio(engineCfg and engineCfg.RearLockRatio, 0.95),
             centerType     = (engineCfg and engineCfg.CenterLockType) or 2,
         }
         car.frontLockActive    = false

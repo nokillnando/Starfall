@@ -29,9 +29,6 @@ CONFIG.VEHICLE_CFG = {
                                             -- X/Y/Z are prop-local axes. Higher values resist rotation around that axis.
     frontWeightBias             = 0.65,
     chassisForward              = Vector(1, 0, 0),
-    InvertForward               = false,
-    InvertRight                 = false,
-    AutoAlignToPod              = false,
     comOffset                   = Vector(0, 0, 0),       -- Shifts the wheel/suspension origin relative to the Base prop's mass center (Source units: X=fwd, Y=left, Z=up). Does not move GMod's VPhysics COM; use frontWeightBias / centerOfMassHeight / CGHeight for weight balance.
     angularDrag                 = Vector(3.6, 3.8, 0), -- Chassis roll (X) and pitch (Y) damping (scaled 0.55 on ground, 0.15 airborne). Z is unused (yaw damping uses STEERING_CFG.yawStabilityAssist).
 
@@ -205,7 +202,6 @@ local MAT_DIRT       = 68
 local MAT_FLESH      = 70
 local MAT_GRATE      = 71
 local MAT_ALIENFLESH = 72
-local MAT_CLIP       = 73
 local MAT_SNOW       = 74
 local MAT_PLASTIC    = 76
 local MAT_METAL      = 77
@@ -227,16 +223,12 @@ CONFIG.TIRE_CFG = {
     LateralGrip          = 1.00,      -- Lateral cornering grip multiplier
     LongitudinalGrip     = 1.00,      -- Acceleration/braking grip multiplier
     GripDampingFactor    = 1.18,
-    SlipAnglePeak        = 9.5,       -- Peak lateral slip angle (deg)
-    BrakeTransferFactor    = 5.6,       -- Weight transfer % to front tires during braking
-    ThrottleTransferFactor = 20.4,      -- Weight transfer % to rear tires during acceleration
     RollingResistance      = 0.015,     -- Rolling drag coefficient
     ConstraintRefreshInterval = 60.0, -- Re-scan base constraints, parents & children this often (seconds)
 
     Front = {
         Width            = 185,
-        Aspect           = 55,
-        Radius           = 11,
+        Aspect           = 55,        -- Sidewall profile % (50 = baseline; lower = stiffer/snappier Lat_B & Long_B, higher = softer)
         LateralGrip      = 1.15,
         LongitudinalGrip = 1.15,
         GripBias         = 1.0,
@@ -244,7 +236,6 @@ CONFIG.TIRE_CFG = {
     Rear = {
         Width            = 185,
         Aspect           = 55,
-        Radius           = 11,
         LateralGrip      = 1.15,
         LongitudinalGrip = 1.0,
         GripBias         = 1,
@@ -299,7 +290,7 @@ CONFIG.TIRE_CFG = {
         [MAT_GRASS]      = 5.50,
         [MAT_SNOW]       = 8.00,
         [MAT_SAND]       = 10.00,
-        [83]             = 10.00, -- MAT_SLOSH (Water)
+        [MAT_SLOSH]      = 10.00, -- Water
         Default          = 1.00,
     },
 }
@@ -405,7 +396,6 @@ CONFIG.ENGINE_CFG = {
     StartRunning       = false,
     crankRPM           = 320,
     crankTime          = 0.65,
-    crankFuelTime      = 0.15,
 
     -- ------------------------------------------------------------------------
     -- 3. Transmission & Gear Ratios
@@ -414,7 +404,6 @@ CONFIG.ENGINE_CFG = {
     ClassicAuto         = false,      -- Start in Park. GearUp/GearDown step through P, R, N, D. False enables pedal-selected direction.
     SpeedToReverse      = 5,         -- km/h limit for selecting Park or Reverse
     ReverseWSonReverse  = false,      -- In PRND Reverse, S accelerates and W brakes. False keeps W as throttle.
-    UseRPMBasedGear     = true,
     AlwaysSportMode     = true,
     ComfortUpshiftRPM   = 62,        -- % of redline
     ComfortDownshiftRPM = 34,
@@ -435,18 +424,14 @@ CONFIG.ENGINE_CFG = {
     -- 4. Differentials & Torque Vectoring
     -- ------------------------------------------------------------------------
     PowerDistribution   = 100,         -- 0 = RWD, 100 = FWD, 50 = AWD, 35 = 35/65 AWD
-    FrontDiffType       = 0,         -- 0 = Open, 1 = Viscous LSD, 2 = Locked
-    FrontDiffType       = 0,                -- 0 = Open, 1 = LSD, 2 = Locked
-    FrontLSDStiffness   = 3.0,              -- Front LSD ramp stiffness (higher = locks faster on wheel speed diff)
-    FrontLSDLockRatio   = 0.75,             -- Front LSD max torque/speed lock ratio (0..1)
-    RearDiffType        = 0,                -- 0 = Open, 1 = LSD, 2 = Locked
-    RearLSDStiffness    = 3.0,              -- Rear LSD ramp stiffness (higher = locks faster on wheel speed diff)
-    RearLSDLockRatio    = 0.75,             -- Rear LSD max torque/speed lock ratio (0..1)
-    CenterDiffType      = 0,                -- 0 = Open, 1 = LSD, 2 = Locked (AWD)
-    DiffLockToggleable  = true,             -- Allow K/L/J diff-lock toggles
-    CenterDiffType      = 0,
-    DiffLockToggleable  = false,     -- Allow K/L/J keys to toggle Front/Rear/All diff locks
-    TorqueVectoring     = 0.18,
+    FrontDiffType       = 0,           -- 0 = Open, 1 = Viscous LSD, 2 = Locked
+    FrontLSDStiffness   = 3.0,         -- Front LSD ramp stiffness (higher = locks faster on wheel speed diff)
+    FrontLSDLockRatio   = 0.75,        -- Front LSD max torque/speed lock ratio (0..1)
+    RearDiffType        = 0,           -- 0 = Open, 1 = Viscous LSD, 2 = Locked
+    RearLSDStiffness    = 3.0,         -- Rear LSD ramp stiffness (higher = locks faster on wheel speed diff)
+    RearLSDLockRatio    = 0.75,        -- Rear LSD max torque/speed lock ratio (0..1)
+    CenterDiffType      = 0,           -- 0 = Open, 1 = LSD, 2 = Locked (AWD)
+    DiffLockToggleable  = false,       -- Allow K/L/J keys to toggle Front/Rear/All diff locks
 
     -- ------------------------------------------------------------------------
     -- 5. Clutch & Braking (Engine Braking, Service Brakes, ABS, Handbrake)
@@ -513,11 +498,6 @@ CONFIG.ENGINE_CFG = {
     Supercharger_DriveLoss = 0.08,      -- Fraction of boosted engine torque consumed at maximum boost
 }
 
-CONFIG.REVERSE_CFG = {
-    MaxReverseEngageKMH  = 18,
-    MaxForwardEngageKMH  = 20,
-}
-
 -- ============================================================================
 -- Driver controls, camera and HUD
 -- ============================================================================
@@ -550,7 +530,6 @@ CONFIG.CAMERA_CFG = {
     fpvEnabled              = true,
     freecamEnabled          = false,     -- Optional 360° orbit freecam mode for driver (no auto-recenter)
     defaultMode             = 1,         -- 0 = Off, 1 = Chase Cam, 2 = FPV, 3 = Freecam (Press [V] in seat to cycle)
-    toggleKey               = KEY.V,
     maxDist                 = 190,
     minDist                 = 160,
     heightOffset            = 55,
@@ -774,7 +753,7 @@ CONFIG.SOUND_CFG = {
             skid = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/railway_skid_lateral.ogg", pitchMin = 0.85, pitchMax = 1.30, volume = 1.65 },
             roll = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/roll_rail_02.ogg", pitchMin = 0.70, pitchMax = 1.35, volume = 1.35 },
         },
-        [88] = {
+        [MAT_DEFAULT] = {
             name = "default_gmod",
             skid = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/tire_asphalt_lockup.ogg", pitchMin = 0.85, pitchMax = 1.25, volume = 1.70, pitchExp = 15 },
             roll = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/tyres_asphalt_roll_smooth.ogg", pitchMin = 0.65, pitchMax = 1.45, volume = 0.75 },
@@ -837,7 +816,7 @@ CONFIG.SKID_CFG = {
         [MAT_TILE]     = { name = "tile",         CreateMarks = true,  SkidColor = Color(50, 50, 50, 170),   SkidWidthMul = 1.0, StrengthMul = 1.0 },
         [MAT_GRASS]    = { name = "grass",        CreateMarks = true,  SkidColor = Color(45, 65, 28, 120),   SkidWidthMul = 1.0, StrengthMul = 1.0 },
         [MAT_WOOD]     = { name = "wood",         CreateMarks = true,  SkidColor = Color(60, 60, 60, 140),   SkidWidthMul = 1.0, StrengthMul = 1.0 },
-        [88]           = { name = "default_gmod", CreateMarks = true,  SkidColor = Color(20, 20, 20, 170),   SkidWidthMul = 1.0, StrengthMul = 1.0 },
+        [MAT_DEFAULT]  = { name = "default_gmod", CreateMarks = true,  SkidColor = Color(20, 20, 20, 170),   SkidWidthMul = 1.0, StrengthMul = 1.0 },
     },
 }
 
@@ -920,7 +899,7 @@ CONFIG.EFFECT_CFG = {
             },
         },
         [MAT_GRATE] = { name = "grate", enabled = false },
-        [88] = {
+        [MAT_DEFAULT] = {
             name = "default_gmod",
             skid = {
                 enabled = true, spawnOnSkid = true,

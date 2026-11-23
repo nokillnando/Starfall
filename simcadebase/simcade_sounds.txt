@@ -705,11 +705,12 @@ function SimcadeSounds.initClient(cfg)
                 playOneShot(engEnt, engPos, SND.GearChange, shiftPath, 0.50, 100)
             end
             local bovThreshold = math.max(0, tonumber(ENG.Turbo_BOVThresholdPSI) or 3.5)
+            local bovPitch = clamp(102 * (SND.TurboBOVPitch or 1.0), 40, 220)
             if turboEnabled and bovPath ~= "" and not pendingBovSound and now >= math.max(predictedBovUntil, confirmedBovUntil)
                 and previousPrediction.result.throttle > 0.45 and throttle < 0.20
                 and previousPrediction.turboPSI > bovThreshold then
                 predictedBovUntil = now + confirmationWindow
-                playOneShot(engEnt, engPos, SND.TurboBOV, bovPath, SND.TurboBOVVolume or 0.65, 102)
+                playOneShot(engEnt, engPos, SND.TurboBOV, bovPath, SND.TurboBOVVolume or 0.65, bovPitch)
             end
         end
         previousPrediction = pred
@@ -723,7 +724,8 @@ function SimcadeSounds.initClient(cfg)
         if pendingBovSound then
             pendingBovSound = false
             if now >= predictedBovUntil then
-                playOneShot(engEnt, engPos, SND.TurboBOV, bovPath, SND.TurboBOVVolume or 0.65, 102)
+                local bovPitch = clamp(102 * (SND.TurboBOVPitch or 1.0), 40, 220)
+                playOneShot(engEnt, engPos, SND.TurboBOV, bovPath, SND.TurboBOVVolume or 0.65, bovPitch)
             end
             predictedBovUntil = 0
             confirmedBovUntil = now + confirmationWindow
