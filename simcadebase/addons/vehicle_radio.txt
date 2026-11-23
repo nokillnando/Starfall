@@ -68,8 +68,9 @@ return function(options, config)
 
     local CatalogBaseURL       = tostring(options.CatalogBaseURL or "https://raw.githubusercontent.com/nokillnando/Starfall/main/simcadebase/radio_catalog"):gsub("/+$", "")
     local DriverOnly           = options.DriverOnly ~= false
-    local DefaultVolume        = math.clamp(tonumber(options.DefaultVolume) or 0.65, 0, 1)
-    local VolumeStep           = math.clamp(tonumber(options.VolumeStep) or 0.10, 0.01, 0.5)
+    local MaxVolume            = clamp(tonumber(options.MaxVolume) or 2.5, 0.5, 5.0)
+    local DefaultVolume        = clamp(tonumber(options.DefaultVolume) or 1.0, 0, MaxVolume)
+    local VolumeStep           = clamp(tonumber(options.VolumeStep) or 0.10, 0.01, 0.5)
     local FullVolumeDistance   = math.max(tonumber(options.FullVolumeDistance) or 120, 10)
     local MaxHearingDistance   = math.max(tonumber(options.MaxHearingDistance) or 950, FullVolumeDistance + 10)
     local FalloffExponent      = math.max(tonumber(options.FalloffExponent) or 1.35, 0.1)
@@ -79,6 +80,8 @@ return function(options, config)
     local CrossfadeTime        = math.max(tonumber(options.CrossfadeTime) or 0.35, 0.02)
     local ShowNowPlayingHUD    = options.ShowNowPlayingHUD ~= false
     local HUDAutoHideSeconds   = math.max(tonumber(options.HUDAutoHideSeconds) or 5.0, 0)
+    local ShowChipPermHint     = options.ShowChipPermHint ~= false
+    local ChipPermHintMaxDist  = math.max(tonumber(options.ChipPermHintMaxDist) or 220, 40)
     local RequestHUDPermission = options.RequestHUDPermission ~= false
     local EnableChatCommand    = options.EnableChatCommand ~= false
     local Presets              = (type(options.Presets) == "table" and #options.Presets > 0) and options.Presets or DEFAULT_PRESETS
@@ -284,8 +287,8 @@ return function(options, config)
         end
 
         local function setVolume(vol)
-            local clamped = math.clamp(tonumber(vol) or DefaultVolume, 0, 1)
-            clamped = math.round(clamped * 100) / 100
+            local clamped = clamp(tonumber(vol) or DefaultVolume, 0, MaxVolume)
+            clamped = round(clamped * 100) / 100
             if math.abs(clamped - state.volume) < 0.005 then return end
             state.volume = clamped
             updateWireOutputs()
@@ -325,7 +328,7 @@ return function(options, config)
                 ctx.addWireInput("RadioVolume", "Number", function(_, val)
                     local n = tonumber(val)
                     if n then
-                        if n > 1 then n = n / 100 end
+                        if n > MaxVolume then n = n / 100 end
                         setVolume(n)
                     end
                 end)
@@ -387,7 +390,7 @@ return function(options, config)
                         elseif startsWith(argLow, "vol ") then
                             local v = tonumber(trimStr(string.sub(arg, 5)))
                             if v then
-                                if v > 1 then v = v / 100 end
+                                if v > MaxVolume then v = v / 100 end
                                 setVolume(v)
                             end
                             return ""
@@ -485,6 +488,213 @@ return function(options, config)
             return refreshPlay2DPermission()
         end
         return cachedCanPlay2D
+    end
+
+    -- 3D floating chip hint for nearby bystanders lacking bass.loadURL permission
+    local hintRtName    = "SimcadeRadioHint_RT_" .. chipId
+    local hintRtReady   = false
+    local hintRtDirty   = false
+    local hintHolo      = nil
+    local hintMesh      = nil
+    local hintMat       = nil
+    local hintFontTitle = nil
+    local hintFontSub   = nil
+    local hintVisible   = false
+    local hintLastKey   = ""
+    local hintTitleTxt  = ""
+    local hintSubTxt    = ""
+    local cachedUrlPerm = nil
+    local cachedUrlFor  = ""
+
+    local function checkUrlAllowedCached(url)
+        if url ~= cachedUrlFor or cachedUrlPerm == nil then
+            cachedUrlFor = url
+            local ok = hasBassPermission(url)
+            cachedUrlPerm = ok == true
+        end
+        return cachedUrlPerm
+    end
+
+    local function canUseOffscreen()
+        if not (render and render.createRenderTarget) then return false end
+        if hasPermission then
+            local ok, allowed = pcall(hasPermission, "render.offscreen")
+            if ok then return allowed end
+        end
+        return true
+    end
+
+    local function ensureHintAssets()
+        if hintHolo then return end
+        if not (hologram and hologram.create and mesh and mesh.createFromTable) then return end
+        if not canUseOffscreen() then return end
+
+        local okRT = pcall(function() render.createRenderTarget(hintRtName) end)
+        if not okRT then return end
+        hintRtReady = true
+
+        pcall(function()
+            hintFontTitle = render.createFont("Roboto", 88, 700, true)
+            hintFontSub   = render.createFont("Roboto", 62, 600, true)
+        end)
+
+        local okMat, m = pcall(function() return material.create("UnlitGeneric") end)
+        if not okMat or not m then return end
+        hintMat = m
+        pcall(function()
+            hintMat:setInt("$model", 1)
+            hintMat:setInt("$nocull", 1)
+            hintMat:setInt("$translucent", 0)
+            hintMat:setInt("$alphatest", 1)
+            hintMat:setFloat("$alphatestreference", 0.35)
+            hintMat:setInt("$ignorez", 0)
+            hintMat:setInt("$flags", 256 + 2048 + 8192)
+            hintMat:setTextureRenderTarget("$basetexture", hintRtName)
+        end)
+
+        local hw, hh = 9.5, 4.2
+        local vSpan = hh / hw
+        local vMin = 0.5 - vSpan * 0.5
+        local vMax = 0.5 + vSpan * 0.5
+        local nF = Vector(1, 0, 0)
+        local nB = Vector(-1, 0, 0)
+        local vCol = Color(255, 255, 255, 255)
+        local tl = Vector(0, -hw,  hh)
+        local tr = Vector(0,  hw,  hh)
+        local br = Vector(0,  hw, -hh)
+        local bl = Vector(0, -hw, -hh)
+
+        local okM, qm = pcall(function()
+            return mesh.createFromTable({
+                { pos = tl, normal = nF, u = 0, v = vMin, color = vCol },
+                { pos = tr, normal = nF, u = 1, v = vMin, color = vCol },
+                { pos = br, normal = nF, u = 1, v = vMax, color = vCol },
+                { pos = br, normal = nF, u = 1, v = vMax, color = vCol },
+                { pos = bl, normal = nF, u = 0, v = vMax, color = vCol },
+                { pos = tl, normal = nF, u = 0, v = vMin, color = vCol },
+                { pos = tl, normal = nB, u = 0, v = vMin, color = vCol },
+                { pos = bl, normal = nB, u = 0, v = vMax, color = vCol },
+                { pos = br, normal = nB, u = 1, v = vMax, color = vCol },
+                { pos = br, normal = nB, u = 1, v = vMax, color = vCol },
+                { pos = tr, normal = nB, u = 1, v = vMin, color = vCol },
+                { pos = tl, normal = nB, u = 0, v = vMin, color = vCol },
+            })
+        end)
+        if not okM or not qm then return end
+        hintMesh = qm
+
+        local okH, h = pcall(function()
+            return hologram.create(Vector(), Angle(), "models/Combine_Helicopter/helicopter_bomb01.mdl")
+        end)
+        if not okH or not isValid(h) then
+            pcall(function() hintMesh:destroy() end)
+            hintMesh = nil
+            return
+        end
+
+        h:setMesh(hintMesh)
+        h:setMeshMaterial(hintMat)
+        h:setRenderBounds(Vector(-2, -hw - 2, -hh - 2), Vector(2, hw + 2, hh + 2))
+        h:suppressEngineLighting(true)
+        h:setNoDraw(true)
+        hintHolo = h
+    end
+
+    local function drawHintRT()
+        if not (hintRtReady and hintRtDirty) then return end
+        hintRtDirty = false
+        pcall(function()
+            render.selectRenderTarget(hintRtName)
+            render.clear(Color(0, 0, 0, 0), true)
+
+            local cx, cy = 512, 512
+            if hintFontTitle and render.setFont then render.setFont(hintFontTitle) end
+            render.setColor(Color(0, 0, 0, 255))
+            render.drawSimpleText(cx + 5, cy - 48 + 5, hintTitleTxt, 1, 1)
+            render.setColor(Color(64, 188, 255, 255))
+            render.drawSimpleText(cx, cy - 48, hintTitleTxt, 1, 1)
+
+            if hintSubTxt ~= "" then
+                if hintFontSub and render.setFont then render.setFont(hintFontSub) end
+                render.setColor(Color(0, 0, 0, 255))
+                render.drawSimpleText(cx + 4, cy + 44 + 4, hintSubTxt, 1, 1)
+                render.setColor(Color(240, 244, 252, 255))
+                render.drawSimpleText(cx, cy + 44, hintSubTxt, 1, 1)
+            end
+
+            render.selectRenderTarget()
+        end)
+    end
+
+    local function hideChipHint()
+        if not hintVisible then return end
+        hintVisible = false
+        if isValid(hintHolo) then
+            hintHolo:setNoDraw(true)
+        end
+    end
+
+    local function updateChipHint(inCabin, listenerPos)
+        if not ShowChipPermHint or inCabin or not radioState.playing or radioState.url == "" then
+            hideChipHint()
+            return
+        end
+        if checkUrlAllowedCached(radioState.url) then
+            hideChipHint()
+            return
+        end
+        local chEnt = chip()
+        if not isValid(chEnt) then
+            hideChipHint()
+            return
+        end
+        local cPos = chEnt:getPos()
+        local maxD2 = ChipPermHintMaxDist * ChipPermHintMaxDist
+        local dChip2 = listenerPos:getDistanceSqr(cPos)
+        local dBase2 = isValid(baseEnt) and listenerPos:getDistanceSqr(baseEnt:getPos()) or dChip2
+        if math.min(dChip2, dBase2) > maxD2 then
+            hideChipHint()
+            return
+        end
+
+        ensureHintAssets()
+        if not isValid(hintHolo) then return end
+
+        local stationLabel = radioState.name ~= "" and radioState.name or "Radio Playing"
+        if #stationLabel > 24 then stationLabel = string.sub(stationLabel, 1, 21) .. "..." end
+        local title = "Radio: " .. stationLabel
+        local sub = "Enter Seat or [E] Chip to Hear"
+        local key = title .. "|" .. sub
+        if key ~= hintLastKey then
+            hintLastKey = key
+            hintTitleTxt = title
+            hintSubTxt = sub
+            hintRtDirty = true
+        end
+
+        -- Pull anchor toward the viewer past bodywork/glass (same approach as seat_indicator.txt)
+        -- so the hint remains clearly visible even if the chip is buried inside a long vehicle's base.
+        local toEyeVec = listenerPos - cPos
+        local eyeDist = toEyeVec:getLength()
+        local toEyeDir = eyeDist > 1 and (toEyeVec / eyeDist) or Vector(0, 0, 1)
+        local anchorPos = cPos + toEyeDir * math.min(26, eyeDist * 0.32)
+        local lp = player()
+        if trace and trace.line and isValid(lp) then
+            local okTr, tr = pcall(trace.line, listenerPos, cPos, lp)
+            if okTr and tr and tr.Hit and tr.Entity ~= chEnt then
+                local trAnchor = tr.HitPos + toEyeDir * 10
+                if listenerPos:getDistanceSqr(trAnchor) < listenerPos:getDistanceSqr(anchorPos) then
+                    anchorPos = trAnchor
+                end
+            end
+        end
+
+        local pos = anchorPos + Vector(0, 0, 10)
+        hintHolo:setPos(pos)
+        hintHolo:setAngles((listenerPos - pos):getAngle())
+        hintHolo:setScale(Vector(1, 1, 1))
+        hintHolo:setNoDraw(false)
+        hintVisible = true
     end
 
     -- Catalog state (lazy-loaded per country)
@@ -731,6 +941,8 @@ return function(options, config)
         local listenerPos = (eyePos and eyePos()) or lp:getShootPos()
         local overheadPos = listenerPos + OVERHEAD_OFFSET
         local dist    = listenerPos:getDistance(srcPos)
+
+        updateChipHint(inCabin, listenerPos)
 
         -- Update fading-out channels
         for i = #fadingChannels, 1, -1 do
@@ -1406,33 +1618,40 @@ return function(options, config)
             sendCmd(CMD_TOGGLE)
         end
 
-        -- Volume slider
+        -- Volume slider (0% .. MaxVolume*100%, with 100% reference tick)
         local slX = stopX + stopW + 18
-        local slW = w - (slX - x) - pad - 48
+        local slW = w - (slX - x) - pad - 56
         local slY = stopY + 14
         local slH = 8
         local hoverSlider = pointInRect(mx, my, slX - 6, slY - 10, slW + 12, slH + 20)
         if clicked and hoverSlider then draggingSlider = true end
         if draggingSlider and mouseDown then
-            local v = math.clamp((mx - slX) / math.max(1, slW), 0, 1)
-            local rounded = math.round(v * 20) / 20
+            local frac = clamp((mx - slX) / math.max(1, slW), 0, 1)
+            local v = frac * MaxVolume
+            local rounded = round(v * 20) / 20
             if math.abs(rounded - radioState.volume) >= 0.04 then
                 radioState.volume = rounded
                 sendCmd(CMD_SETVOL, rounded)
             end
         end
 
+        local volFrac = clamp(radioState.volume / math.max(0.01, MaxVolume), 0, 1)
         render.setColor(COL_ROW)
         drawBox(4, slX, slY, slW, slH)
+        if MaxVolume > 1.05 then
+            local tickX = slX + math.floor(slW * (1.0 / MaxVolume))
+            render.setColor(COL_TEXT_DIM)
+            render.drawRect(tickX, slY - 3, 2, slH + 6)
+        end
         render.setColor(COL_ACCENT)
-        drawBox(4, slX, slY, math.floor(slW * radioState.volume), slH)
-        local knobX = slX + math.floor(slW * radioState.volume)
+        drawBox(4, slX, slY, math.floor(slW * volFrac), slH)
+        local knobX = slX + math.floor(slW * volFrac)
         render.setColor(COL_TEXT)
         render.drawFilledCircle(knobX, slY + slH * 0.5, 7)
 
         if fontSmall then render.setFont(fontSmall) end
         render.setColor(COL_TEXT)
-        render.drawSimpleText(slX + slW + 10, slY + slH * 0.5, tostring(math.round(radioState.volume * 100)) .. "%", 0, 1)
+        render.drawSimpleText(slX + slW + 10, slY + slH * 0.5, tostring(round(radioState.volume * 100)) .. "%", 0, 1)
 
         -- Bottom hint bar
         if fontTiny then render.setFont(fontTiny) end
@@ -1487,8 +1706,10 @@ return function(options, config)
 
             hook.add("permissionrequest", "SimcadeRadio_Perm_" .. chipId, function()
                 refreshPlay2DPermission()
+                cachedUrlPerm = nil
                 if hasBassPermission(radioState.url ~= "" and radioState.url or nil) then
                     needBassPermPrompt = false
+                    hideChipHint()
                 end
                 if radioState.playing and radioState.url ~= "" and hasBassPermission(radioState.url) then
                     if not (activeChannel and isValid(activeChannel)) then
@@ -1526,7 +1747,7 @@ return function(options, config)
                 local prevURL     = radioState.url
 
                 radioState.playing = playing
-                radioState.volume  = math.clamp(volume, 0, 1)
+                radioState.volume  = clamp(volume, 0, MaxVolume)
                 radioState.seq     = seq
                 radioState.name    = name
                 radioState.url     = url
@@ -1567,6 +1788,7 @@ return function(options, config)
                     setMenuOpen(false)
                 end
                 if not radioState.playing and #fadingChannels == 0 then
+                    hideChipHint()
                     return
                 end
                 local now = timer.curtime()
@@ -1579,6 +1801,8 @@ return function(options, config)
                     trySendBassPermPrompt()
                 end
             end)
+
+            hook.add("renderoffscreen", "SimcadeRadio_HintRT_" .. chipId, drawHintRT)
 
             hook.add("drawhud", "SimcadeRadio_HUD_" .. chipId, function()
                 if not menuOpen and not ShowNowPlayingHUD then return end
@@ -1676,6 +1900,9 @@ return function(options, config)
             hook.remove("inputReleased", "SimcadeRadio_KeyUp_" .. chipId)
             hook.remove("permissionrequest", "SimcadeRadio_Perm_" .. chipId)
             hook.remove("hudconnected", "SimcadeRadio_HudConn_" .. chipId)
+            hook.remove("renderoffscreen", "SimcadeRadio_HintRT_" .. chipId)
+            if isValid(hintHolo) then pcall(function() hintHolo:remove() end) end
+            if hintMesh and hintMesh.destroy then pcall(function() hintMesh:destroy() end) end
         end,
     }
 end

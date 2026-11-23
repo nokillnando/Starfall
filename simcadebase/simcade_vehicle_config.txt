@@ -6,7 +6,7 @@
 --@include simcadebase/addons/backfire_antilag.txt
 --@include simcadebase/addons/seat_indicator.txt
 --@include simcadebase/addons/vehicle_radio.txt
-
+--disable includes and addons not needed to slightly reduce dupe file size
 local CONFIG = {}
 -- Advance only after applying the required settings for the new config format.
 CONFIG.SCHEMA_VERSION = 4
@@ -1077,7 +1077,8 @@ CONFIG.ADDON_MODULES = {
         options = {
             CatalogBaseURL       = "https://raw.githubusercontent.com/nokillnando/Starfall/main/simcadebase/radio_catalog",
             DriverOnly           = true,  -- Only the driver can change stations / volume / power
-            DefaultVolume        = 0.65,  -- Initial radio volume (0.0 .. 1.0)
+            DefaultVolume        = 1.0,   -- Initial radio volume (1.0 = 100%)
+            MaxVolume            = 2.5,   -- Max volume boost (2.5 = 250% for quiet radio streams)
             VolumeStep           = 0.10,  -- Volume step per RadioVolDown / RadioVolUp press
             FullVolumeDistance   = 120,   -- 3D audio full-volume radius outside the vehicle (units)
             MaxHearingDistance   = 950,   -- 3D audio max hearing distance outside the vehicle (units)
@@ -1088,6 +1089,7 @@ CONFIG.ADDON_MODULES = {
             CrossfadeTime        = 0.35,  -- Fade duration (seconds) when switching or stopping stations
             ShowNowPlayingHUD    = true,  -- Compact now-playing bar + 5-bar FFT equalizer in vehicle
             HUDAutoHideSeconds   = 5.0,   -- Auto-hide HUD bar after N seconds (0 = always visible in vehicle)
+            ShowChipPermHint     = true,  -- Show floating "[E] Chip to Hear Radio" hint above chip for nearby players lacking permission
             RequestHUDPermission = true,  -- Prompt once for render.hud permission when opening the menu
             EnableChatCommand    = true,  -- Allow driver to use !radio <url> [name], !radio stop, !radio vol <0-100>
         },
