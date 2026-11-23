@@ -399,7 +399,9 @@ function SimcadeCore.init(CONFIG)
     local function updateSemiDynamicFilter()
         if type(ExtraFilterSemiDynamic) ~= "table" or #ExtraFilterSemiDynamic == 0 then return end
         for _, ent in ipairs(ExtraFilterSemiDynamic) do
-            addFilterTree(ent, filterSeen, traceFilter)
+            if isValid(ent) and not filterSeen[ent] then
+                addFilterTree(ent, filterSeen, traceFilter)
+            end
         end
     end
 
