@@ -21,10 +21,10 @@
 --@include simcadebase/simcade_prediction.txt
 
 -- Updated automatically when build_release.py builds to simcadebase/releases.
-local LOCAL_REVISION = 13
+local LOCAL_REVISION = 1
 -- Bump when the cores require a new setting or change an existing setting's meaning.
 -- Optional settings with backwards-compatible defaults can keep the same schema.
-local LOCAL_CONFIG_SCHEMA = 4
+local LOCAL_CONFIG_SCHEMA = 1
 local modules = {
     "simcadebase/simcade_engine.txt",
     "simcadebase/simcade_aero.txt",

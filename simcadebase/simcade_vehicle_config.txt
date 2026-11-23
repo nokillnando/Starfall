@@ -9,7 +9,7 @@
 --disable includes and addons not needed to slightly reduce dupe file size
 local CONFIG = {}
 -- Advance only after applying the required settings for the new config format.
-CONFIG.SCHEMA_VERSION = 4
+CONFIG.SCHEMA_VERSION = 1
 
 CONFIG.CORE_UPDATE = {
     enabled = true,
