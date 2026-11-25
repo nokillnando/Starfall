@@ -220,6 +220,7 @@ function SimcadeHUD.initClient(cfg)
             wsFwdG       = net.readFloat(),
             wsLatG       = net.readFloat(),
             wsVertMult   = net.readFloat(),
+            clutch       = net.readUInt(8) / 255,
         }
     end)
 
@@ -315,11 +316,10 @@ function SimcadeHUD.initClient(cfg)
             local keyFwd = lp.keyDown and lp:keyDown(IN_KEY.FORWARD) or false
             local keyBack = lp.keyDown and lp:keyDown(IN_KEY.BACK) or false
             local keyHbk = lp.keyDown and lp:keyDown(IN_KEY.JUMP) or false
-            local keyClu = (st.clutchDown == true) or (lp.keyDown and lp:keyDown(IN_KEY.WALK) or false)
             local inRev = (gearStr == "R" or gearStr:sub(1, 1) == "R")
             local rawThr = (inRev and keyBack or keyFwd) and (st.halfThrottle and 0.5 or 1.0) or 0
             local rawBrk = (inRev and keyFwd or keyBack) and 1.0 or 0
-            local rawClu = keyClu and 1.0 or 0
+            local rawClu = st.clutch
             if not st.running then rawThr = 0 end
             smoothThr = smoothThr + (rawThr - smoothThr) * 0.35
             smoothBrk = smoothBrk + (rawBrk - smoothBrk) * 0.35

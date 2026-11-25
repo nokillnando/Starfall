@@ -4,7 +4,7 @@
 SimcadePrediction = {}
 local P = SimcadePrediction
 -- Change the channel when the packet layout changes so older clients cannot replay it.
-local snapshotChannel = "Simcade_DriveSnapshot_v2"
+local snapshotChannel = "Simcade_DriveSnapshot_v3"
 local gears = {"gear", "req", "state", "want", "shifting", "clutch"}
 local function array(v, scale)
     return {[0] = v.x * scale, v.y * scale, v.z * scale}
@@ -37,6 +37,8 @@ if SERVER then
         net.writeBool(car.manualBox)
         net.writeUInt(car.autoRange or 0, 2)
         net.writeFloat(car.eng.w)
+        net.writeFloat(car.eng.T)
+        net.writeFloat(car.simClutch or 1)
         net.writeFloat(car.eng.inductionTorqueRatio or 1)
         net.writeFloat(turboRPM)
         net.writeFloat(car.drv.u16Deg or 0)
@@ -146,8 +148,11 @@ function P.initClient(cfg)
             running = net.readBool(), crank = net.readFloat(), ground = {}, loads = {}, comLocal = comLocal}
         car.manualBox = net.readBool()
         car.autoRange = net.readUInt(2)
-        car.eng.w, car.eng.inductionTorqueRatio = net.readFloat(), net.readFloat()
+        car.eng.w, car.eng.T, car.simClutch = net.readFloat(), net.readFloat(), net.readFloat()
+        car.eng.inductionTorqueRatio = net.readFloat()
         frame.turbo = {rpm = net.readFloat()}
+        frame.supercharger = {psi = 0, boost = 1.0}
+        frame.manifold = (SimcadeEngine and SimcadeEngine.newManifoldState) and SimcadeEngine.newManifoldState(cfg.ENGINE_CFG) or nil
         car.drv.u16Deg, car.drv.smoothedLat = net.readFloat(), net.readFloat()
         car.drv.gear, car.drv.reversing = net.readInt(8), net.readBool()
         car.drv.brakeLatch, car.drv.revBrakeLatch = net.readBool(), net.readBool()
@@ -207,12 +212,76 @@ function P.initClient(cfg)
                 frame.gearUp, frame.gearDown = cmd.gearUp, cmd.gearDown
                 local dt = math.min(cmd.dt, cmd.time - frame.inputTime)
                 local throttle = frame.running and k.rawThrottle or 0
-                local turbo = SimcadeEngine.stepTurbo(frame.turbo, cfg.ENGINE_CFG, frame.running and car.rpm or 0, throttle, dt)
+                local effectiveThrottle = throttle
+                if frame.running then
+                    if car.classicAuto and not car.manualBox then
+                        if car.autoRange == 0 then
+                            effectiveThrottle = 0
+                        elseif car.autoRange == 1 and car.reverseWSonReverse then
+                            effectiveThrottle = k.rawReverseThrottle or k.rawBrake
+                        end
+                    elseif not car.manualBox then
+                        local drv = car.drv
+                        local fwdMS = frame.vel[0] * frame.R[0] + frame.vel[1] * frame.R[1] + frame.vel[2] * frame.R[2]
+                        local sDown = (k.rawBrake or 0) > 0.10
+                        local wDown = (k.rawThrottle or 0) > 0.10
+                        if sDown and not wDown then
+                            local revActive = (drv and (drv.reverseLaunch or ((drv.reverseHold or 0) > 0 and not drv.brakeLatch)))
+                                or (not (drv and drv.brakeLatch) and fwdMS <= 0.35)
+                            if revActive then
+                                effectiveThrottle = k.rawReverseThrottle or k.rawBrake
+                            end
+                        elseif wDown and not sDown then
+                            local fwdBraking = (drv and drv.revBrakeLatch)
+                                or (fwdMS < -0.35 and not (drv and (drv.forwardLaunch or ((drv.forwardHold or 0) > 0 and not drv.revBrakeLatch))))
+                            if fwdBraking then
+                                effectiveThrottle = 0
+                            end
+                        end
+                    end
+                    if car.dt and car.dt.shifting ~= 0 then
+                        effectiveThrottle = 0
+                    end
+                end
+                local butterflyThrottle = effectiveThrottle
+                local thrRise = tonumber(cfg.ENGINE_CFG and cfg.ENGINE_CFG.ThrottleRiseTime) or 0
+                if thrRise > 0 and car and car.eng then
+                    local prevThr = car.eng.T or 0
+                    if butterflyThrottle > prevThr then
+                        butterflyThrottle = prevThr + (butterflyThrottle - prevThr) * (1 - math.exp(-dt / thrRise))
+                    end
+                end
+                local predRPM = frame.running and car.rpm or 0
+                local useManifold = (cfg.ENGINE_CFG and cfg.ENGINE_CFG.ManifoldModel == true) and frame.manifold ~= nil and SimcadeEngine.stepManifold ~= nil
+                local turboLoad = (frame.running and useManifold) and math.clamp(frame.manifold.charge or 0, 0, 1) or butterflyThrottle
+                local turbo = SimcadeEngine.stepTurbo(frame.turbo, cfg.ENGINE_CFG, predRPM, turboLoad, dt)
+                local sc = (cfg.ENGINE_CFG and cfg.ENGINE_CFG.Supercharger == true and SimcadeEngine.stepSupercharger)
+                    and SimcadeEngine.stepSupercharger(frame.supercharger, cfg.ENGINE_CFG, predRPM, butterflyThrottle)
+                    or frame.supercharger
+                if SimcadeEngine.computeInduction and car.eng then
+                    local indRatio, indPSI, parasiticDragKNm, combinedBoostRatio, airPress =
+                        SimcadeEngine.computeInduction(cfg.ENGINE_CFG, turbo, sc, predRPM, butterflyThrottle, frame.running)
+                    car.eng.inductionTorqueRatio = indRatio
+                    car.eng.boostPSI = indPSI
+                    car.eng.parasiticDragKNm = parasiticDragKNm
+                    if useManifold then
+                        SimcadeEngine.stepManifold(frame.manifold, cfg.ENGINE_CFG, predRPM, butterflyThrottle, dt, combinedBoostRatio, indRatio, airPress, frame.running)
+                        car.eng.manifoldCharge = frame.manifold.charge
+                        car.eng.manifoldVacuum = frame.manifold.vacuumFrac
+                        car.eng.manifoldPSI = frame.manifold.gaugePSI
+                    else
+                        car.eng.manifoldCharge = nil
+                        car.eng.manifoldVacuum = nil
+                        car.eng.manifoldPSI = indPSI
+                    end
+                elseif car.eng then
+                    car.eng.parasiticDragKNm = 0
+                end
                 local result = car:stepVPhysics(dt, frame.pos, frame.R, frame.vel, frame.omega, frame.ground, {
                     steer = k.steerTarget, gas = throttle,
                     reverseGas = frame.running and k.rawReverseThrottle or 0, forwardBrake = k.wKey,
                     brake = k.rawBrake, handbrake = k.rawHandbrake, clutchPedal = k.clutchDown and 0 or 1,
-                    ignitionRunning = frame.running, crankRPM = frame.crank, vphysLoadsKN = frame.loads,
+                    ignitionRunning = frame.running, cranking = (not frame.running) and ((frame.crank or 0) > 1), crankRPM = frame.crank, vphysLoadsKN = frame.loads,
                     weightShiftCfg = cfg.WEIGHT_SHIFT_CFG, maxSubsteps = 2,
                 })
                 frame.pos, frame.R, frame.vel, frame.omega = car.pos, car.R, car.v, car.w

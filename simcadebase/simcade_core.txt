@@ -90,6 +90,7 @@ function SimcadeCore.init(CONFIG)
     local kAllLk    = resolveBind(CONTROLS_CFG.AllLock,       KEY and KEY.J)
     local kParkBrk  = resolveBind(CONTROLS_CFG.ParkingBrake,  KEY and KEY.P)
     local kHorn     = resolveBind(CONTROLS_CFG.Horn,          KEY and KEY.G)
+    local kJakeBrk  = resolveBind(CONTROLS_CFG.JakeBrake,     KEY and KEY.X)
 
     -- ========================================================================
     -- CLIENT SIDE
@@ -172,6 +173,11 @@ function SimcadeCore.init(CONFIG)
             elseif kHorn and btn == kHorn then
                 net.start("Simcade_ClientKeyEvent")
                 net.writeUInt(12, 4)
+                net.writeBool(true)
+                SimcadeCore.sendPacket()
+            elseif ENGINE_CFG.JakeBrakeEnabled == true and kJakeBrk and btn == kJakeBrk then
+                net.start("Simcade_ClientKeyEvent")
+                net.writeUInt(13, 4)
                 net.writeBool(true)
                 SimcadeCore.sendPacket()
             end
@@ -274,6 +280,7 @@ function SimcadeCore.init(CONFIG)
         or { mode = (ENGINE_CFG.StartRunning ~= false) and 3 or 0, timer = 0, running = (ENGINE_CFG.StartRunning ~= false), crankRPM = 0 }
     local turboState = (SimcadeEngine and SimcadeEngine.newTurboState) and SimcadeEngine.newTurboState() or { rpm = 0, psi = 0, boost = 1.0 }
     local superchargerState = (SimcadeEngine and SimcadeEngine.newSuperchargerState) and SimcadeEngine.newSuperchargerState() or { psi = 0, boost = 1.0 }
+    local manifoldState = (SimcadeEngine and SimcadeEngine.newManifoldState) and SimcadeEngine.newManifoldState(ENGINE_CFG) or nil
 
     local exitHbkDefault = tonumber(ENGINE_CFG.AutoHandbrakeOnExitSpeed)
     if exitHbkDefault == nil and ENGINE_CFG.AutoHandbrakeOnExitSpeed ~= false then exitHbkDefault = 15 end
@@ -916,6 +923,15 @@ function SimcadeCore.init(CONFIG)
                 ctrlState.parkingBrake = not ctrlState.parkingBrake
                 sendDriverPrint(drv, ctrlState.parkingBrake and "Parking Brake: ENGAGED" or "Parking Brake: RELEASED")
             end
+        elseif code == 13 then
+            if ENGINE_CFG.JakeBrakeEnabled == true and physicsCar.cycleJakeBrake then
+                local stg = physicsCar:cycleJakeBrake()
+                if stg ~= nil then
+                    local maxStg = physicsCar.jakeBrakeStages or 3
+                    local label = (stg == 0) and "OFF" or ((maxStg == 1) and "ON" or string.format("STAGE %d/%d", stg, maxStg))
+                    sendDriverPrint(drv, "Jake Brake: " .. label)
+                end
+            end
         end
     end)
 
@@ -1009,6 +1025,9 @@ function SimcadeCore.init(CONFIG)
         if ENGINE_CFG.ParkingBrakeToggle ~= false and kParkBrk then
             driveParts[#driveParts + 1] = keyLabel(kParkBrk, "P") .. "=ParkBrake"
         end
+        if ENGINE_CFG.JakeBrakeEnabled == true and kJakeBrk then
+            driveParts[#driveParts + 1] = keyLabel(kJakeBrk, "X") .. "=JakeBrake"
+        end
 
         local sysParts = {}
         if kIgn then
@@ -1068,7 +1087,8 @@ function SimcadeCore.init(CONFIG)
         ctrlState._lastThinkTime = nowTick
         local targetInterval = 1.0 / math.clamp(VEHICLE_CFG.UpdateRate or 60, 15, 120)
         if lastPhysTickTime > 0 and (nowTick - lastPhysTickTime) < (targetInterval * 0.85) then
-            if cachedLiftForcePerSec and not (Base.isPlayerHolding and Base:isPlayerHolding()) then
+            if cachedLiftForcePerSec and not (Base.isPlayerHolding and Base:isPlayerHolding())
+                and Phys:getVelocity():dot(cachedLiftForcePerSec) <= 15 * cachedLiftForcePerSec:getLength() then
                 local fdt = math.clamp(tickDt, 0.002, 0.05)
                 local imp = cachedLiftForcePerSec * fdt
                 Phys:applyForceCenter(imp)
@@ -1097,6 +1117,7 @@ function SimcadeCore.init(CONFIG)
             smoothedFwdAccel, smoothedLatAccel = 0, 0
             lastVelWorld = Phys:getVelocity()
             cachedLiftForcePerSec = nil
+            skippedLiftApplied = Vector(0, 0, 0)
         end
 
         if not physicsCar then
@@ -1193,7 +1214,32 @@ function SimcadeCore.init(CONFIG)
         end
         local ignToggle = hasDriver and ((ctrlState.ignKeyHeld == true) or (ctrl.fKey == 1) or podLight or (wireInputs and wireInputs.Light and wireInputs.Light > 0)) or false
         local prevIgnState, prevIgnRun = ignState.state, ignState.running
-        local ignRes = SimcadeEngine.stepIgnition(ignState, ignToggle, dt, hasDriver)
+        local liveFlywheelRPM = (physicsCar and physicsCar.eng) and ((physicsCar.eng.w or 0) * 9.54929676) or 0
+        local ignRes = SimcadeEngine.stepIgnition(ignState, ignToggle, dt, hasDriver, liveFlywheelRPM)
+        if not prevIgnRun and ignState.running and physicsCar then
+            physicsCar.stallTimer = 0
+            physicsCar.engineStalled = false
+            local startCause = ignState.lastStartCause
+            ignState.lastStartCause = nil
+            if startCause == "bump" then
+                physicsCar.stallGraceTimer = 0.85
+                physicsCar.catchFlareTimer = 0.35
+                if hasDriver then
+                    sendDriverPrint(Driver, "Engine BUMP-STARTED")
+                end
+            elseif ENGINE_CFG.PhysicalStarter == true and ENGINE_CFG.PhysicalIdle == true then
+                physicsCar.stallGraceTimer = 0.85
+                physicsCar.catchFlareTimer = 0.45
+            else
+                physicsCar.stallGraceTimer = 0.65
+                if physicsCar.eng and physicsCar.c then
+                    local catchW = (physicsCar.c[124] or 800) * 0.85 * 0.10471975512
+                    if (physicsCar.eng.w or 0) < catchW then
+                        physicsCar.eng.w = catchW
+                    end
+                end
+            end
+        end
         if hasDriver and (ignState.state ~= prevIgnState or ignState.running ~= prevIgnRun) then
             if prevIgnRun and not ignState.running then
                 sendDriverPrint(Driver, "Engine OFF")
@@ -1221,7 +1267,8 @@ function SimcadeCore.init(CONFIG)
         local physMass = math.max(15, Phys:getMass() or 1200)
         totalVehicleMass = physMass
         local simMass = getSimMass(physMass)
-        local vphysScale = physMass / simMass
+        local supportMass = math.max(physMass, ctrlState._contraptionMass or physMass)
+        local supportScale = supportMass / simMass
         if math.abs((physicsCar.m or simMass) - simMass) > 2 then
             physicsCar:updateMass(math.max(350, simMass))
         end
@@ -1279,9 +1326,18 @@ function SimcadeCore.init(CONFIG)
             local pw = physicsCar.wheels[w.physicsIndex]
             local axle = pw.axleX and (driverFwd * pw.axleX + driverLeft * pw.axleY + driverUp * pw.axleZ) or driverLeft
             w.curbAxle = axle
+            local wallPoint, wallNormal
+            if not isPhysgunHeld then
+                wallPoint, wallNormal = SimcadeSuspension.traceWheelWall(w, mountPos, driverUp, axle,
+                    Phys, dt, physMass, SUSPENSION_CFG, traceFilter)
+            else
+                w.wallProbeOrigin = nil
+                w.wallDriveContact = nil
+            end
+            w.wallContact = wallPoint ~= nil
             local tr, hitDist, rays = SimcadeSuspension.traceTread(w, mountPos, driverUp, axle,
                 maxRayDist, traceFilter, math.max(35, physMass * 0.15), SUSPENSION_CFG, debugRaysEnabled and nowTick >= nextWheelDebugNetTime
-                    and index >= firstDebugWheel and index < firstDebugWheel + debugCount)
+                    and index >= firstDebugWheel and index < firstDebugWheel + debugCount, wallPoint, wallNormal)
             if rays then w.debugAxle = Base:worldToLocalVector(axle) end
             w.debugRays = rays
             -- The tire solver measures travel on the mount axis, then adds the wheel radius.
@@ -1345,7 +1401,7 @@ function SimcadeCore.init(CONFIG)
                 groundedCount = groundedCount + 1
                 if w.inWater then waterWheelsCount = waterWheelsCount + 1 end
                 w.supportVel = SimcadeSuspension.supportVelocity(w, dt)
-                if not isPhysgunHeld then
+                if not isPhysgunHeld and not w.wallContact then
                     SimcadeSuspension.applyCurbBlock(Phys, w, driverUp, w.curbAxle, dt, physMass, numWheels, gravity, SUSPENSION_CFG, traceFilter)
                 else
                     w.curbNormal, w.curbRoadPoint = nil, nil
@@ -1407,29 +1463,73 @@ function SimcadeCore.init(CONFIG)
         end
         local turboActive = ENGINE_CFG.Turbo == true
         local superchargerActive = ENGINE_CFG.Supercharger == true
+        local manifoldActive = (ENGINE_CFG.ManifoldModel == true) and (manifoldState ~= nil) and (SimcadeEngine and SimcadeEngine.stepManifold ~= nil)
+        local effectiveThrottle = 0
+        if ignRes.running then
+            effectiveThrottle = rawThrottle
+            if physicsCar and physicsCar.classicAuto and not physicsCar.manualBox then
+                if physicsCar.autoRange == 0 then
+                    effectiveThrottle = 0
+                elseif physicsCar.autoRange == 1 and physicsCar.reverseWSonReverse then
+                    effectiveThrottle = ctrl.rawReverseThrottle or rawBrake
+                end
+            elseif physicsCar and not physicsCar.manualBox then
+                local drv = physicsCar.drv
+                local fwdMS = signedFwdSpeed * IN_TO_M
+                local sDown = rawBrake > 0.10
+                local wDown = rawThrottle > 0.10
+                if sDown and not wDown then
+                    local revActive = (drv and (drv.reverseLaunch or ((drv.reverseHold or 0) > 0 and not drv.brakeLatch)))
+                        or (not (drv and drv.brakeLatch) and fwdMS <= 0.35)
+                    if revActive then
+                        effectiveThrottle = ctrl.rawReverseThrottle or rawBrake
+                    end
+                elseif wDown and not sDown then
+                    local fwdBraking = (drv and drv.revBrakeLatch)
+                        or (fwdMS < -0.35 and not (drv and (drv.forwardLaunch or ((drv.forwardHold or 0) > 0 and not drv.revBrakeLatch))))
+                    if fwdBraking then
+                        effectiveThrottle = 0
+                    end
+                end
+            end
+            if physicsCar and physicsCar.dt and physicsCar.dt.shifting ~= 0 then
+                effectiveThrottle = 0
+            end
+        end
+        local butterflyThrottle = effectiveThrottle
+        local thrRise = tonumber(ENGINE_CFG.ThrottleRiseTime) or 0
+        if thrRise > 0 and physicsCar and physicsCar.eng then
+            local prevThr = physicsCar.eng.T or 0
+            if butterflyThrottle > prevThr then
+                butterflyThrottle = prevThr + (butterflyThrottle - prevThr) * (1 - math.exp(-dt / thrRise))
+            end
+        end
+        local turboLoadIn = (ignRes.running and manifoldActive) and math.clamp(manifoldState.charge or 0, 0, 1) or butterflyThrottle
         local tRes = (SimcadeEngine and SimcadeEngine.stepTurbo)
-            and SimcadeEngine.stepTurbo(turboState, ENGINE_CFG, ignRes.running and (physicsCar.rpm or 0) or 0, ignRes.running and rawThrottle or 0, dt)
+            and SimcadeEngine.stepTurbo(turboState, ENGINE_CFG, ignRes.running and (physicsCar.rpm or 0) or 0, turboLoadIn, dt)
             or { psi = 0, boost = 1.0 }
         local sRes = (SimcadeEngine and SimcadeEngine.stepSupercharger)
-            and SimcadeEngine.stepSupercharger(superchargerState, ENGINE_CFG, ignRes.running and (physicsCar.rpm or 0) or 0, ignRes.running and rawThrottle or 0)
+            and SimcadeEngine.stepSupercharger(superchargerState, ENGINE_CFG, ignRes.running and (physicsCar.rpm or 0) or 0, butterflyThrottle)
             or { psi = 0, boost = 1.0 }
-        local turboBoostRatio = turboActive and math.max(1.0, tonumber(tRes.boost) or 1.0) or 1.0
-        local superchargerBoostRatio = superchargerActive and math.max(1.0, tonumber(sRes.boost) or 1.0) or 1.0
-        local combinedBoostRatio = turboBoostRatio * superchargerBoostRatio
-        local inductionAirPressure = math.max(1, tonumber(
-            (turboActive and ENGINE_CFG.Turbo_AirPressure)
-            or (superchargerActive and ENGINE_CFG.Supercharger_AirPressure)
-        ) or 18.4)
+        local inductionTorqueRatio, inductionBoostPSI, parasiticDragKNm, combinedBoostRatio, inductionAirPressure, turboBoostRatio =
+            SimcadeEngine.computeInduction(ENGINE_CFG, tRes, sRes, physicsCar.rpm or 0, butterflyThrottle, ignRes.running)
         if physicsCar.eng then
-            local turboTorqueRatio = 1.0 + (turboBoostRatio - 1.0) * math.max(0, tonumber(ENGINE_CFG.Turbo_TorqueGain) or 1.0)
-            local superchargerTorqueRatio = 1.0 + (superchargerBoostRatio - 1.0) * math.max(0, tonumber(ENGINE_CFG.Supercharger_TorqueGain) or 1.0)
-            local superchargerBoostFrac = (superchargerActive and (tonumber(ENGINE_CFG.Supercharger_MaxPSI) or 8) > 0)
-                and math.clamp((tonumber(sRes.psi) or 0) / (tonumber(ENGINE_CFG.Supercharger_MaxPSI) or 8), 0, 1)
-                or 0
-            local driveLoss = math.clamp(tonumber(ENGINE_CFG.Supercharger_DriveLoss) or 0.08, 0, 0.75)
-            superchargerTorqueRatio = superchargerTorqueRatio * (1 - driveLoss * superchargerBoostFrac)
-            physicsCar.eng.inductionTorqueRatio = math.max(0, turboTorqueRatio * superchargerTorqueRatio)
-            physicsCar.eng.boostPSI = math.max(0, (combinedBoostRatio - 1.0) * inductionAirPressure)
+            physicsCar.eng.inductionTorqueRatio = inductionTorqueRatio
+            physicsCar.eng.boostPSI = inductionBoostPSI
+            physicsCar.eng.parasiticDragKNm = parasiticDragKNm
+            if manifoldActive then
+                SimcadeEngine.stepManifold(
+                    manifoldState, ENGINE_CFG, physicsCar.rpm or 0, butterflyThrottle, dt,
+                    combinedBoostRatio, inductionTorqueRatio, inductionAirPressure, ignRes.running
+                )
+                physicsCar.eng.manifoldCharge = manifoldState.charge
+                physicsCar.eng.manifoldVacuum = manifoldState.vacuumFrac
+                physicsCar.eng.manifoldPSI = manifoldState.gaugePSI
+            else
+                physicsCar.eng.manifoldCharge = nil
+                physicsCar.eng.manifoldVacuum = nil
+                physicsCar.eng.manifoldPSI = inductionBoostPSI
+            end
         end
         -- Suspension forces (using simMass for virtual weight scaling)
         local avgCornerWeight = (simMass / numWheels) * gravity
@@ -1503,7 +1603,7 @@ function SimcadeCore.init(CONFIG)
                 w._cvz0     = cornerVel:dot(driverUp)
                 w._lx       = rel:dot(driverFwd)
                 w._ly       = rel:dot(driverRight)
-                w._liftDir = (w.hitNormal * 0.75 + driverUp * 0.25):getNormalized()
+                w._liftDir = w.hitNormal
                 w._liftUp = w._liftDir:dot(driverUp)
                 w._axleSusp = SimcadeSuspension.getAxleCfg(SUSPENSION_CFG, w.isFront)
                 local axle = w._axleSusp
@@ -1569,8 +1669,13 @@ function SimcadeCore.init(CONFIG)
                 local axle = w._axleSusp
                 local deflection = math.max(1, w.rideHeight * math.clamp(axle.restCompression or 0.45, 0.15, 0.85))
                 local stiffness = math.max(0, axle.springStiffnessMult or axle.springStiffness or 1)
-                local kWheel = (cornerMassSub * gravity / deflection) * stiffness
-                kRollSum = kRollSum + kWheel * (w._ly * w._ly)
+                local helper = math.max(0, axle.helperSpringMult or (simMass >= 2600 and 8 or 0))
+                local helperStart = math.clamp(axle.helperStartCompression or 0, deflection / w.rideHeight, 1) * w.rideHeight
+                local travel = math.max(1, (axle.bumpLimit or w.rideHeight) - helperStart)
+                local overload = math.clamp((w._subComp - helperStart) / travel, 0, 1)
+                local kWheel = cornerMassSub * gravity * (stiffness / deflection + 2 * helper * overload / travel)
+                maxSpringFrequency = math.max(maxSpringFrequency, math.sqrt(kWheel / cornerMassSub))
+                kRollSum = kRollSum + kWheel * (1 + 1.4 * math.clamp(axle.antiRollStiffness or 0, 0, 1.2)) * (w._ly * w._ly)
                 kPitchSum = kPitchSum + kWheel * (w._lx * w._lx)
             end
             -- Geometric estimate fallback; keep a low floor so small Base props still use their true inertia.
@@ -1578,11 +1683,11 @@ function SimcadeCore.init(CONFIG)
             local geoPitch = physMass * maxLx * maxLx * 0.4
             iRoll  = (iRoll and iRoll > 0) and math.clamp(iRoll, geoRoll * 0.05, geoRoll * 2.0) or geoRoll
             iPitch = (iPitch and iPitch > 0) and math.clamp(iPitch, geoPitch * 0.05, geoPitch * 2.0) or geoPitch
-            -- Suspension forces are virtual (simMass); applied impulse is scaled by physMass/simMass
-            iRoll  = math.max(1, iRoll / vphysScale)
-            iPitch = math.max(1, iPitch / vphysScale)
+            -- Convert physical inertia to the same scale as the simulated spring forces.
+            iRoll  = math.max(1, iRoll / supportScale)
+            iPitch = math.max(1, iPitch / supportScale)
             maxSpringFrequency = math.max(maxSpringFrequency, math.sqrt(kRollSum / iRoll), math.sqrt(kPitchSum / iPitch))
-            local nSuspSub = math.clamp(math.ceil(dt * math.max(66, 8 * maxSpringFrequency)), 1, 16)
+            local nSuspSub = math.clamp(math.ceil(dt * math.max(66, 8 * maxSpringFrequency)), 1, 32)
             local hSub = dt / nSuspSub
             local gFracSub    = #subWheels / numWheels
             local avgCWSub    = (simMass / numWheels) * gravity
@@ -1594,7 +1699,9 @@ function SimcadeCore.init(CONFIG)
             end
 
             local gUp = gravity * driverUp.z
-            local subMass = simMass * math.max(1.0, (ctrlState._contraptionMass or physMass) / math.max(1, physMass))
+            local loadLeveling = #subWheels >= 3 and
+                ((SimcadeSuspension.getAxleCfg(SUSPENSION_CFG, false).levelCapacityKG or 0) > 0
+                or (SimcadeSuspension.getAxleCfg(SUSPENSION_CFG, true).levelCapacityKG or 0) > 0)
             local dvz, dwr, dwp = 0, 0, 0
             for s = 1, nSuspSub do
                 local Fz, TrSpring, TpSpring = 0, 0, 0
@@ -1606,7 +1713,7 @@ function SimcadeCore.init(CONFIG)
                     suspParams.chassisVelZ   = w._cvz0 + dCorner
                     suspParams.rideHeight    = w.rideHeight or 24
                     suspParams.virtualMassKG = simMass
-                    suspParams.physMassKG    = physMass
+                    suspParams.physMassKG    = supportMass
                     suspParams.numWheels     = numWheels
                     suspParams.dt            = hSub
                     suspParams.arrestDt      = dt
@@ -1619,21 +1726,30 @@ function SimcadeCore.init(CONFIG)
                         _, force, rateK = SimcadeSuspension.computeWheelForce(suspParams)
                     end
                     w._springForce, w._springRate = force, rateK
+                    if loadLeveling and s == 1 then
+                        -- Estimate the static corner load for the heave and pitch predictors.
+                        suspParams.compIn = w.compIn
+                        suspParams.compressionRate, suspParams.chassisVelZ = 0, 0
+                        local _, staticForce = SimcadeSuspension.computeWheelForce(suspParams)
+                        w._staticSpring = staticForce
+                    end
                 end
                 SimcadeSuspension.applyAntiRoll(groundedByIndex[0], groundedByIndex[1])
                 SimcadeSuspension.applyAntiRoll(groundedByIndex[3], groundedByIndex[2])
                 for _, w in ipairs(subWheels) do
                     local f = w._springForce
                     w._subImp = w._subImp + f * hSub
-                    local fe = f * w._liftUp
+                    local fe = (f - (loadLeveling and w._staticSpring or 0)) * w._liftUp
                     Fz = Fz + fe
                     -- The applied offset impulses subtract the static load shares.
-                    TrSpring = TrSpring + fe * (w._ly - staticY)
+                    -- Axle leveling estimates heave and pitch load. The passive
+                    -- roll predictor must retain the left/right restoring moment.
+                    TrSpring = TrSpring + f * w._liftUp * (w._ly - staticY)
                     TpSpring = TpSpring + fe * (w._lx - staticX)
                 end
                 if nSuspSub > 1 then
                     local Tr = TrSpring + transferTr
-                    dvz = dvz + (Fz / subMass - gUp) * hSub
+                    dvz = dvz + (Fz / simMass - (loadLeveling and 0 or gUp)) * hSub
                     dwr = dwr + (Tr / iRoll) * hSub
                     dwp = dwp + (TpSpring / iPitch) * hSub
                     for _, w in ipairs(subWheels) do
@@ -1644,6 +1760,21 @@ function SimcadeCore.init(CONFIG)
             end
         end
 
+        local levelImpulse = 0
+        for leftIndex = 0, 3, 3 do
+            local rightIndex = leftIndex == 0 and 1 or 2
+            local left, right = groundedByIndex[leftIndex], groundedByIndex[rightIndex]
+            local cfg = SimcadeSuspension.getAxleCfg(SUSPENSION_CFG, leftIndex == 0)
+            local axle = physicsCar.wheels[leftIndex]
+            if isPhysgunHeld then
+                axle.levelKG = 0
+            else
+                -- Add slow payload support after the passive spring predictor.
+                local imp
+                axle.levelKG, imp = SimcadeSuspension.levelAxle(left, right, cfg, axle.levelKG or 0, dt, gravity * dt / supportScale)
+                levelImpulse = levelImpulse + imp
+            end
+        end
         for _, w in ipairs(runtimeWheels) do
             if w.isGrounded then
                 local virtForce = (w._subImp or 0) / dt
@@ -1672,7 +1803,18 @@ function SimcadeCore.init(CONFIG)
             avgUpAlign = avgUpAlign / #groundedSuspWheels
         end
 
+        -- Loose cargo has physical kg even when the tare is virtual. Use the
+        -- axle support estimate to convert tire forces with the laden mass ratio.
+        local payloadKG = (physicsCar.wheels[0].levelKG or 0) + (physicsCar.wheels[3].levelKG or 0)
+        local grossPhysical = supportMass + payloadKG
+        local driveScale = grossPhysical / (simMass + payloadKG)
+        local driveMass = simMass * driveScale
+        if payloadKG > 0 then
+            for i = 0, 3 do vphysLoadsKN[i] = vphysLoadsKN[i] * supportScale / driveScale end
+        end
+        local useContactYaw = groundedCount > 0 and (supportMass > physMass or payloadKG > 0)
         local physicsStep = physicsCar:stepVPhysics(dt, pos_m, R_mat, vel_m, angVel_rad, wheelGrounds, {
+            useContactYaw   = useContactYaw,
             steer           = steerInput,
             gas             = ignRes.running and rawThrottle or 0,
             reverseGas      = ignRes.running and (ctrl.rawReverseThrottle or rawBrake) or 0,
@@ -1688,27 +1830,42 @@ function SimcadeCore.init(CONFIG)
             latAccelG       = smoothedLatAccel,
             vertAccelG      = ctrlState._smoothedVertG or 0,
             ignitionRunning = ignRes.running,
+            cranking        = ignRes.cranking,
             crankRPM        = ignRes.crankRPM,
             maxSubsteps     = physicsMaxSubsteps,
         })
 
+        if physicsStep.engineStalled and ignState.running then
+            SimcadeEngine.stallIgnition(ignState)
+            ignRes.running = false
+            physicsCar.engineStalled = false
+            physicsCar.stallTimer = 0
+            if hasDriver then
+                sendDriverPrint(Driver, string.format("Engine STALLED (hold %s to crank)", keyLabel(kIgn, "F")))
+            end
+        end
+
         local totalAppliedForce = 0
         if not isPhysgunHeld then
             if #groundedSuspWheels > 0 then
-            Phys:applyForceCenter(rawCornerLiftSum * vphysScale - skippedLiftApplied)
+            Phys:applyForceCenter(rawCornerLiftSum * supportScale - skippedLiftApplied)
             skippedLiftApplied = Vector(0, 0, 0)
 
-            local maxDeltaImp = avgCornerWeight * dt * 6.0
+            local maxDeltaImp = avgCornerWeight * dt * 6.0 + levelImpulse
+            -- Scale all corner differences together so the correction stays a pure moment.
+            local maxOffsetSq = maxDeltaImp * maxDeltaImp
+            for _, w in ipairs(runtimeWheels) do
+                local share = (w.isFront and frontBias or (1 - frontBias)) * 0.5
+                maxOffsetSq = math.max(maxOffsetSq, (w.suspImpulseVec - rawCornerLiftSum * share):getLengthSqr())
+            end
+            local offsetScale = maxDeltaImp / math.sqrt(maxOffsetSq)
             for _, w in ipairs(runtimeWheels) do
                 local staticShare = w.isFront and (frontBias * 0.5) or ((1.0 - frontBias) * 0.5)
                 local deltaSuspVec = w.suspImpulseVec - (rawCornerLiftSum * staticShare)
                 local lenSq = deltaSuspVec:getLengthSqr()
                 if lenSq > 0.001 then
-                    if lenSq > (maxDeltaImp * maxDeltaImp) then
-                        deltaSuspVec = deltaSuspVec:getNormalized() * maxDeltaImp
-                    end
-                    local forcePos = w.isGrounded and (w.contactPos or w.inPlaneForcePos) or w.inPlaneForcePos
-                    Phys:applyForceOffset(deltaSuspVec * vphysScale, forcePos)
+                    deltaSuspVec = deltaSuspVec * offsetScale
+                    Phys:applyForceOffset(deltaSuspVec * supportScale, w.inPlaneForcePos)
                 end
             end
 
@@ -1723,12 +1880,12 @@ function SimcadeCore.init(CONFIG)
                 for _, w in ipairs(runtimeWheels) do
                     local frontSign = w.isFront and 1 or -1
                     local transferImp = (frontSign * pitchBias + w._rollSide * rollBias) * avgCornerWeight * dt * gFrac
-                    Phys:applyForceOffset(driverUp * (transferImp * vphysScale), w.inPlaneForcePos)
+                    Phys:applyForceOffset(driverUp * (transferImp * supportScale), w.inPlaneForcePos)
                 end
             end
         end
 
-        -- Tire + Aero forces (applied at CoM, scaled by physMass, projected onto ground plane)
+        -- Convert simulated acceleration to an impulse on the supported chassis.
             local gripTiltScale = (#groundedSuspWheels > 0) and math.clamp((avgUpAlign - 0.55) / 0.23, 0, 1) or 0
             if canTransferRoll then
                 -- Only the road-tangent lateral part of the tire impulse
@@ -1737,8 +1894,8 @@ function SimcadeCore.init(CONFIG)
                 local lateralScale = gripTiltScale * (1 - rightDotNormal * rightDotNormal)
                 ctrlState.corneringG = math.clamp(-physicsStep.dv_left_m * M_TO_IN * lateralScale / (dt * gravity), -2, 2)
             end
-            local totalGripImpulse = (driverFwd * (physicsStep.dv_fwd_m * M_TO_IN * physMass)
-                + driverLeft * (physicsStep.dv_left_m * M_TO_IN * physMass)) * gripTiltScale
+            local totalGripImpulse = (driverFwd * (physicsStep.dv_fwd_m * M_TO_IN * driveMass)
+                + driverLeft * (physicsStep.dv_left_m * M_TO_IN * driveMass)) * gripTiltScale
             if #groundedSuspWheels > 0 and avgGroundNorm:getLengthSqr() > 0.01 then
                 totalGripImpulse = totalGripImpulse - avgGroundNorm * totalGripImpulse:dot(avgGroundNorm)
             end
@@ -1747,20 +1904,21 @@ function SimcadeCore.init(CONFIG)
             end
             totalAppliedForce = totalGripImpulse:getLength()
             if #groundedSuspWheels > 0 and dt > 0 then
-                local liftPerSec = (rawCornerLiftSum * vphysScale) / dt
+                local liftPerSec = (rawCornerLiftSum * supportScale) / dt
                 local gFrac = #groundedSuspWheels / numWheels
-                local maxCachedLift = physMass * gravity * 3.0
+                local maxCachedLift = supportMass * gravity * 3.0
                 local liftLen = liftPerSec:getLength()
                 local clampedLift = (liftLen > maxCachedLift) and (liftPerSec * (maxCachedLift / liftLen)) or liftPerSec
                 if cachedLiftForcePerSec then
                     local blend = math.clamp(dt * 3.0, 0, 1)
                     cachedLiftForcePerSec = cachedLiftForcePerSec + (clampedLift - cachedLiftForcePerSec) * blend
                 else
-                    local staticSupport = physMass * gravity * gFrac * math.max(0, avgGroundNorm.z)
+                    local staticSupport = supportMass * gravity * gFrac * math.max(0, avgGroundNorm.z)
                     cachedLiftForcePerSec = avgGroundNorm * math.min(staticSupport, liftLen)
                 end
             else
                 cachedLiftForcePerSec = nil
+                skippedLiftApplied = Vector(0, 0, 0)
             end
 
             -- Angular damping + yaw delta
@@ -1769,8 +1927,7 @@ function SimcadeCore.init(CONFIG)
             local rollRate = angVelLocal:dot(resolvedLocalFwd)
             local rollDamping = resolvedLocalFwd * (-rollRate * (1 - math.exp(-angDrag.x * rollPitchMult * dt)))
             local dampPitch = -angVelLocal:dot(resolvedLocalRight) * (1.0 - math.exp(-(angDrag.y * rollPitchMult) * dt))
-            local yawDeltaLocal = Base:worldToLocalVector(driverUp * physicsStep.dw_yaw_rad) * (180 / math.pi)
-            local deltaAngVel = rollDamping + resolvedLocalRight * dampPitch + yawDeltaLocal
+            local deltaAngVel = rollDamping + resolvedLocalRight * dampPitch
 
             if #groundedSuspWheels >= 3 and math.abs(steerInput) < 0.05 and rawHandbrake < 0.1 and (physicsStep.speed_ms or 0) * 3.6 > 8 then
                 local yawStabRate = (STEERING_CFG.yawStabilityAssist or 0.38) * 4.5
@@ -1783,30 +1940,95 @@ function SimcadeCore.init(CONFIG)
             local supportedLoad, brakedLoad = 0, 0
             for _, w in ipairs(groundedSuspWheels) do
                 w.holdBrake = math.max(physicsCar.drv.brk or 0, w.isFront and 0 or rawHandbrake)
+                -- A small front holding force helps a parked car when the
+                -- steered tires point partly down a bank. Fade it out as the
+                -- car starts moving relative to the surface under this wheel.
+                if w.isFront and rawHandbrake > 0 and rawThrottle < 0.05 then
+                    local relative = velWorld - w.supportVel + angVelWorldRad:cross(w.contactPos - comWorld)
+                    local tangent = relative - w.hitNormal * relative:dot(w.hitNormal)
+                    local assist = 0.12 * rawHandbrake * math.max(0, 1 - tangent:getLengthSqr() / (20 * 20))
+                    w.holdBrake = math.max(w.holdBrake, assist)
+                end
                 supportedLoad = supportedLoad + w.normalLoad
                 brakedLoad = brakedLoad + w.normalLoad * w.holdBrake
             end
             local restImpulse, restYawImpulse = Vector(), 0
+            local parkingHold = brakedLoad > 0 and canHold
             local yawOrigin = comWorld + driverFwd * ((physicsCar.comShiftX_m or 0) * M_TO_IN)
+            local yawInverseInertia
+            if useContactYaw then
+                yawOrigin = Base:localToWorld(massCenterLocal)
+                local inertia = Phys:getInertia()
+                local up = resolvedLocalUp
+                if inertia and inertia.x > 0 and inertia.y > 0 and inertia.z > 0 then
+                    yawInverseInertia = up.x^2 / inertia.x + up.y^2 / inertia.y + up.z^2 / inertia.z
+                end
+            end
             for _, w in ipairs(runtimeWheels) do
-                local massShare = physMass * w.normalLoad / math.max(0.001, supportedLoad)
-                local brakeShare = physMass * w.normalLoad * (w.holdBrake or 0) / math.max(0.001, brakedLoad)
+                local massShare = grossPhysical * w.normalLoad / math.max(0.001, supportedLoad)
+                local brakeShare = grossPhysical * w.normalLoad * (w.holdBrake or 0) / math.max(0.001, brakedLoad)
+                local motionMass = parkingHold and supportMass or physMass
                 local impulse, point = SimcadeSuspension.staticGripImpulse(w, physicsCar.wheels[w.physicsIndex],
-                    canHold, w.holdBrake or 0, driverFwd, driverLeft, comWorld, velWorld, angVelWorldRad,
-                    massShare, brakeShare, vphysScale, gravity, dt, Base)
+                    canHold, w.holdBrake or 0, driverFwd, driverLeft, useContactYaw and yawOrigin or comWorld, velWorld, angVelWorldRad,
+                    massShare, brakeShare, driveScale, gravity, dt, Base, supportScale,
+                    useContactYaw and motionMass / grossPhysical or 1, yawInverseInertia and motionMass * yawInverseInertia or 0,
+                    parkingHold)
                 if impulse then
                     restImpulse = restImpulse + impulse
                     restYawImpulse = restYawImpulse + (point - yawOrigin):cross(impulse):dot(driverUp) * IN_TO_M
                 end
             end
-            -- Dynamic tire forces use a center impulse and the solver's yaw inertia.
-            -- Replace them through the same paths when a contact settles.
+            -- Static grip replaces the settled part of the dynamic contact impulse.
             if restImpulse:getLengthSqr() > 0 then
-                Phys:applyForceCenter(restImpulse * (1000 * M_TO_IN * vphysScale))
+                Phys:applyForceCenter(restImpulse * (1000 * M_TO_IN * driveScale))
             end
             local inverseInertia = physicsCar.mode344 ~= 0 and physicsCar.Iinv2 or physicsCar.Iinv
-            deltaAngVel = deltaAngVel + resolvedLocalUp * math.deg(restYawImpulse * inverseInertia[2])
+            if useContactYaw then
+                -- The linear impulse was applied at the Base mass center. Restore
+                -- the contact moment about that same point using the same scale.
+                local yawImpulse = (physicsStep.tireYawImpulse * gripTiltScale + restYawImpulse) * 1000 * driveScale
+                yawImpulse = yawImpulse + (comWorld - yawOrigin):cross(totalGripImpulse):dot(driverUp) * IN_TO_M^2
+                local spanM = physicsCar.c[69]
+                local lateralImpulse = driverLeft * (yawImpulse * M_TO_IN / spanM)
+                local arm = driverFwd * (0.5 * spanM * M_TO_IN)
+                Phys:applyForceOffset(lateralImpulse, comWorld + arm)
+                Phys:applyForceOffset(-lateralImpulse, comWorld - arm)
+            else
+                local yawDelta = physicsStep.dw_yaw_rad + restYawImpulse * inverseInertia[2]
+                deltaAngVel = deltaAngVel + resolvedLocalUp * math.deg(yawDelta)
+            end
             Phys:addAngleVelocity(deltaAngVel)
+
+            -- The sweep handled incoming velocity before the tire step. Resolve
+            -- this tick's new drive into the face as well, even at zero speed.
+            local remainingGrip = totalGripImpulse
+            for _, w in ipairs(runtimeWheels) do
+                local wall = w.wallDriveContact
+                if wall and not wall.resolved then
+                    local inward = -remainingGrip:dot(wall.normal) - supportMass * wall.spareSpeed
+                    if inward > 0 then
+                        local contactPoint = wall.point
+                        local count = 1
+                        for _, other in ipairs(runtimeWheels) do
+                            local otherWall = other.wallDriveContact
+                            if other ~= w and otherWall and otherWall.body == wall.body
+                                and otherWall.normal:dot(wall.normal) > 0.99
+                                and math.abs(otherWall.spareSpeed - wall.spareSpeed) < 0.1 then
+                                contactPoint = contactPoint + otherWall.point
+                                count = count + 1
+                                otherWall.resolved = true
+                            end
+                        end
+                        contactPoint = contactPoint / count
+                        local body = wall.body
+                        if isValid(body) then inward = inward / (1 + supportMass / math.max(1, body:getMass())) end
+                        local reaction = wall.normal * inward
+                        Phys:applyForceOffset(reaction, contactPoint)
+                        if isValid(body) then body:applyForceOffset(-reaction, contactPoint) end
+                        remainingGrip = remainingGrip + reaction
+                    end
+                end
+            end
 
             local waterLvl = (Base.getWaterLevel and Base:getWaterLevel()) or (Base.waterLevel and Base:waterLevel()) or 0
             local wheelWaterFrac = waterWheelsCount / numWheels
@@ -1945,14 +2167,15 @@ function SimcadeCore.init(CONFIG)
             end
         end
 
+        local isDiesel = SimcadeEngine and SimcadeEngine.isDiesel and SimcadeEngine.isDiesel(ENGINE_CFG)
         local liveBoostPSI = (combinedBoostRatio - 1.0) * inductionAirPressure
         local gearChanged = (physicsStep.gearName ~= prevGearName)
         local bovThreshold = math.max(0, tonumber(ENGINE_CFG.Turbo_BOVThresholdPSI) or 3.5)
         local turboPSI = turboActive and math.max(0, tonumber(tRes.psi) or 0) or 0
-        local bovTrigger = turboActive and (prevThrottle > 0.45 and physicsStep.throttle < 0.20 and prevBoostPSI > bovThreshold)
+        local bovTrigger = turboActive and not isDiesel and (prevThrottle > 0.45 and physicsStep.throttle < 0.20 and prevBoostPSI > bovThreshold)
         prevGearName, prevThrottle, prevBoostPSI = physicsStep.gearName, physicsStep.throttle, turboPSI
 
-        local masterClutch = SimcadeGearbox.computeMasterClutch({
+        local masterClutch = physicsCar.clutchEngageTime > 0 and physicsStep.clutch or SimcadeGearbox.computeMasterClutch({
             gear                  = physicsCar.dt.gear,
             state                 = physicsCar.dt.state,
             clutchPedal           = clutchPedal,
@@ -1968,13 +2191,15 @@ function SimcadeCore.init(CONFIG)
             clutchLerp            = ENGINE_CFG.ClutchLerp,
             clutchLerpReverse     = ENGINE_CFG.ClutchLerpReverse,
         })
-        local displayRPM = ignRes.running and (physicsStep.rpm or 0) or (ignRes.crankRPM or 0)
+        local displayRPM = ignRes.running and (physicsStep.rpm or 0)
+            or (ignRes.cranking and (ENGINE_CFG.PhysicalStarter ~= true) and (ignRes.crankRPM or 0) or (physicsStep.flywheel_rpm or 0))
         local anyDrifting = (kmh > 10 and math.abs(maxSlipAngle) > math.rad(12) and anySlipping)
 
         if aHost then
             local actx = aHost.ctx
             actx.state.running = ignRes.running
             actx.state.turboBoostRatio = turboBoostRatio
+            actx.state.manifoldPSI = physicsStep.manifoldPSI or liveBoostPSI
             actx.state.limiterRPM = physicsCar.c[126]
             actx.state.rpm = displayRPM
             actx.state.gear = (physicsCar.dt.gear or 2) - 1
@@ -1984,6 +2209,8 @@ function SimcadeCore.init(CONFIG)
             actx.state.throttle = physicsStep.throttle or rawThrottle
             actx.state.isDrifting = anyDrifting
             actx.state.isSlipping = anySlipping
+            actx.state.jakeBrakeStage = physicsStep.jakeBrakeStage or 0
+            actx.state.jakeBrakeActive = physicsStep.jakeBrakeActive == true
             aHost.runHook("OnPostPhysics", dt, physicsStep)
         end
 
@@ -2017,6 +2244,8 @@ function SimcadeCore.init(CONFIG)
                 frontActiveLockPct = physicsStep.frontActiveLockPct,
                 rearActiveLockPct = physicsStep.rearActiveLockPct,
                 absActive = anyABSActive,
+                jakeBrakeStage = physicsStep.jakeBrakeStage or 0,
+                jakeBrakeActive = physicsStep.jakeBrakeActive == true,
                 flLoad = (runtimeWheels[1] and runtimeWheels[1].normalLoad or 0) / dt,
                 frLoad = (runtimeWheels[2] and runtimeWheels[2].normalLoad or 0) / dt,
                 rlLoad = (runtimeWheels[3] and runtimeWheels[3].normalLoad or 0) / dt,
@@ -2227,6 +2456,7 @@ function SimcadeCore.init(CONFIG)
                 net.writeFloat(wsDbg.fwdG or 0)
                 net.writeFloat(wsDbg.latG or 0)
                 net.writeFloat(wsDbg.vertMult or 1.0)
+                net.writeUInt(math.round(masterClutch * 255), 8)
                 if not sendTelemetry(hudTargets, true) then return false end
                 nextHudNetTime = nextDeadline(nextHudNetTime, (kmh > 1 or rawThrottle > 0.05 or rawBrake > 0.05 or ignRes.cranking) and netInterval or math.max(netInterval, 0.25))
                 return true

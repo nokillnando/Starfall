@@ -9,15 +9,24 @@ return function(options)
     local coolRate = math.max(0, options.CoolRate or 0.08)
     local airflow = math.max(0, options.SpeedCoolScale or 0.15)
     local stoppedMult = math.max(0, options.StoppedCoolMult or 0.5)
+    local enableFade = (options.EnableFade == true)
+    local fadeStartTemp = math.max(ambient, tonumber(options.FadeStartTemp) or 400)
+    local fadeFullTemp = math.max(fadeStartTemp + 10, tonumber(options.FadeFullTemp) or 750)
+    local minFadeMult = math.clamp(tonumber(options.MinFadeMult) or 0.45, 0.15, 1.0)
     -- Solver slots run FL, FR, RR, RL.
     local fields = { [0] = "TempFL", "TempFR", "TempRR", "TempRL" }
     local temperatures = {}
     local extraWheels = {}
     local extraTemperatures = {}
     local rpmToKmh = math.max(0, options.WheelRPMToSpeed or 0.15)
-    local values = { TempMax = ambient, WheelTemps = {}, ExtraWheelTemps = {} }
+    local values = { TempMax = ambient, WheelTemps = {}, ExtraWheelTemps = {}, FadeMults = { [0] = 1, 1, 1, 1 } }
     for slot = 0, 3 do
         values[fields[slot]] = ambient
+    end
+    local function computeFadeMult(tempC)
+        if not enableFade or tempC <= fadeStartTemp then return 1.0 end
+        local t = math.clamp((tempC - fadeStartTemp) / (fadeFullTemp - fadeStartTemp), 0, 1)
+        return 1.0 - (1.0 - minFadeMult) * t
     end
 
     return {
@@ -71,7 +80,7 @@ return function(options)
                 local slot = runtime.physicsIndex
                 local wheel = ctx.car.wheels[slot]
                 local wheelKmh = math.abs(wheel.w) * runtime.radius * 0.0254 * 3.6
-                temperatures[i] = integrate(temperatures[i] or ambient, wheel.serviceBrakeKNm / fullBrake, wheelKmh)
+                temperatures[i] = integrate(temperatures[i] or ambient, (wheel.serviceBrakeKNm or 0) / fullBrake, wheelKmh)
                 wheelTemps[i] = math.round(temperatures[i], 1)
                 corners[slot] = math.max(corners[slot], wheelTemps[i])
                 hottest = math.max(hottest, wheelTemps[i])
@@ -95,6 +104,11 @@ return function(options)
             for slot = 0, 3 do
                 local field = fields[slot]
                 values[field] = corners[slot]
+                local fadeMult = computeFadeMult(corners[slot])
+                values.FadeMults[slot] = math.round(fadeMult, 3)
+                if ctx.car and ctx.car.wheels and ctx.car.wheels[slot] then
+                    ctx.car.wheels[slot].brakeTempMult = enableFade and fadeMult or nil
+                end
                 ctx.setWireOutput("Brake" .. field, corners[slot])
             end
             values.TempMax = math.round(hottest, 1)
@@ -103,6 +117,13 @@ return function(options)
             ctx.setWireOutput("BrakeTempMax", values.TempMax)
             ctx.setWireOutput("BrakeWheelTemps", wheelTemps)
             ctx.setWireOutput("ExtraBrakeWheelTemps", extraTemps)
+        end,
+        OnCleanup = function(ctx)
+            if ctx and ctx.car and ctx.car.wheels then
+                for slot = 0, 3 do
+                    if ctx.car.wheels[slot] then ctx.car.wheels[slot].brakeTempMult = nil end
+                end
+            end
         end,
     }
 end

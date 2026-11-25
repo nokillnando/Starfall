@@ -704,9 +704,10 @@ function SimcadeSounds.initClient(cfg)
                 predictedShifts[gear] = now + confirmationWindow
                 playOneShot(engEnt, engPos, SND.GearChange, shiftPath, 0.50, 100)
             end
+            local isDiesel = SimcadeEngine and SimcadeEngine.isDiesel and SimcadeEngine.isDiesel(ENG)
             local bovThreshold = math.max(0, tonumber(ENG.Turbo_BOVThresholdPSI) or 3.5)
             local bovPitch = clamp(102 * (SND.TurboBOVPitch or 1.0), 40, 220)
-            if turboEnabled and bovPath ~= "" and not pendingBovSound and now >= math.max(predictedBovUntil, confirmedBovUntil)
+            if turboEnabled and not isDiesel and bovPath ~= "" and not pendingBovSound and now >= math.max(predictedBovUntil, confirmedBovUntil)
                 and previousPrediction.result.throttle > 0.45 and throttle < 0.20
                 and previousPrediction.turboPSI > bovThreshold then
                 predictedBovUntil = now + confirmationWindow

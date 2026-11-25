@@ -1,0 +1,235 @@
+--@name Simcade Gearbox & Differential Module
+--@shared
+
+SimcadeGearbox = SimcadeGearbox or {}
+
+local clamp = math.clamp or function(v, a, b) return v < a and a or (v > b and b or v) end
+
+-- Compute Sim-Engine style Master Clutch disengagement (0 = engaged, 1 = disengaged)
+function SimcadeGearbox.computeMasterClutch(params)
+    local gear         = params.gear or 2
+    local state        = params.state or 2
+    local clutchPedal  = params.clutchPedal
+    local handbrake    = params.handbrake or 0
+    local brkIn        = params.brake or 0
+    local thrIn        = params.throttle or 0
+    local speedKmh     = math.abs(params.speedKmh or 0)
+    local stopSpd      = params.stoppedPhaseBrakeSpeed or 5
+    local rpmNow       = params.rpm or 1000
+    local redline      = math.max(1000, params.redlineRPM or 8000)
+    local isManual     = params.isManual and true or false
+    local useInManual  = (params.useClutchLerpInManual ~= false)
+    local inReverse    = (gear == 0) or (params.reversing == true)
+    local lerpLim      = inReverse and (params.clutchLerpReverse or 0.5) or (params.clutchLerp or 0.4)
+
+    local hasThrInput = thrIn > 0.05
+    local simClutch = 0
+    if gear == 1 or state == 0 or state == 1 or (clutchPedal == 0) or (handbrake > 0.5) then
+        simClutch = 1
+    elseif brkIn > 0.05 and not hasThrInput and speedKmh <= stopSpd then
+        simClutch = 1
+    elseif brkIn > 0.05 and not hasThrInput and speedKmh <= (stopSpd + 15) then
+        simClutch = 1.0 - clamp((speedKmh - stopSpd) / 15.0, 0, 1)
+    elseif not hasThrInput and speedKmh <= stopSpd then
+        simClutch = 1
+    end
+
+    if simClutch < 1 and (not isManual or useInManual) then
+        local rpmClutch = math.max(0, lerpLim - (rpmNow / redline))
+        simClutch = math.max(simClutch, rpmClutch)
+    end
+    return clamp(simClutch, 0, 1)
+end
+
+-- Sim-Engine Fixed-Gearing Upshift & Downshift with Anti-Hunt, Slip & Over-Rev Guards
+function SimcadeGearbox.evaluateAutoShift(car, dt)
+    local d, c = car.dt, car.c
+    if d.gear == 1 or d.shifting ~= 0 then
+        car._upDwell = 0
+        car._downDwell = 0
+        return nil
+    end
+
+    local function getRatio(g)
+        return (car.gearRatio and car:gearRatio(g)) or c[116 + g] or 0
+    end
+
+    local thr = (car.drv and car.drv.thr) or 0
+    local brk = (car.drv and car.drv.brk) or 0
+    local redline = math.max(1000, c[125] or c[126] or 8000)
+    local rpmNow = car.eng.w * 9.54929676
+    local rpmPct = (rpmNow / redline) * 100
+
+    local comfortUp   = car.comfortUpshiftRPM   or 62
+    local sportUp     = car.sportUpshiftRPM     or 90
+    local comfortDown = car.comfortDownshiftRPM or 34
+    local sportDown   = car.sportDownshiftRPM   or 55
+    local thrEff      = car.alwaysSportMode and 1.0 or clamp(thr, 0, 1)
+    local upPct       = comfortUp   + (sportUp   - comfortUp)   * thrEff
+    local downPct     = comfortDown + (sportDown - comfortDown) * thrEff
+    local upRPM       = redline * (upPct / 100)
+    local downRPM     = redline * (downPct / 100)
+    local sportDownRPM = redline * (sportDown / 100)
+
+    local roadMS = math.abs(car.forward or 0)
+    local speedKmh = roadMS * 3.6
+    local now = car.now or 0
+    local stepDt = clamp(tonumber(dt) or 0.016, 0.001, 0.1)
+    local antiHuntCooldown = math.max(0.25, car.downshiftCooldown or 0.45)
+
+    -- Anchor anti-hunt cooldown to when the shift actually finishes (after shiftDelay),
+    -- not when it was requested.
+    if car._awaitingShiftFinish then
+        if d.gear == car._pendingShiftGear or (now - (car.lastShiftTime or 0)) > 2.0 then
+            local cd = car._pendingShiftCooldown or antiHuntCooldown
+            car._awaitingShiftFinish = false
+            car._pendingShiftGear = nil
+            car._pendingShiftCooldown = nil
+            car.lastShiftTime = now
+            car.nextDownshiftTime = now + cd
+            car._upDwell = 0
+            car._downDwell = 0
+        end
+    end
+
+    local sinceLastShift = now - (car.lastShiftTime or -10)
+
+    local function commitShift(targetGear, dir, cooldownOverride)
+        local cd = cooldownOverride or antiHuntCooldown
+        car.lastShiftDir          = dir
+        car.lastShiftTime         = now
+        car.nextDownshiftTime     = now + cd
+        car._awaitingShiftFinish  = true
+        car._pendingShiftGear     = targetGear
+        car._pendingShiftCooldown = cd
+        car._upDwell              = 0
+        car._downDwell            = 0
+        return targetGear
+    end
+
+    if d.gear <= 0 then
+        local minGear = car.minGear or 0
+        if minGear >= 0 or d.state ~= 3 then
+            car._upDwell, car._downDwell = 0, 0
+            return nil
+        end
+        local revIdx = 1 - d.gear -- 0 -> R1 (1), -1 -> R2 (2)
+        local revSpeeds = car.reverseGearSpeeds
+        local upshiftSpd = revSpeeds and revSpeeds[revIdx]
+        if d.gear > minGear and thr > 0.05 and ((upshiftSpd and speedKmh >= upshiftSpd) or rpmPct >= upPct) then
+            if car.lastShiftDir ~= "down" or sinceLastShift >= antiHuntCooldown then
+                return commitShift(d.gear - 1, "up")
+            end
+        elseif d.gear < 0 and now >= (car.nextDownshiftTime or 0) then
+            local downSpd = revSpeeds and revSpeeds[revIdx - 1]
+            if (downSpd and speedKmh <= downSpd * 0.72) or rpmPct <= downPct then
+                if car.lastShiftDir ~= "up" or sinceLastShift >= antiHuntCooldown then
+                    return commitShift(d.gear + 1, "down")
+                end
+            end
+        end
+        return nil
+    end
+    local topGear = (car.top or 6) + 1
+    local gearSpeeds = car.gearSpeeds
+    local wRad = (car.wheels and car.wheels[2] and car.wheels[2].radius) or 0.34
+    local curRatio = math.abs(getRatio(d.gear))
+    if curRatio < 0.01 then curRatio = 1 end
+    local finalDrive = math.abs(c[111] or 3.9)
+    local roadSyncRPM = (roadMS / math.max(0.20, wRad)) * finalDrive * curRatio * 9.54929676
+
+    local wheelSpinMS = 0
+    if car.wheels then
+        for wi = 0, 3 do
+            local W = car.wheels[wi]
+            if W then
+                local ws = math.abs((W.w or 0) * (W.radius or wRad))
+                if ws > wheelSpinMS then wheelSpinMS = ws end
+            end
+        end
+    end
+    local isWheelSpinning = (wheelSpinMS - roadMS) > 4.0
+
+    local stopSpd = (car.stoppedPhaseBrakeSpeed or 5) + 3
+    if d.gear > 2 and speedKmh <= stopSpd and (roadSyncRPM <= (redline * 0.40) or rpmNow <= (redline * 0.45)) then
+        return commitShift(2, "down", 0.15)
+    end
+    if d.state ~= 3 then
+        car._upDwell, car._downDwell = 0, 0
+        return nil
+    end
+
+    -- Maximum RPM allowed immediately after a downshift so the lower gear has
+    -- a real hysteresis buffer below the upshift point (prevents 1-2 / 2-3 hunting).
+    local downshiftLandingCap = math.min(redline * 0.90, upRPM * 0.82)
+
+    -- Upshift guard: anti-loop (next gear must land well above its effective downshift threshold),
+    -- wheelspin, min speed, and short dwell timer (bypassed near redline).
+    local wantsUpshift = false
+    local mustUpshift = (rpmNow >= redline * 0.97)
+    if d.gear < topGear and rpmPct >= upPct and thr > 0.05 and not isWheelSpinning then
+        if mustUpshift or car.lastShiftDir ~= "down" or sinceLastShift >= antiHuntCooldown then
+            local nextRatio = math.abs(getRatio(d.gear + 1))
+            if nextRatio < 0.01 then nextRatio = curRatio end
+            local ratioStep = nextRatio / math.max(0.05, curRatio)
+            local nextProjectedRPM = math.max(rpmNow, roadSyncRPM) * ratioStep
+            local nextEffectiveDownRPM = math.min(downRPM, downshiftLandingCap * ratioStep)
+            local nextSportDownRPM = math.min(sportDownRPM, downshiftLandingCap * ratioStep)
+            local safeToUpshift = (nextProjectedRPM > nextEffectiveDownRPM * 1.12) and (thr <= 0.25 or nextProjectedRPM > nextSportDownRPM * 0.95)
+            local gearMaxKmh = ((redline / 9.54929676) / math.max(0.1, curRatio * finalDrive)) * wRad * 3.6
+            local spdEntry = (car.fwdGearSpeeds and car.fwdGearSpeeds[d.gear - 1]) or (gearSpeeds and gearSpeeds[d.gear + 1])
+            local minUpshiftKmh = spdEntry and (spdEntry * 0.65) or (gearMaxKmh * 0.50)
+            -- On a climb, allow for the speed lost while the clutch is open.
+            -- A short crawler gear can otherwise upshift directly into the
+            -- near-stop downshift window and repeat the shift under load.
+            local shiftLossKmh = (car.uphillSin or 0) * 15.24 * 3.6 * (car.shiftDelay or 0.14)
+            local entryKmh = minUpshiftKmh
+            if shiftLossKmh > 0 then entryKmh = math.max(entryKmh, stopSpd + 1) + shiftLossKmh end
+            if (safeToUpshift or mustUpshift) and speedKmh >= entryKmh then
+                wantsUpshift = true
+            end
+        end
+    end
+
+    if wantsUpshift then
+        car._downDwell = 0
+        car._upDwell = (car._upDwell or 0) + stepDt
+        if mustUpshift or car._upDwell >= 0.12 then
+            return commitShift(d.gear + 1, "up")
+        end
+        return nil
+    else
+        car._upDwell = 0
+    end
+
+    -- Downshift guard: ratio-aware threshold, landing margin below upRPM, dwell debounce,
+    -- and strict anti-hunt cooldown.
+    local wantsDownshift = false
+    local effRPM = (not isWheelSpinning) and math.min(rpmNow, math.max(rpmNow * 0.65, roadSyncRPM * 1.15 + 400)) or rpmNow
+    if d.gear > 2 and now >= (car.nextDownshiftTime or 0) then
+        if car.lastShiftDir ~= "up" or sinceLastShift >= antiHuntCooldown then
+            local prevRatio = math.abs(getRatio(d.gear - 1))
+            if prevRatio < 0.01 then prevRatio = curRatio end
+            local stepDownRatio = curRatio / math.max(0.05, prevRatio)
+            local effectiveDownRPM = math.min(downRPM, downshiftLandingCap * stepDownRatio)
+            if rpmNow <= effectiveDownRPM or effRPM <= effectiveDownRPM then
+                local projectedRPM = math.max(rpmNow, roadSyncRPM) * (prevRatio / math.max(0.05, curRatio))
+                if projectedRPM < downshiftLandingCap then
+                    wantsDownshift = true
+                end
+            end
+        end
+    end
+
+    if wantsDownshift then
+        car._downDwell = (car._downDwell or 0) + stepDt
+        local downDwellReq = (brk > 0.15) and 0.08 or 0.18
+        if car._downDwell >= downDwellReq then
+            return commitShift(d.gear - 1, "down")
+        end
+    else
+        car._downDwell = 0
+    end
+
+    return nil
+end

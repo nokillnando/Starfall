@@ -258,9 +258,10 @@ function SimcadeVehicleBuilder.buildCarData(vehicleCfg, tireCfg, suspCfg, engine
     for i = 1, 6 do c[117 + i] = gearRatioMap[1 + i] or 0 end
 
     -- Engine RPM Grid
-    if engineCfg.idleRPM then c[124] = max(500, engineCfg.idleRPM) end
-    if engineCfg.redlineRPM then c[125] = max(c[124] + 1500, engineCfg.redlineRPM) end
-    c[126] = max(c[125] + 250, engineCfg.limiterRPM or (c[125] + 500))
+    local isDiesel = SimcadeEngine and SimcadeEngine.isDiesel and SimcadeEngine.isDiesel(engineCfg)
+    if engineCfg.idleRPM then c[124] = max(isDiesel and 350 or 500, engineCfg.idleRPM) end
+    if engineCfg.redlineRPM then c[125] = max(c[124] + (isDiesel and 800 or 1500), engineCfg.redlineRPM) end
+    c[126] = max(c[125] + (isDiesel and 100 or 250), engineCfg.limiterRPM or (c[125] + (isDiesel and 150 or 500)))
 
     local rawFinal = engineCfg.finalDrive or engineCfg.FinalDrive or 4.10
     local fwdSpeeds = engineCfg.ForwardGearSpeeds or engineCfg.GearSpeeds or engineCfg.gearSpeeds
@@ -273,7 +274,7 @@ function SimcadeVehicleBuilder.buildCarData(vehicleCfg, tireCfg, suspCfg, engine
             for i = 1, #fwdSpeeds do
                 local spd = tonumber(fwdSpeeds[i]) or 0
                 if spd > 1 then
-                    fwdList[#fwdList + 1] = clamp(kNumerator / spd, 0.2, 15.0)
+                    fwdList[#fwdList + 1] = clamp(kNumerator / spd, 0.2, 45.0)
                 end
             end
             if #fwdList >= 1 then
@@ -287,7 +288,7 @@ function SimcadeVehicleBuilder.buildCarData(vehicleCfg, tireCfg, suspCfg, engine
             for i = 1, #revSpeeds do
                 local spd = tonumber(revSpeeds[i]) or 0
                 if spd > 1 then
-                    revList[#revList + 1] = -clamp(kNumerator / spd, 0.2, 15.0)
+                    revList[#revList + 1] = -clamp(kNumerator / spd, 0.2, 45.0)
                 end
             end
             if #revList >= 1 then
@@ -351,9 +352,10 @@ function SimcadeVehicleBuilder.buildCarData(vehicleCfg, tireCfg, suspCfg, engine
         end
     end
 
-    local engineTorqueCurve, enginePeakTorqueNm
+    local engineTorqueCurve, enginePeakTorqueNm, engineSpec
     if SimcadeEngine and engineCfg and (engineCfg.PeakTorqueNm or engineCfg.PeakHP or engineCfg.DisplacementLiters or engineCfg.TorqueCurve) then
         local spec = SimcadeEngine.synthesizeSpec(engineCfg)
+        engineSpec = spec
         c[124] = spec.idleRPM
         c[125] = spec.redlineRPM
         c[126] = spec.limiterRPM
@@ -365,6 +367,18 @@ function SimcadeVehicleBuilder.buildCarData(vehicleCfg, tireCfg, suspCfg, engine
         end
         for i = 0, 2 do
             c[146 + i] = spec.brakeCurveKNm[i]
+        end
+        if SERVER and engineCfg.WarnEngineCurveMismatch ~= false and spec.warnings and #spec.warnings > 0 then
+            local warningKey = table.concat(spec.warnings, "|")
+            if SimcadeEngine._lastSpecWarningKey ~= warningKey then
+                SimcadeEngine._lastSpecWarningKey = warningKey
+                local logFn = printConsole or print
+                if logFn then
+                    for _, msg in ipairs(spec.warnings) do
+                        pcall(logFn, "[Simcade Engine] " .. msg)
+                    end
+                end
+            end
         end
     end
 
@@ -395,9 +409,10 @@ function SimcadeVehicleBuilder.buildCarData(vehicleCfg, tireCfg, suspCfg, engine
     local comShiftX_m = (frontWeightBias - 0.50) * wheelbase_m
 
     return {
-        c                 = c,
-        engineTorqueCurve = engineTorqueCurve,
+        c                  = c,
+        engineTorqueCurve  = engineTorqueCurve,
         enginePeakTorqueNm = enginePeakTorqueNm,
+        engineSpec         = engineSpec,
         top               = top,
         minGear           = minGear,
         gearRatioMap      = gearRatioMap,

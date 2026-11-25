@@ -54,10 +54,79 @@ local function supportTrace(startPos, endPos, filter, minMass, hullSize)
     end
 end
 
-function SimcadeSuspension.traceTread(w, mount, up, axle, reach, filter, minMass, cfg, recordRays)
+-- Test the tire cross section at wall height before any tread ray can select
+-- the obstacle's top and raise the hub used for collision detection.
+local wallDirections = {{1,0},{-1,0},{0,1},{0,-1},{1,1},{1,-1},{-1,1},{-1,-1}}
+function SimcadeSuspension.traceWheelWall(w, mount, up, axle, phys, dt, mass, cfg, filter)
+    w.wallDriveContact = nil
+    local radius = w.radius
+    local hub = mount + up * math.min((w.compIn or 0) - w.rideHeight, -2)
+    local ratio = clamp(cfg.curbWallHeightRatio or 0.82, 0.1, 1.5)
+    local origin = hub + up * (radius * (ratio - 1))
+    local forward = axle:cross(up):getNormalized()
+    local side = up:cross(forward)
+    local length = radius * math.sqrt(1 - (ratio - 1)^2)
+    local width = w.width * 0.5
+    local travel = phys:getVelocityAtPoint(hub) * dt
+    travel = travel - up * travel:dot(up)
+    local start = origin
+    local prior = w.wallProbeOrigin
+    if prior and (prior - origin):getLengthSqr() < (radius * 3 + travel:getLength())^2 then
+        start = prior + up * (origin - prior):dot(up)
+    end
+    local best, bestGap, bestNormal, recovering
+    local filterSize = #filter
+    for _, direction in ipairs(wallDirections) do
+        local tip = origin + forward * (direction[1] * length) + side * (direction[2] * width)
+        local tr = supportTrace(start, tip + travel, filter, 0)
+        local buried = tr and tr.StartSolid
+        if buried then
+            -- A prop can be moved into a parked wheel. Trace back from outside
+            -- and use the nearest exit when there is no prior free-space point.
+            tr = supportTrace(origin + (tip - origin) * 2, origin, filter, 0)
+        end
+        if tr and tr.Hit and not tr.StartSolid and math.abs(tr.HitNormal:dot(up)) < 0.55 then
+            local normal = (tr.HitNormal - up * tr.HitNormal:dot(up)):getNormalized()
+            local gap = (origin - tr.HitPos):dot(normal) - length * math.abs(normal:dot(forward))
+                - width * math.abs(normal:dot(side))
+            if not best or (buried and recovering and gap > bestGap)
+                or (not buried and (recovering or gap < bestGap)) then
+                best, bestGap, bestNormal, recovering = tr, gap, normal, buried
+            end
+        end
+    end
+    for i = #filter, filterSize + 1, -1 do filter[i] = nil end
+    w.wallProbeOrigin = origin
+    if not best then return end
+    -- Keep a free-space trace origin even if VPhysics pushed the hub into a face.
+    local distance = (origin - best.HitPos):dot(bestNormal)
+    if distance < 0.5 then w.wallProbeOrigin = origin + bestNormal * (0.5 - distance) end
+    local body
+    if not best.HitWorld and isValid(best.Entity) then body = best.Entity:getPhysicsObject() end
+    local velocity = phys:getVelocityAtPoint(best.HitPos)
+    local movable = isValid(body) and body:isMoveable() and hasPermission("entities.applyForce", best.Entity)
+    if isValid(body) then velocity = velocity - body:getVelocityAtPoint(best.HitPos) end
+    local closing = -velocity:dot(bestNormal)
+    w.wallDriveContact = {point = best.HitPos, normal = bestNormal, body = movable and body or nil,
+        spareSpeed = math.max(0, bestGap / dt - closing)}
+    local correction = math.min(-bestGap / dt, radius * 4)
+    local speed = math.max(0, closing + correction)
+    if speed > 0 then
+        local contactMass = mass * 0.5
+        if movable then contactMass = 1 / (1 / contactMass + 1 / math.max(1, body:getMass())) end
+        local impulse = bestNormal * (speed * contactMass)
+        phys:applyForceOffset(impulse, best.HitPos)
+        if movable then body:applyForceOffset(-impulse, best.HitPos) end
+    end
+    return best.HitPos, bestNormal
+end
+
+function SimcadeSuspension.traceTread(w, mount, up, axle, reach, filter, minMass, cfg, recordRays, wallPoint, wallNormal)
     local filterSize = #filter
     local rays = recordRays and {} or nil
     local best, bestDist, selected
+    local forward = axle:cross(up):getNormalized()
+    local radialUp = forward:cross(axle):dot(up)
     local function sample(startPos, correction, central, hullSize)
         local length = reach - correction
         if length <= 0 then
@@ -70,10 +139,26 @@ function SimcadeSuspension.traceTread(w, mount, up, axle, reach, filter, minMass
             rays[#rays + 1] = { depth = tr and tr.Hit and (startPos - tr.HitPos):dot(up) or length, hit = tr and tr.Hit }
         end
         if not tr or not tr.Hit then return end
+        if wallPoint and (startPos - wallPoint):dot(wallNormal) <= 0.01
+            and (tr.StartSolid or (tr.HitPos - wallPoint):dot(up) >= -0.01) then return end
         if tr.StartSolid then
             -- Only the central probe can recover a buried wheel. A shoulder inside a wall cannot support it.
             if central then best, bestDist = tr, w.radius * 0.6 end
         elseif tr.HitNormal:dot(up) > 0.55 then
+            -- A flat step first meets the round tread at its edge, between
+            -- stations. Resolve the arc there to avoid discrete jumps in travel.
+            local offset = (startPos - mount):dot(forward)
+            if not central and bestDist and math.abs(offset) > 0.1
+                and (startPos - tr.HitPos):dot(up) < bestDist - 0.1 then
+                local top = tr.HitPos - up * 0.05
+                local edge = supportTrace(top - forward * offset, top, filter, minMass)
+                if edge and edge.Hit and not edge.StartSolid and math.abs(edge.HitNormal:dot(up)) < 0.55 then
+                    local x = clamp((edge.HitPos - mount):dot(forward), -w.radius, w.radius)
+                    local r2 = w.radius^2
+                    correction = correction + radialUp * (math.sqrt(math.max(0, r2 - offset^2))
+                        - math.sqrt(math.max(0, r2 - x^2)))
+                end
+            end
             local dist = (startPos - tr.HitPos):dot(up) + correction
             if not bestDist or dist < bestDist - 0.001 then best, bestDist = tr, dist end
         end
@@ -179,7 +264,7 @@ end
 
 -- Tangential contact impulses in Source units. Store anchors on the support so a
 -- stationary tire can ride a moving prop. Forces at the patches also resist yaw.
-function SimcadeSuspension.staticGripImpulse(w, tire, canPark, brake, forward, left, com, vel, omega, mass, brakeMass, scale, gravity, dt, base)
+function SimcadeSuspension.staticGripImpulse(w, tire, canPark, brake, forward, left, com, vel, omega, mass, brakeMass, scale, gravity, dt, base, suspensionScale, motionMassRatio, yawMassFactor, parkingHold)
     if not w.isGrounded or w.normalLoad <= 0 or not tire or (tire.load or 0) <= 0 then
         w.restAnchor = nil
         return
@@ -193,7 +278,8 @@ function SimcadeSuspension.staticGripImpulse(w, tire, canPark, brake, forward, l
     local tracked = anchored and base:localToWorld(w.restChassisPoint) or patch
     local anchor = anchored and (supportValid and support:localToWorld(w.restAnchor) or w.restAnchor) or patch
     local supportVel = supportValid and (w.supportVel or (anchored and (anchor - w.lastRestWorld) / dt) or support:getVelocity()) or Vector()
-    local velocity = vel + omega:cross(tracked - com) - supportVel
+    local yawVelocity = (n * omega:dot(n)):cross(tracked - com)
+    local velocity = vel + yawVelocity - supportVel
     velocity = velocity - n * velocity:dot(n)
     local heading = forward * (tire.axleY or 1) - left * (tire.axleX or 0)
     local lateral = n:cross(heading):getNormalized()
@@ -233,14 +319,50 @@ function SimcadeSuspension.staticGripImpulse(w, tire, canPark, brake, forward, l
         w.restAnchor = nil
         return
     end
-    if lateralHold and not parked then
+    local gradeError
+    if parkingHold or parked then
+        -- A grade needs a fixed reference on the supporting surface. On level
+        -- ground keep dissipating a shove at the truck's new position.
+        if 1 - n.z^2 > 0.000001 then
+            local displacement = anchor - tracked
+            gradeError = displacement - n * displacement:dot(n)
+            if not parked then
+                gradeError = lateral * gradeError:dot(lateral)
+                anchor = tracked + gradeError
+            end
+        end
+        if not gradeError then anchor = tracked end
+    elseif lateralHold then
         anchor = tracked + lateral * (anchor - tracked):dot(lateral)
     end
     local err = anchor - tracked
     local posGain = math.min(6.0, 0.25 / dt)
     local velGain = 1 - math.exp(-55 * dt)
-    local acceleration = err * posGain - velocity * velGain + Vector(0, 0, gravity * dt)
-    local demand = acceleration * mass - w.suspImpulseVec * scale
+    -- Cargo contributes to the static load, but can slide independently.
+    -- Limit motion corrections to the receiving body's contact-point inertia.
+    local arm = tracked - com
+    local tangentArm = arm - n * arm:dot(n)
+    local motion = err * posGain - velocity * velGain
+    if parkingHold or parked then
+        -- All patches share the same chassis translation. Applying a separate
+        -- yaw penalty to that common motion leaves very little lateral hold on
+        -- a long wheelbase. Only the rotational slip needs the point-inertia limit.
+        local yawFactor = 0.0254^2 * (yawMassFactor or 0)
+        local yawSlip = rolling * (yawVelocity:dot(rolling) / (1 + tangentArm:dot(lateral)^2 * yawFactor))
+            + lateral * (yawVelocity:dot(lateral) / (1 + tangentArm:dot(rolling)^2 * yawFactor))
+        motion = (supportVel - vel - yawSlip) * (velGain * (motionMassRatio or 1))
+        if gradeError then motion = motion + gradeError * (0.4 / dt * (motionMassRatio or 1)) end
+    else
+        motion = motion * ((motionMassRatio or 1) / (1 + tangentArm:getLengthSqr() * 0.0254^2 * (yawMassFactor or 0)))
+    end
+    local lift = w.suspImpulseVec * (suspensionScale or scale)
+    -- On a grade the normal impulse is weight impulse times cos(slope).
+    -- Balance the weight actually carried here, including when a chassis
+    -- contact or settling payload carries some of the estimated vehicle mass.
+    local weightImpulse = mass * gravity * dt
+    if n.z > 0.55 then weightImpulse = math.max(0, lift:dot(n)) / n.z end
+    local staticDemand = Vector(0, 0, weightImpulse) - lift
+    local demand = motion * mass + staticDemand
     local targetX = fx
     local requestedX = fx
     if parked then
@@ -248,7 +370,7 @@ function SimcadeSuspension.staticGripImpulse(w, tire, canPark, brake, forward, l
         targetX = clamp(requestedX, -peakX * brake, peakX * brake)
     end
     local sideLimit = peakY * math.sqrt(math.max(0, 1 - (targetX / peakX)^2))
-    local bank = (Vector(0, 0, gravity * mass * dt) - w.suspImpulseVec * scale):dot(lateral)
+    local bank = staticDemand:dot(lateral)
     local spareAccel = math.max(0, sideLimit * knImpulse - math.abs(bank)) / (mass * dt)
     local captureSpeedSq = 2 * spareAccel * contactLength
     local sideRatioSq = sideSpeed^2 / math.max(0.001, captureSpeedSq)
@@ -257,8 +379,14 @@ function SimcadeSuspension.staticGripImpulse(w, tire, canPark, brake, forward, l
     local targetY = clamp(requestedY, -sideLimit, sideLimit)
     local correction = rolling * (targetX - fx) + lateral * (targetY - fy)
 
+    -- A steered tire can roll along its tread while its lateral contact
+    -- still sticks. Release only the saturated axis of a parked patch.
+    if gradeError and adhesion > 0 and math.abs(requestedY) <= sideLimit
+        and parked and math.abs(requestedX) > peakX * brake then
+        anchor = tracked + lateral * gradeError:dot(lateral)
+    end
     if adhesion > 0 and math.abs(requestedY) <= sideLimit
-        and (not parked or math.abs(requestedX) <= peakX * brake) then
+        and (gradeError or not parked or math.abs(requestedX) <= peakX * brake) then
         w.restAnchor = supportValid and support:worldToLocal(anchor) or anchor
         if not anchored then w.restChassisPoint = base:worldToLocal(patch) end
         w.lastRestWorld, w.restSupport = anchor, support
@@ -291,7 +419,7 @@ function SimcadeSuspension.applyCurbBlock(phys, w, up, axle, dt, mass, wheels, g
     local probeHeight = clamp(radius * (cfg.curbProbeHeightRatio or 0.14), 0.1,
         math.max(0.1, cfg.curbProbeMaxHeight or 4.5))
     local wallHeight = radius * clamp(cfg.curbWallHeightRatio or 0.82, 0.1, 1.5)
-    local minHeight = math.max(0.25, cfg.curbMinHeight or 1.75)
+    local minHeight = math.max(0.25, cfg.curbMinHeight or 1.75, radius * (cfg.curbClimbRatio or 0.42))
     local best, bestClosing = nil, -1
     local filterSize = #filter
     local minMass = math.max(35, mass * 0.15)
@@ -484,6 +612,45 @@ function SimcadeSuspension.applyCurbBlock(phys, w, up, axle, dt, mass, wheels, g
 end
 
 -- Compute vertical suspension + anti-roll + bumpstop + pitch/roll impulses
+-- One height valve serves both springs. Pressure builds only under sustained
+-- compression. The bags lose leverage near full extension as the load comes off.
+function SimcadeSuspension.levelAxle(left, right, cfg, previousKG, dt, impulsePerKG)
+    local capacity = math.max(0, cfg.levelCapacityKG or 0)
+    if capacity == 0 or not (left or right) then return 0, 0 end
+    local height = (left or right).rideHeight
+    local target = height * clamp(cfg.levelCompression or 0.35, 0.1, 0.8)
+    local pressure = previousKG
+    local compression = (left or right).compIn
+    if left and right then
+        compression = (left.compIn + right.compIn) * 0.5
+        local rate = (left._rate0 + right._rate0) * 0.5
+        local err = compression - target
+        -- Close the valve when motion is already taking up the height error.
+        local demand = math.max(0, math.abs(err) - 0.5)
+        if err * rate < 0 then demand = math.max(0, demand - math.abs(rate) * 0.35) end
+        local step = capacity * dt * math.min(0.35, demand / height * 1.5)
+        pressure = clamp(pressure + (err > 0 and step or -step), 0, capacity)
+        if compression < target * 0.5 then pressure = pressure * math.exp(-6 * dt) end
+    else
+        pressure = pressure * math.exp(-dt)
+    end
+    -- Convert physical kg per axle to virtual impulse per grounded spring.
+    local perWheel = 0.5 * pressure * impulsePerKG
+    -- Share the axle's available lift according to spring-seat deflection.
+    -- A loaded corner can use more than half while total lift stays bounded.
+    local bias = 0
+    if left and right then
+        bias = clamp((left.compIn - right.compIn) / target, -1, 1)
+    end
+    local function support(w, share)
+        if not w then return 0 end
+        local imp = perWheel * share * clamp(compression / target, 0, 1)
+        w._subImp = w._subImp + imp
+        return imp
+    end
+    return pressure, support(left, 1 + bias) + support(right, 1 - bias)
+end
+
 -- Scales virtual suspension force by (physMass / virtualMass) so heavy trucks (e.g. 6000 kg)
 -- and light karts (e.g. 600 kg) both ride stably on any GMod prop mass.
 function SimcadeSuspension.computeWheelForce(params)
@@ -510,7 +677,16 @@ function SimcadeSuspension.computeWheelForce(params)
     local rebRatio      = axleSusp.reboundDampingRatio or (bumpRatio * 1.25)
 
     local kSpring = (cornerMassV * gravity / math.max(1, targetDefl)) * stiffnessMult
-    local cCrit   = 2.0 * math.sqrt(math.max(1, kSpring * cornerMassV))
+    local bumpLimit = math.max(4, axleSusp.bumpLimit or rideHeight)
+    local springComp = math.min(compIn, bumpLimit)
+    local helperMult = math.max(0, axleSusp.helperSpringMult or (isTruck and 8 or 0))
+    local helperStart = rideHeight * clamp(axleSusp.helperStartCompression or restComp, restComp, 1)
+    local helperTravel = math.max(1, bumpLimit - helperStart)
+    local overload = math.max(0, springComp - helperStart) / helperTravel
+    local helperPeak = cornerMassV * gravity * helperMult
+    local helperForce = helperPeak * overload * overload
+    local tangentRate = kSpring + 2 * helperPeak * overload / helperTravel
+    local cCrit   = 2.0 * math.sqrt(math.max(1, tangentRate * cornerMassV))
     local velComp
     if params.compressionRate ~= nil then
         velComp = clamp(params.compressionRate, -450, 450)
@@ -522,16 +698,14 @@ function SimcadeSuspension.computeWheelForce(params)
     end
     local dampK   = cCrit * ((velComp >= 0) and (bumpRatio * bumpDampMult) or (rebRatio * rebDampMult))
 
-    local springComp = math.min(compIn, axleSusp.bumpLimit or rideHeight)
     -- Digressive compression damping above 60 in/s so sharp curb/step spikes don't violently kick the chassis
     local effVelComp = velComp
     if velComp > 60 then
         effVelComp = math.min(140, 60 + (velComp - 60) * 0.20)
     end
-    local springForceV = springComp * kSpring + effVelComp * dampK
+    local springForceV = springComp * kSpring + helperForce + effVelComp * dampK
 
     -- Progressive rubber bumpstop in top 15% of travel (no catapult spring)
-    local bumpLimit = math.max(4, axleSusp.bumpLimit or rideHeight)
     local bumpStart = bumpLimit * 0.85
     if compIn > bumpStart and velComp >= 0 then
         local over = clamp((compIn - bumpStart) / math.max(1, bumpLimit - bumpStart), 0, 1.5)
@@ -542,7 +716,7 @@ function SimcadeSuspension.computeWheelForce(params)
     local maxForceMult = (velComp <= 0)
         and (2.5 * weightShare * math.max(1.0, math.sqrt(math.max(0.25, stiffnessMult))))
         or  (4.2 * weightShare * math.max(1.0, stiffnessMult))
-    springForceV = clamp(springForceV, 0, cornerMassV * gravity * maxForceMult)
+    springForceV = clamp(springForceV, 0, cornerMassV * gravity * maxForceMult + helperForce)
 
     -- Inelastic bottom-out arrest in top 15% of travel: absorbs downward slam without rebounding upward
     local cornerVelZ = params.chassisVelZ or 0

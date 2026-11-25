@@ -1,0 +1,366 @@
+--@name Simcade driver prediction
+--@shared
+
+SimcadePrediction = {}
+local P = SimcadePrediction
+-- Change the channel when the packet layout changes so older clients cannot replay it.
+local snapshotChannel = "Simcade_DriveSnapshot_v3"
+local gears = {"gear", "req", "state", "want", "shifting", "clutch"}
+local function array(v, scale)
+    return {[0] = v.x * scale, v.y * scale, v.z * scale}
+end
+local function vector(a)
+    return Vector(a[0], a[1], a[2])
+end
+
+if SERVER then
+    function P.send(driver, base, pod, car, pos, fwd, up, vel, omega, ground, loads, mass, compound, ignition, active, gearUp, gearDown, turboRPM, comLocal, sendPacket)
+        net.start(snapshotChannel)
+        net.writeEntity(base)
+        net.writeEntity(pod)
+        net.writeFloat(timer.curtime())
+        net.writeBool(active)
+        if not active then return sendPacket(driver, true) end
+        net.writeFloat(driver:getPing() / 1000)
+        net.writeBool(gearUp == true)
+        net.writeBool(gearDown == true)
+        net.writeVector(pos)
+        net.writeVector(comLocal)
+        net.writeVector(fwd)
+        net.writeVector(up)
+        net.writeVector(vel)
+        net.writeVector(omega)
+        net.writeFloat(mass)
+        net.writeString(compound)
+        net.writeBool(ignition.running)
+        net.writeFloat(ignition.crankRPM or 0)
+        net.writeBool(car.manualBox)
+        net.writeUInt(car.autoRange or 0, 2)
+        net.writeFloat(car.eng.w)
+        net.writeFloat(car.eng.T)
+        net.writeFloat(car.simClutch or 1)
+        net.writeFloat(car.eng.inductionTorqueRatio or 1)
+        net.writeFloat(turboRPM)
+        net.writeFloat(car.drv.u16Deg or 0)
+        net.writeFloat(car.drv.smoothedLat or 0)
+        net.writeInt(car.drv.gear, 8)
+        net.writeBool(car.drv.reversing or false)
+        net.writeBool(car.drv.brakeLatch or false)
+        net.writeBool(car.drv.revBrakeLatch or false)
+        net.writeBool(car.drv.reverseLaunch or false)
+        net.writeFloat(car.drv.reverseHold or 0)
+        net.writeFloat(car.drv.brk or 0)
+        net.writeBool(car.drv.forwardLaunch or false)
+        net.writeFloat(car.drv.forwardHold or 0)
+        net.writeBool(car.frontLockActive or false)
+        net.writeBool(car.rearLockActive or false)
+        net.writeBool(car.allLockActive or false)
+        for _, k in ipairs(gears) do net.writeFloat(car.dt[k]) end
+        for i = 0, 3 do
+            local g = ground[i]
+            net.writeVector(vector(g.p))
+            net.writeVector(vector(g.n))
+            net.writeUInt(g.s, 8)
+            net.writeUInt(g.matType or 0, 8)
+            net.writeFloat(loads[i] or 0)
+            net.writeFloat(car.wheels[i].w)
+            net.writeInt(math.clamp(math.round((car.wheels[i].travelCamberDeg or 0) * 100), -32768, 32767), 16)
+            if i == 0 or i == 3 then net.writeFloat(car.wheels[i].beamRollDeg or 0) end
+        end
+        return sendPacket(driver, true)
+    end
+    return
+end
+
+function P.initClient(cfg)
+    local car, base, pod, compound, mass, frame, view
+    local lastSample, nextSample, lastSnapshot = nil, 0, -1
+    local history, inputState = {}, {}
+    local step = 1 / math.clamp(cfg.VEHICLE_CFG.UpdateRate or 30, 20, 60)
+    local localFwd = (cfg.VEHICLE_CFG.chassisForward or Vector(1, 0, 0)):getNormalized()
+    local localLeft = Vector(0, 0, 1):cross(localFwd)
+    if localLeft:getLengthSqr() < 0.01 then localLeft = Vector(0, 1, 0) end
+    localLeft = localLeft:getNormalized()
+    local localUp = localFwd:cross(localLeft):getNormalized()
+    local mounts = {}
+    local function seated(seat)
+        local p = player()
+        return isValid(seat) and p:inVehicle() and p:getVehicle() == seat
+    end
+
+    net.receive(snapshotChannel, function()
+        local b, seat = net.readEntity(), net.readEntity()
+        local stamp, active = net.readFloat(), net.readBool()
+        if not isValid(b) or not seated(seat) or (base == b and stamp <= lastSnapshot) then return end
+        if b ~= base or seat ~= pod then
+            car, view, history, inputState = nil, nil, {}, {}
+            lastSample, nextSample = nil, 0
+        end
+        base, pod, lastSnapshot = b, seat, stamp
+        if not active then frame, view, history = nil, nil, {} return end
+        local receivedAt = timer.curtime()
+        -- A snapshot reflects the driver's native input from approximately
+        -- one round trip earlier. Replay recent local inputs from that estimate.
+        local roundTrip = math.clamp(net.readFloat(), 0, 0.25)
+        local inputTime = receivedAt - roundTrip
+        local gearUp, gearDown = net.readBool(), net.readBool()
+        local pos, comLocal = net.readVector(), net.readVector()
+        local fwd, up = net.readVector(), net.readVector()
+        local left = up:cross(fwd)
+        local vel, omega = net.readVector(), net.readVector()
+        local m, c = net.readFloat(), net.readString()
+        if not car or compound ~= c or mass ~= m then
+            car = SimcadeVehiclePhysics.newFromConfig(cfg.VEHICLE_CFG, cfg.TIRE_CFG, cfg.SUSPENSION_CFG, cfg.ENGINE_CFG,
+                cfg.STEERING_CFG, cfg.WHEELS, m, c, cfg.AERO_CFG)
+            car.activeDiffCfg = cfg.ACTIVE_DIFF_CFG
+            for i, w in ipairs(cfg.WHEELS) do
+                local front = w.isFront
+                if front == nil then front = w.pos.x > 0 end
+                local idx = front and (w.pos.y < 0 and 1 or 0) or (w.pos.y < 0 and 2 or 3)
+                local axle = SimcadeSuspension.getAxleCfg(cfg.SUSPENSION_CFG, front)
+                local radius = w.radius or 15
+                local rideH = math.max(8, axle.rideHeight or 24)
+                local airTrav = math.max(-(rideH - 2), axle.airTravel ~= nil and axle.airTravel or 6)
+                local travel = rideH + airTrav
+                local span = axle.solidAxle and math.clamp(axle.springSpanRatio or 0.75, 0, 1) or 1
+                mounts[i] = {
+                    index = idx, radius = radius, width = w.width or 9, isRear = not front,
+                    length = travel * 2 / (1 + span) + radius,
+                    offset = localFwd * w.pos.x + localLeft * w.pos.y + localUp * SimcadeSuspension.mountHeight(w, axle),
+                }
+                for _, mate in ipairs(cfg.WHEELS) do
+                    local mateFront = mate.isFront
+                    if mateFront == nil then mateFront = mate.pos.x > 0 end
+                    if axle.solidAxle and front == mateFront and w.pos.y * mate.pos.y < 0 then
+                        mounts[i].halfTrack = (w.pos.y - mate.pos.y) * 0.5
+                        break
+                    end
+                end
+                local a = (w.casterDeg ~= nil or w.steeringCamberDeg ~= nil) and w or axle
+                car.wheels[idx].alignment = {camberDeg = w.camberDeg or axle.camberDeg,
+                    casterDeg = a.casterDeg, legacySteeringCamber = a.casterDeg == nil and a.steeringCamberDeg}
+            end
+            compound, mass = c, m
+        end
+        frame = {pos = array(pos, 0.0254), vel = array(vel, 0.0254), omega = array(omega, 1),
+            R = {[0]=fwd.x,fwd.y,fwd.z,left.x,left.y,left.z,up.x,up.y,up.z},
+            receivedAt = receivedAt, inputTime = inputTime, roundTrip = roundTrip, gearUp = gearUp, gearDown = gearDown,
+            running = net.readBool(), crank = net.readFloat(), ground = {}, loads = {}, comLocal = comLocal}
+        car.manualBox = net.readBool()
+        car.autoRange = net.readUInt(2)
+        car.eng.w, car.eng.T, car.simClutch = net.readFloat(), net.readFloat(), net.readFloat()
+        car.eng.inductionTorqueRatio = net.readFloat()
+        frame.turbo = {rpm = net.readFloat()}
+        frame.supercharger = {psi = 0, boost = 1.0}
+        frame.manifold = (SimcadeEngine and SimcadeEngine.newManifoldState) and SimcadeEngine.newManifoldState(cfg.ENGINE_CFG) or nil
+        car.drv.u16Deg, car.drv.smoothedLat = net.readFloat(), net.readFloat()
+        car.drv.gear, car.drv.reversing = net.readInt(8), net.readBool()
+        car.drv.brakeLatch, car.drv.revBrakeLatch = net.readBool(), net.readBool()
+        car.drv.reverseLaunch = net.readBool()
+        car.drv.reverseHold, car.drv.brk = net.readFloat(), net.readFloat()
+        car.drv.forwardLaunch, car.drv.forwardHold = net.readBool(), net.readFloat()
+        car.frontLockActive, car.rearLockActive, car.allLockActive = net.readBool(), net.readBool(), net.readBool()
+        for _, k in ipairs(gears) do car.dt[k] = net.readFloat() end
+        if SimcadeVehiclePhysics.T.clutch_dir[car.dt.state] == nil then
+            car, frame, view, history = nil, nil, nil, {}
+            return
+        end
+        for i = 0, 3 do
+            frame.ground[i] = {p = array(net.readVector(), 1), n = array(net.readVector(), 1),
+                s = net.readUInt(8), matType = net.readUInt(8)}
+            frame.loads[i], car.wheels[i].w = net.readFloat(), net.readFloat()
+            car.wheels[i].travelCamberDeg = net.readInt(16) * 0.01
+            if i == 0 or i == 3 then
+                local roll = net.readFloat()
+                car.wheels[i].beamRollDeg = roll
+                car.wheels[i == 0 and 1 or 2].beamRollDeg = roll
+            end
+        end
+    end)
+
+    hook.add("think", "Simcade_PredictDriver", function()
+        if not pod then return end
+        local now = timer.curtime()
+        if not seated(pod) or not isValid(base) then
+            base, pod, car, frame, view = nil, nil, nil, nil, nil
+            history, inputState = {}, {}
+            lastSample, nextSample = nil, 0
+            return
+        end
+        if not frame or now - frame.receivedAt > 0.35 then
+            frame, view = nil, nil
+            return
+        end
+        if now >= nextSample then
+            local dt = lastSample and math.clamp(now - lastSample, 0.001, 0.05) or step
+            lastSample = now
+            nextSample = math.max(nextSample + step, now + step * 0.5)
+            local ctrl = SimcadeControls.pollInputs(player(), true, nil, nil, inputState, cfg.CONTROLS_CFG)
+            history[#history + 1] = {dt = dt, ctrl = ctrl, time = now,
+                gearUp = inputState.gearUp, gearDown = inputState.gearDown}
+            while history[1].time < now - 0.3 do
+                table.remove(history, 1)
+            end
+        end
+        -- Spread replay over frames so a delayed snapshot cannot cause a solver burst.
+        local count = 0
+        for _, cmd in ipairs(history) do
+            if cmd.time > frame.inputTime then
+                local k = cmd.ctrl
+                if cmd.gearUp and not frame.gearUp then car:shiftKey(true) end
+                if cmd.gearDown and not frame.gearDown then car:shiftKey(false) end
+                frame.gearUp, frame.gearDown = cmd.gearUp, cmd.gearDown
+                local dt = math.min(cmd.dt, cmd.time - frame.inputTime)
+                local throttle = frame.running and k.rawThrottle or 0
+                local effectiveThrottle = throttle
+                if frame.running then
+                    if car.classicAuto and not car.manualBox then
+                        if car.autoRange == 0 then
+                            effectiveThrottle = 0
+                        elseif car.autoRange == 1 and car.reverseWSonReverse then
+                            effectiveThrottle = k.rawReverseThrottle or k.rawBrake
+                        end
+                    elseif not car.manualBox then
+                        local drv = car.drv
+                        local fwdMS = frame.vel[0] * frame.R[0] + frame.vel[1] * frame.R[1] + frame.vel[2] * frame.R[2]
+                        local sDown = (k.rawBrake or 0) > 0.10
+                        local wDown = (k.rawThrottle or 0) > 0.10
+                        if sDown and not wDown then
+                            local revActive = (drv and (drv.reverseLaunch or ((drv.reverseHold or 0) > 0 and not drv.brakeLatch)))
+                                or (not (drv and drv.brakeLatch) and fwdMS <= 0.35)
+                            if revActive then
+                                effectiveThrottle = k.rawReverseThrottle or k.rawBrake
+                            end
+                        elseif wDown and not sDown then
+                            local fwdBraking = (drv and drv.revBrakeLatch)
+                                or (fwdMS < -0.35 and not (drv and (drv.forwardLaunch or ((drv.forwardHold or 0) > 0 and not drv.revBrakeLatch))))
+                            if fwdBraking then
+                                effectiveThrottle = 0
+                            end
+                        end
+                    end
+                    if car.dt and car.dt.shifting ~= 0 then
+                        effectiveThrottle = 0
+                    end
+                end
+                local butterflyThrottle = effectiveThrottle
+                local thrRise = tonumber(cfg.ENGINE_CFG and cfg.ENGINE_CFG.ThrottleRiseTime) or 0
+                if thrRise > 0 and car and car.eng then
+                    local prevThr = car.eng.T or 0
+                    if butterflyThrottle > prevThr then
+                        butterflyThrottle = prevThr + (butterflyThrottle - prevThr) * (1 - math.exp(-dt / thrRise))
+                    end
+                end
+                local predRPM = frame.running and car.rpm or 0
+                local useManifold = (cfg.ENGINE_CFG and cfg.ENGINE_CFG.ManifoldModel == true) and frame.manifold ~= nil and SimcadeEngine.stepManifold ~= nil
+                local turboLoad = (frame.running and useManifold) and math.clamp(frame.manifold.charge or 0, 0, 1) or butterflyThrottle
+                local turbo = SimcadeEngine.stepTurbo(frame.turbo, cfg.ENGINE_CFG, predRPM, turboLoad, dt)
+                local sc = (cfg.ENGINE_CFG and cfg.ENGINE_CFG.Supercharger == true and SimcadeEngine.stepSupercharger)
+                    and SimcadeEngine.stepSupercharger(frame.supercharger, cfg.ENGINE_CFG, predRPM, butterflyThrottle)
+                    or frame.supercharger
+                if SimcadeEngine.computeInduction and car.eng then
+                    local indRatio, indPSI, parasiticDragKNm, combinedBoostRatio, airPress =
+                        SimcadeEngine.computeInduction(cfg.ENGINE_CFG, turbo, sc, predRPM, butterflyThrottle, frame.running)
+                    car.eng.inductionTorqueRatio = indRatio
+                    car.eng.boostPSI = indPSI
+                    car.eng.parasiticDragKNm = parasiticDragKNm
+                    if useManifold then
+                        SimcadeEngine.stepManifold(frame.manifold, cfg.ENGINE_CFG, predRPM, butterflyThrottle, dt, combinedBoostRatio, indRatio, airPress, frame.running)
+                        car.eng.manifoldCharge = frame.manifold.charge
+                        car.eng.manifoldVacuum = frame.manifold.vacuumFrac
+                        car.eng.manifoldPSI = frame.manifold.gaugePSI
+                    else
+                        car.eng.manifoldCharge = nil
+                        car.eng.manifoldVacuum = nil
+                        car.eng.manifoldPSI = indPSI
+                    end
+                elseif car.eng then
+                    car.eng.parasiticDragKNm = 0
+                end
+                local result = car:stepVPhysics(dt, frame.pos, frame.R, frame.vel, frame.omega, frame.ground, {
+                    steer = k.steerTarget, gas = throttle,
+                    reverseGas = frame.running and k.rawReverseThrottle or 0, forwardBrake = k.wKey,
+                    brake = k.rawBrake, handbrake = k.rawHandbrake, clutchPedal = k.clutchDown and 0 or 1,
+                    ignitionRunning = frame.running, cranking = (not frame.running) and ((frame.crank or 0) > 1), crankRPM = frame.crank, vphysLoadsKN = frame.loads,
+                    weightShiftCfg = cfg.WEIGHT_SHIFT_CFG, maxSubsteps = 2,
+                })
+                frame.pos, frame.R, frame.vel, frame.omega = car.pos, car.R, car.v, car.w
+                frame.inputTime = cmd.time
+                count = count + 1
+                if cmd == history[#history] then
+                    -- Fall back to server telemetry if the solver diverges.
+                    local speed = result.speed_ms
+                    if speed ~= speed or speed > 2000 or car.R[0] ~= car.R[0] then
+                        frame, view, car, history = nil, nil, nil, {}
+                        return
+                    end
+                    local skid = 0
+                    local tires = {}
+                    for i = 0, 3 do
+                        local wheel = car.wheels[i]
+                        if (frame.loads[i] or 0) > 0 and wheel.contact ~= 0 then
+                            skid = math.max(skid, wheel.skidIntensity or 0)
+                            tires[i] = {skid = math.clamp(wheel.skidIntensity or 0, 0, 1.5), spin = wheel.w or 0}
+                        end
+                    end
+                    view = {base = base, result = result, time = cmd.time,
+                        skid = math.clamp(skid, 0, 1.5), turboPSI = turbo.psi, roundTrip = frame.roundTrip,
+                        tires = tires, comLocal = frame.comLocal}
+                end
+                if count >= 3 then break end
+            end
+        end
+    end)
+    function P.get(baseEnt)
+        if view and view.base == baseEnt and timer.curtime() - view.time <= 0.25 and seated(pod) then
+            return view
+        end
+    end
+
+    local effectsSample
+    function P.getTireEffects()
+        if not view or not P.get(base) then
+            effectsSample = nil
+            return
+        end
+        local now = timer.curtime()
+        if effectsSample and effectsSample.base == base and now - effectsSample.time < 0.04 then
+            return effectsSample.wheels and effectsSample or nil
+        end
+
+        -- Trace from the displayed car. The predicted chassis can be ahead of
+        -- the rendered wheels and would put smoke and marks in the wrong place.
+        local up = base:localToWorldVector(localUp):getNormalized()
+        local sample = {base = base, time = now, up = up,
+            fwd = base:localToWorldVector(localFwd):getNormalized(), wheels = {}}
+        for i, mount in ipairs(mounts) do
+            local tire = view.tires[mount.index]
+            local wheel = {grounded = false, skid = 0, time = now}
+            if tire then
+                local offset = mount.offset
+                if mount.halfTrack then
+                    local roll = math.rad(car.wheels[mount.index].beamRollDeg or 0)
+                    offset = offset + localLeft * (mount.halfTrack * (math.cos(roll) - 1))
+                end
+                local origin = base:localToWorld(view.comLocal + offset)
+                local hit = trace.line(origin, origin - up * mount.length, {base, pod}, MASK.SOLID)
+                -- Props and other dynamic contacts need the server's filters.
+                if hit.Hit and not hit.HitWorld then
+                    sample.wheels = nil
+                    effectsSample = sample
+                    return
+                end
+                if hit.HitWorld and not hit.StartSolid then
+                    wheel.grounded = true
+                    wheel.pos, wheel.norm, wheel.matType = hit.HitPos, hit.HitNormal, SimcadeTires.resolveMaterial(hit, cfg.TIRE_CFG)
+                    wheel.skid = tire.skid
+                    wheel.rimSpeed = math.abs(tire.spin * mount.radius)
+                    wheel.width, wheel.isRear = mount.width, mount.isRear
+                end
+            end
+            sample.wheels[i] = wheel
+        end
+        effectsSample = sample
+        return sample
+    end
+end

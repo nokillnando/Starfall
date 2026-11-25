@@ -1,15 +1,45 @@
 --@name Simcade Vehicle Config
---@author RedFox
+--@author [C17]Red Fox
 --@shared
 --@include simcadebase/simcade_loader.txt
---@include simcadebase/addons/brake_temperature.txt
---@include simcadebase/addons/backfire_antilag.txt
+-- @include simcadebase/addons/brake_temperature.txt
+-- @include simcadebase/addons/backfire_antilag.txt
 --@include simcadebase/addons/seat_indicator.txt
 --@include simcadebase/addons/vehicle_radio.txt
 --disable includes and addons not needed to slightly reduce dupe file size
+
+--[[
+NOTES:
+    Cargo vehicles are not fully supported, suspension wise, with tunning the settings you can get something close to that
+    which will hold some cargo but real simulation of those are not supported(yet), so heavy duty cargo stuff is off and
+    untested at best
+
+    While for the most part you can get 90% realistic results some times are obviously missing and may or may not be planned
+    such as hybrid and electric vehicles
+    
+    Many of the features are untested at best(dont have test beds for those), such as turbo and charger
+    
+    This chip has a auto update feature(can be disabled below), which as long as the config is on the required version of the core,
+    it'll auto update to the newest core on spawn, for the updated cores only. If not or offline, it'll use local versions, if you disable it as well.
+    
+    Tire physics while they are mostly realistic you can tune them to whatever you feel best for the car.
+    
+    There are bound to have bugs in it, due to the nature of the whole thing its impossible to test each and every combination possible.
+    Whenever those occur, do contact me at: https://steamcommunity.com/id/nokillnando/
+    Also make sure to provide a dupe for it, or I wont be able to test and fix the bug
+    
+    YES THIS IS MADE WITH AI, don't like it? Not my problem, don't use it and don't bother me either, see it for the end result not the means.
+    
+    
+    Changelog:
+        R3 - Initial public release, needs player testing, releases together with the Peugeot 106 S16 dupe
+]]--
+
+
+
 local CONFIG = {}
 -- Advance only after applying the required settings for the new config format.
-CONFIG.SCHEMA_VERSION = 1
+CONFIG.SCHEMA_VERSION = 2
 
 CONFIG.CORE_UPDATE = {
     enabled = true,
@@ -34,7 +64,7 @@ CONFIG.VEHICLE_CFG = {
 
     -- Simulation and networking
     DriverPrediction            = true,      -- Predict the driver's Simcade gauges, sounds and tire effects
-    UpdateRate                  = 60,        -- Target physics rate (Hz); 30Hz prevents Starfall 6000us CPU spikes
+    UpdateRate                  = 20,        -- Target physics rate (Hz); 30Hz prevents Starfall 6000us CPU spikes
     NetworkRate                 = 20,        -- Target active telemetry rate per stream (Hz), limited by physics ticks and available bytes
     NetworkBudgetBytesPerSecond = 4300,      -- Server telemetry budget per chip (bytes/s; 4300 fits default 5 kB/s servers). 0 disables telemetry.
     MaxCPUPercent               = 75,        -- Above this %, reduce substeps & skip non-critical FX
@@ -45,10 +75,10 @@ CONFIG.VEHICLE_CFG = {
 }
 
 CONFIG.WHEELS = {
-    { name = "FL", pos = Vector( 47,  27, -1), isFront = true,  steer = 1, drive = true, radius = 11, width = 7 },
-    { name = "FR", pos = Vector( 47, -27, -1), isFront = true,  steer = 1, drive = true, radius = 11, width = 7 },
-    { name = "RL", pos = Vector(-46.75,27,0), isFront = false, steer = 0, drive = true, radius = 11, width = 7 },
-    { name = "RR", pos = Vector(-46.75,-27, 0), isFront = false, steer = 0, drive = true, radius = 11, width = 7 },
+    { name = "FL", pos = Vector( 47,  28, -1.5), isFront = true,  steer = 1, drive = true, radius = 11, width = 7 },
+    { name = "FR", pos = Vector( 47, -28, -1.5), isFront = true,  steer = 1, drive = true, radius = 11, width = 7 },
+    { name = "RL", pos = Vector(-46.75,27,-0.5), isFront = false, steer = 0, drive = true, radius = 11, width = 7 },
+    { name = "RR", pos = Vector(-46.75,-27, -0.5), isFront = false, steer = 0, drive = true, radius = 11, width = 7 },
 }
 
 CONFIG.WHEEL_DEFAULTS = {
@@ -82,12 +112,16 @@ CONFIG.SUSPENSION_CFG = {
         maxAxleRollDeg      = 15,   -- Articulation stop relative to chassis
         springSpanRatio     = 0.75, -- Solid axle spring spacing / wheel track (1 = springs at hubs)
         casterDeg           = 6,    -- Positive tips the upper steering pivot rearward and adds camber in turns
-        rideHeight          = 14,
+        rideHeight          = 15.5,
         airTravel           = 3,
         restCompression     = 0.45,
-        springStiffnessMult = 2.15,
+        springStiffnessMult = 1.45,
+        helperSpringMult    = nil,  -- Extra corner weights at full bump. Automatic value is 8 at 2600 kg virtual mass or above, otherwise 0.
+        helperStartCompression = nil, -- Fraction of rideHeight where the helper starts. Defaults to restCompression.
+        levelCapacityKG     = 0,    -- Extra payload capacity for this axle in kg. 0 disables leveling.
+        levelCompression    = 0.35, -- Target compression as a fraction of rideHeight when leveling is enabled.
         bumpDampingRatio    = 1.12,
-        reboundDampingRatio = 1.45,
+        reboundDampingRatio = 0.75,
         antiRollStiffness   = 0.16,
     },
     Rear = {
@@ -95,24 +129,28 @@ CONFIG.SUSPENSION_CFG = {
         bumpCamberDeg       = -3.0, -- Added to static camber at full bump; zero change at rest, linear between
         droopCamberDeg      =  2.0, -- Added at full droop. Both travel settings apply only to independent wheels
         solidAxle           = false, -- Enable beam suspension and the RearAxle Wire entity for mesh parenting
-        axleCenterZ         = 0.3, -- Nominal beam center above chassis COM at rest compression (Source units)
+        -- axleCenterZ = 0.3, -- Optional beam height override. Omit to keep the wheel mount height when enabling solidAxle.
         maxAxleRollDeg      = 15,  -- Maximum beam tilt in either direction relative to chassis
         springSpanRatio     = 0.75,
         rideHeight          = 14,
         airTravel           = 3,
         restCompression     = 0.45,
-        springStiffnessMult = 1.75,
-        bumpDampingRatio    = 0.72,
-        reboundDampingRatio = 1.25,
+        springStiffnessMult = 1.25,
+        helperSpringMult    = nil,
+        helperStartCompression = nil,
+        levelCapacityKG     = 0,
+        levelCompression    = 0.35,
+        bumpDampingRatio    = 0.52,
+        reboundDampingRatio = 0.75,
         antiRollStiffness   = 0.14,
     },
 
     -- Chassis pitch and roll
-    centerOfMassHeight     = 14,
-    pitchTransferAccelMult = 4.0, -- Chassis pitch response when gaining longitudinal speed
-    pitchTransferBrakeMult = 4.0, -- Chassis pitch response when slowing down, including lift-off
+    centerOfMassHeight     = 12,
+    pitchTransferAccelMult = 4.5, -- Chassis pitch response when gaining longitudinal speed
+    pitchTransferBrakeMult = 4.5, -- Chassis pitch response when slowing down, including lift-off
     -- Legacy pitchTransferMult is the fallback for either multiplier when omitted.
-    rollTransferMult       = 2.0,
+    rollTransferMult       = 1.5,
     rollRecoveryMult       = 1.0, -- How quickly the tire-driven roll couple fades on turn exit. 1 = normal, higher unwinds sooner.
     invertPitchTransfer    = false,
     invertRollTransfer     = false,
@@ -120,8 +158,9 @@ CONFIG.SUSPENSION_CFG = {
     -- Wheel traces and curb response
     useTreadTrace       = true,       -- Sample the curved tread across the configured wheel width
     useHullTrace        = false,      -- Enable to override tread sampling with the legacy square hull
-    curbTripEnabled      = true,      -- Catch & trip tires when hitting curbs sideways
+    curbTripEnabled      = true,      -- Extra curb resistance and jolt. Wheel-wall contact also works with this disabled.
     curbClimbRatio       = 0.42,      -- Fraction of wheel radius a tire can climb before catching
+    curbMinHeight        = 1.75,      -- Minimum rise in Source units for a curb jolt. The larger of this and radius * curbClimbRatio applies.
     curbProbeHeightRatio = 0.14,      -- Lower curb probe height as fraction of wheel radius
     curbProbeMaxHeight   = 4.5,       -- Max height (units) above ground for lower probe (so big wheels still catch curbs)
     curbProbeDistMult    = 1.00,      -- Scale the forward tread and lateral half-width probe reach
@@ -154,12 +193,12 @@ CONFIG.WEIGHT_SHIFT_CFG = {
     Enabled              = true,  -- Enable simulated dynamic weight transfer on tire normal loads (Fz)
     LongitudinalTransfer = 4.0,   -- Pitch transfer multiplier (braking -> front, accel -> rear)
     LateralTransfer      = 1.5,   -- Roll transfer multiplier (cornering -> outside wheels)
-    VerticalTransfer     = 1.0,   -- Vertical G load scale (crests unload <1.0g, dips/half-pipes load >1.0g)
+    VerticalTransfer     = 0.75,   -- Vertical G load scale (crests unload <1.0g, dips/half-pipes load >1.0g)
     MinVertLoadMult      = 0.20,  -- Minimum vertical load multiplier over crests
     MaxVertLoadMult      = 2.00,  -- Maximum vertical load multiplier in dips/compression
     CGHeight             = 0.55,  -- Effective center-of-gravity height (meters)
-    Wheelbase            = 2.55,  -- Effective wheelbase (meters)
-    TrackWidth           = 1.55,  -- Effective track width (meters)
+    Wheelbase            = 2.38,  -- Effective wheelbase (meters)
+    TrackWidth           = 1.39,  -- Effective track width (meters)
     Smoothing            = 10.0,  -- Acceleration filter rate (Hz)
     MaxTransferFrac      = 0.45,  -- Max load fraction transferred per axis (0 - 0.85)
     MinWheelLoadFrac     = 0.15,  -- Minimum load fraction kept on unloaded wheel
@@ -178,8 +217,8 @@ CONFIG.STEERING_CFG = {
     ackermann = 0.14, -- 0 gives equal wheel angles. Higher values reduce the outside wheel angle in a turn.
 
     -- How quickly input builds angle, and how strongly speed takes angle away
-    SteeringSpeed = 60,  -- Degrees per second added at full input before speed decay or drift modifiers.
-    SpeedEffect   = 750, -- Higher preserves more steering angle at speed. Lower reduces angle even with a key held.
+    SteeringSpeed = 45,  -- Degrees per second added at full input before speed decay or drift modifiers.
+    SpeedEffect   = 650, -- Higher preserves more steering angle at speed. Lower reduces angle even with a key held.
     LinearBlend   = 0.3, -- Partial input curve. 0 is cubic (softer near center), 1 is linear. Full A/D input is identical.
 
     -- How quickly the wheels center after releasing the steering keys
@@ -187,8 +226,8 @@ CONFIG.STEERING_CFG = {
     ReturnSpeedAttenuation = 40, -- Higher softens centering at low speeds. 40 reaches full return at about 53 km/h.
 
     -- Drift key rates and straight-line stability
-    DriftTurnInMultiplier       = 1.25, -- Input rate when steering farther into an established drift. 1 is normal.
-    DriftCountersteerMultiplier = 1.50, -- Input rate when countersteering to catch a drift. 1 is normal.
+    DriftTurnInMultiplier       = 2.5, -- Input rate when steering farther into an established drift. 1 is normal.
+    DriftCountersteerMultiplier = 3, -- Input rate when countersteering to catch a drift. 1 is normal.
     yawStabilityAssist          = 0.38, -- Body yaw damping above 8 km/h with steering near center, 3+ wheels grounded and handbrake released. 0 disables it.
 }
 
@@ -361,6 +400,7 @@ CONFIG.ENGINE_CFG = {
     -- ------------------------------------------------------------------------
     -- 1. Engine & Powerband
     -- ------------------------------------------------------------------------
+    EngineType         = "gasoline", -- "gasoline" | "diesel" (unthrottled fuel metering, smooth governor, no BOV/vacuum, boost smoke limit)
     DisplacementLiters = 1.6,
     PeakHP             = 118,
     PeakTorqueNm       = 152,
@@ -380,22 +420,44 @@ CONFIG.ENGINE_CFG = {
     idleRPM            = 950,
     PowerbandStartRPM  = 2600,      -- RPM where engine comes "on cam" / enters powerband
     PowerbandRiseSharpness = 1.0,   -- Generated curve only; 1 = smooth, >1 brings torque in sooner (minimum 0.25)
-    PowerbandEndRPM    = 6500,      -- Must be below limiterRPM for PowerbandDropSharpness to have an effect
+    PowerbandEndRPM    = 6850,      -- Must be >= peakPowerRPM and < limiterRPM for PowerbandDropSharpness to take effect
     PowerbandDropSharpness = 1.0,   -- Generated curve only; 1 = linear, >1 drops faster (minimum 0.25)
+    -- Optional fine shaping for generated curves: Powerband = { lowEndScale = 0.60, topEndScale = 0.78 },
+    ConstrainGeneratedPeakHP = false, -- Generated curve only: cap high-RPM torque to the requested PeakHP envelope
+    WarnEngineCurveMismatch  = true,  -- Log once at init if requested torque/power/RPM targets conflict or are clamped
     peakTorqueRPM      = 5200,
     peakPowerRPM       = 6600,
     redlineRPM         = 7200,
-    limiterRPM         = 7100,
+    limiterRPM         = 7350,      -- Must be >= redlineRPM (values below redlineRPM are clamped up to redlineRPM)
     revLimitDrop       = 280,       -- RPM drop below limiterRPM before ignition returns (0 = pure time-based cut, 60-120 = rapid race bounce, 250-500+ = deep drop)
     revLimitDelay      = 0.04,      -- Minimum ignition-cut hold time in seconds (e.g. 0.01-0.03 = ultra-quick race cut, 0.04-0.12 = slower/heavier cut)
+    RevLimiterMode     = "hard",    -- "hard" (ignition cut bounce) | "soft" (progressive torque taper before hard ceiling backstop)
+    RevLimiterSoftWindowRPM = 250,  -- RPM window below limiterRPM where soft-cut taper ramps down (when RevLimiterMode = "soft")
+    RevLimiterSoftMinTorque = 0.05, -- Residual torque fraction at the top of the soft-cut ramp before hard cut catches
+    -- Diesel-only tuning (used when EngineType = "diesel"; ignored on gasoline engines)
+    DieselGovernorWindowRPM = nil,  -- Smooth fuel-taper governor window below limiterRPM (nil = auto ~12% of RPM span)
+    DieselSmokeLimit        = 0.25, -- Off-boost AFC fuel cap when Turbo = true (0..0.65; 0 disables off-boost limiting)
+    DieselCoastBrakeScale   = 0.55, -- Natural unthrottled coast braking fraction (diesels lack throttle-plate vacuum drag)
     flywheelInertia    = nil,       -- Rotational inertia (kg·m²; nil/0 = auto from displacement & cylinders). Lower = faster rev up & down (0.03-0.08 race, 0.10-0.22 street, 0.25-0.45+ heavy; clamped 0.03..1.50)
 
     -- ------------------------------------------------------------------------
-    -- 2. Ignition & Starter (Sim-Engine 4-state: 0=Off, 1=Crank, 2=Start, 3=Run)
+    -- 2. Ignition, Starter & Idle (Sim-Engine 4-state: 0=Off, 1=Ignition On, 2=Cranking, 3=Catch)
     -- ------------------------------------------------------------------------
     StartRunning       = false,
     crankRPM           = 320,
     crankTime          = 0.65,
+    PhysicalStarter    = true,     -- Opt-in torque-based starter motor & RPM catch threshold (false keeps timed crankTime)
+    StarterTorqueNm    = nil,       -- Starter torque at flywheel in Nm (nil/0 = auto-sized to hold ~crankRPM against compression drag)
+    StarterCatchRPM    = 260,       -- Minimum crank RPM required for combustion to catch (when PhysicalStarter = true)
+    StarterCatchTime   = 0.25,      -- Seconds held >= StarterCatchRPM before engine catches (when PhysicalStarter = true)
+    BumpStartEnabled   = true,      -- Allow push/bump-starting when Ignition is ON (state 1) and rolling in gear spins the engine
+    BumpStartRPM       = nil,       -- Min wheel-driven RPM to bump-start (nil = auto above StallRPM, ~55-65% of idleRPM)
+    BumpStartTime      = 0.22,      -- Seconds held >= BumpStartRPM before the engine catches while rolling in gear
+    PhysicalIdle       = true,     -- Opt-in bounded idle torque controller & engine stalling (false preserves legacy idleRPM floor)
+    IdleControllerGain = 0.0018,    -- Proportional idle torque gain per RPM of droop below idleRPM (when PhysicalIdle = true)
+    IdleMaxTorqueFrac  = 0.28,      -- Max fraction of idle torque curve the idle controller can add above self-sustain (0..0.75)
+    StallRPM           = 450,       -- RPM below which the engine stalls if held for StallDelay seconds (when PhysicalIdle = true)
+    StallDelay         = 0.35,      -- Seconds below StallRPM before combustion shuts down (ignition stays ON for immediate re-crank)
 
     -- ------------------------------------------------------------------------
     -- 3. Transmission & Gear Ratios
@@ -424,42 +486,61 @@ CONFIG.ENGINE_CFG = {
     -- 4. Differentials & Torque Vectoring
     -- ------------------------------------------------------------------------
     PowerDistribution   = 100,         -- 0 = RWD, 100 = FWD, 50 = AWD, 35 = 35/65 AWD
-    FrontDiffType       = 0,           -- 0 = Open, 1 = Viscous LSD, 2 = Locked
-    FrontLSDStiffness   = 3.0,         -- Front LSD ramp stiffness (higher = locks faster on wheel speed diff)
-    FrontLSDLockRatio   = 0.75,        -- Front LSD max torque/speed lock ratio (0..1)
-    RearDiffType        = 0,           -- 0 = Open, 1 = Viscous LSD, 2 = Locked
-    RearLSDStiffness    = 3.0,         -- Rear LSD ramp stiffness (higher = locks faster on wheel speed diff)
-    RearLSDLockRatio    = 0.75,        -- Rear LSD max torque/speed lock ratio (0..1)
+    DrivetrainEfficiency = nil,        -- Flywheel-to-wheel torque efficiency (0.50..1.00; nil = auto: 0.88 FWD, 0.85 RWD, 0.82 AWD; 1.0 = lossless)
+    FrontDiffType       = 0,           -- 0 = Open, 1 = LSD (torque + viscous), 2 = Locked
+    FrontLSDStiffness   = 3.0,         -- Front LSD viscous speed-diff ramp (higher = locks faster on wheel speed diff)
+    FrontLSDLockRatio   = 0.75,        -- Front LSD max viscous lock ratio (0..1)
+    FrontLSDPreload     = 15,          -- Front LSD static preload locking torque (Nm)
+    FrontLSDAccelLock   = 0.65,        -- Front LSD torque-sensitive lock under drive (0..1; 1-way/1.5-way/2-way accel ramp)
+    FrontLSDDecelLock   = 0.25,        -- Front LSD torque-sensitive lock on coast/overrun (0..1; 0 = 1-way, <accel = 1.5-way, =accel = 2-way)
+    RearDiffType        = 0,           -- 0 = Open, 1 = LSD (torque + viscous), 2 = Locked
+    RearLSDStiffness    = 3.0,         -- Rear LSD viscous speed-diff ramp (higher = locks faster on wheel speed diff)
+    RearLSDLockRatio    = 0.75,        -- Rear LSD max viscous lock ratio (0..1)
+    RearLSDPreload      = 15,          -- Rear LSD static preload locking torque (Nm)
+    RearLSDAccelLock    = 0.65,        -- Rear LSD torque-sensitive lock under drive (0..1)
+    RearLSDDecelLock    = 0.25,        -- Rear LSD torque-sensitive lock on coast/overrun (0..1)
     CenterDiffType      = 0,           -- 0 = Open, 1 = LSD, 2 = Locked (AWD)
     DiffLockToggleable  = false,       -- Allow K/L/J keys to toggle Front/Rear/All diff locks
 
     -- ------------------------------------------------------------------------
     -- 5. Clutch & Braking (Engine Braking, Service Brakes, ABS, Handbrake)
     -- ------------------------------------------------------------------------
-    engineBrakeTorque      = 65,        -- Base engine braking torque (Nm; higher = stronger off-throttle decel)
+    engineBrakeTorque      = 45,        -- Base engine braking torque (Nm; higher = stronger off-throttle decel)
     EngineBrakeMult        = 1.0,       -- Multiplier for base and manual over-rev engine braking (0 = freewheel, 1 = normal, 2+ = strong)
+    EngineBrakeThrottleFade = 0.15,     -- Throttle fraction (0.02..1.0) over which closed-throttle engine braking fades out
+    JakeBrakeEnabled       = false,     -- Enable driver-toggleable compression-release / exhaust brake (CONTROLS_CFG.JakeBrake)
+    JakeBrakeStages        = 3,         -- Number of Jake brake stages (1 = Off/On, 3 = Off / Low / Med / High)
+    JakeBrakeMult          = 3.2,       -- Top-stage engine braking multiplier when off-throttle in gear above JakeBrakeMinRPM
+    JakeBrakeMinRPM        = nil,       -- Min RPM for Jake brake activation (nil = idleRPM + 300)
+    ThrottleResponseExp    =1.0,       -- Partial-throttle load curve (1.0 = linear, <1 = snappier tip-in, >1 = progressive; WOT unchanged)
+    ThrottleRPMScale       = 0.7,       -- RPM-dependent partial throttle (0 = off; 0.8-1.2 = stronger low-RPM tip-in, progressive high-RPM; WOT unchanged)
     ClutchType             = "friction", -- "friction" | "torque_converter" | "centrifugal"
+    ClutchMaxTorqueNm      = nil,       -- Dry-plate clutch clamping capacity in Nm (nil = auto ~1.85x peak torque with boost headroom)
+    ThrottleRiseTime       = 0.05,     -- Throttle response time constant in seconds. 0 uses the standard pedal response.
+    ClutchEngageTime       = 0,     -- Friction clutch take-up time in seconds. 0 uses the standard engagement behavior.
+    HardRPMLimit           = false, -- Enable to cap RPM during wheel-driven overrun.
     ClutchLerp             = 0.40,
     ClutchLerpReverse      = 0.50,
     UseClutchLerpInManual  = true,
     -- Torque Converter settings (used when ClutchType = "torque_converter")
-    TC_StallRPM            = 2200,       -- Stall speed (RPM)
+    TC_StallRPM            = 2200,       -- Nominal stall speed (RPM); calibrates hydrodynamic K-factor (higher torque naturally raises stall)
     TC_MaxMult             = 2.0,        -- Peak torque multiplication at stall
     TC_CouplingRatio       = 0.85,       -- Turbine/impeller speed ratio where multiplication ends
     TC_LockupRPM           = 3200,       -- Lockup threshold RPM (0 = disable lockup)
-    TC_CreepTorque         = 0.12,       -- Idle creep engagement factor (0..0.4)
+    TC_CreepTorque         = 0.12,       -- Idle creep scale (0.12 = normal; 0 disables idle creep)
     -- Centrifugal Clutch settings (used when ClutchType = "centrifugal")
     CentrifugalEngageRPM   = 1800,       -- RPM where clutch shoes begin engaging
     CentrifugalFullRPM     = 3200,       -- RPM where clutch reaches 100% lock
     StoppedPhaseBrakeSpeed = 5,
     brakeTorque            = 750,
     frontBrakeBias         = 0.62,
+    BurnoutAssist          = false,     -- True releases rear service brakes when holding throttle + brake at low speed; false allows normal left-foot braking
     BrakeHighSpeedScale    = 1.0,       -- Brake torque multiplier at BrakeHighSpeedRefKMH (e.g. 0.60 = 40% less brake force at 200 km/h)
     BrakeHighSpeedStartKMH = 80,        -- Speed (km/h) below which braking stays at 100%
     BrakeHighSpeedRefKMH   = 200,       -- Speed (km/h) where BrakeHighSpeedScale is reached
     ABSEnabled             = true,      -- Enable Anti-lock Braking System above ~8 km/h
     ABSLockThreshold       = 0.16,      -- Slip ratio (0..1) where ABS triggers: 0.08-0.16 = tight (no skids), 0.25-0.35 = street, >=0.45 = loose (allows lockup)
-    ABSPulseRate           = 34,        -- ABS release/apply cycles per second (Hz); higher = smoother pedal modulation
+    ABSPulseRate           = 14,        -- ABS release/apply cycles per second (Hz); higher = smoother pedal modulation
     ABSReleaseRatio        = 0.15,      -- Brake torque fraction kept during release pulse (0.05-0.25 = clean release, >=0.65 = weak release/allows lockup)
     HandbrakeTorque        = 2400,      -- Rear handbrake torque (Nm)
     HandbrakeLockWheels    = true,      -- Lock rear wheels immediately when handbrake is pulled
@@ -470,32 +551,45 @@ CONFIG.ENGINE_CFG = {
     AutoHandbrakeOnExitSpeed = 15,      -- Auto-engage handbrake when driver exits at <= this speed (km/h; 0 = off)
 
     -- ------------------------------------------------------------------------
-    -- 6. Forced Induction (exhaust-driven turbocharger)
+    -- 6. Forced Induction (exhaust-driven turbocharger & belt-driven supercharger)
     -- ------------------------------------------------------------------------
+    -- Shared absolute reference pressure (PSI absolute) for pressure-ratio = (gaugePSI + ref) / ref.
+    -- 14.696 = standard sea-level atmosphere; legacy configs without this key fall back to 18.4.
+    Induction_ReferencePSI = 14.696,
+    ManifoldModel          = true, -- Opt-in intake manifold pressure (MAP) state: separates pre-throttle boost from post-throttle vacuum/load
+    ManifoldTimeConstant   = 0.06,  -- Manifold fill/empty time constant in seconds (0.005..0.50; lower = snappier throttle/lift response)
+    ManifoldIdleAbsPSI     = nil,   -- Closed-throttle idle MAP in PSI absolute (nil = ~5.0 PSI abs / -9.7 PSI vacuum @ sea level)
     Turbo              = false,  -- Enable turbocharger torque and boost simulation
-    Turbo_PSIMax       = 12.0,   -- Compressor pressure ceiling (PSI)
+    Turbo_PSIMax       = 12.0,   -- Compressor pressure ceiling (PSI gauge)
     Turbo_StartRPM     = 2000,   -- Engine RPM where spool flow begins; not the RPM for full boost
-    Turbo_AirPressure  = 18.4,   -- Reference pressure for the boost pressure-ratio calculation
-    Turbo_MaxRPM       = 9000,   -- Turbo shaft RPM limit (not engine RPM)
+    -- Optional per-system override (omit to use Induction_ReferencePSI; legacy default was 18.4)
+    -- Turbo_AirPressure  = 18.4,
+    Turbo_MaxRPM       = 9000,   -- Calibrated turbo spool proxy limit (not literal ~150k turbine RPM)
     Turbo_MaxFlow      = 9000,   -- Flow scale; higher values generally spool more slowly
     Turbo_FlowScale    = 100,    -- Exhaust-flow drive strength; higher values spool faster
     Turbo_DragScale    = 0.01,   -- Rotor drag; higher values reduce spool and speed up pressure decay
     Turbo_Inertia      = 0.035,  -- Rotor inertia; lower values respond/spool faster
     Turbo_Exp          = 1.0,    -- Flow response exponent; >1 delays low-flow spool, <1 builds it earlier
-    Turbo_TorqueGain   = 1.0,    -- Scales pressure-ratio torque gain; 0 disables added torque
-    Turbo_BOVThresholdPSI = 3.5, -- Minimum PSI for the lift-off blow-off sound
-    -- Optional wastegate cap; defaults to Turbo_PSIMax when omitted.
+    Turbo_CoastFlow    = 0.08,   -- Off-throttle exhaust-drive fraction (0..1); lower sheds boost faster on lift-off
+    Turbo_LoadExp      = 1.0,    -- Throttle-to-exhaust-drive exponent (0.1..3.0; 1 = linear, WOT unchanged)
+    Turbo_TorqueGain   = 0.80,   -- Scales pressure-ratio torque gain (0.80 @ 14.696 PSI matches legacy 1.0 @ 18.4 PSI; 0 disables)
+    Turbo_BOVThresholdPSI = 3.5, -- Minimum gauge PSI for the lift-off blow-off sound
+    -- Optional wastegate cap (PSI gauge); defaults to Turbo_PSIMax when omitted.
     -- Turbo_WastegatePSI = 10.0,
     -- Supercharger is independent; both systems may be enabled for compound/twincharging.
     Supercharger = false,
     Supercharger_Type = "centrifugal", -- Approximate response: "roots", "twin_screw", or "centrifugal"
-    Supercharger_MaxPSI = 8.0,          -- Maximum boost at Supercharger_RatedRPM
+    Supercharger_MaxPSI = 8.0,          -- Maximum boost (PSI gauge) at Supercharger_RatedRPM
     Supercharger_RatedRPM = 6500,       -- Engine RPM at which the configured maximum boost is reached
-    Supercharger_AirPressure = 18.4,    -- Reference pressure; keep consistent with Turbo_AirPressure
+    -- Optional per-system override (omit to use Induction_ReferencePSI; legacy default was 18.4)
+    -- Supercharger_AirPressure = 18.4,
     -- Optional response-curve exponent; otherwise selected from Supercharger_Type.
     -- Supercharger_PressureExp = 2.0,
-    Supercharger_TorqueGain = 1.0,      -- Scales torque added by boost; 0 disables it
-    Supercharger_DriveLoss = 0.08,      -- Fraction of boosted engine torque consumed at maximum boost
+    Supercharger_TorqueGain   = 0.80,   -- Scales torque added by boost (0.80 @ 14.696 PSI matches legacy 1.0 @ 18.4 PSI; 0 disables)
+    Supercharger_DriveLoss    = 0.08,   -- Legacy multiplier loss at max boost (ignored when Supercharger_PhysicalLoss = true)
+    Supercharger_PhysicalLoss = false,  -- Opt-in crankshaft compressor-power loss model (replaces Supercharger_DriveLoss)
+    Supercharger_Efficiency   = 0.65,   -- Adiabatic compressor efficiency (0.25..0.95; used when Supercharger_PhysicalLoss = true)
+    Supercharger_BaseDragNm   = nil,    -- Residual mechanical/belt drag in Nm even when bypassed (nil = 4 Nm in physical mode, 0 in legacy mode)
 }
 
 -- ============================================================================
@@ -511,6 +605,7 @@ CONFIG.CONTROLS_CFG = {
     FullThrottle  = IN_KEY.SPEED,     -- Hold with W for 100% throttle (W alone = 50%)
     Handbrake     = IN_KEY.JUMP,      -- Handbrake
     ParkingBrake  = KEY.P,            -- Toggle Parking Brake (stays engaged without holding Space)
+    JakeBrake     = KEY.X,            -- Cycle Jake / Exhaust Brake stages (when JakeBrakeEnabled = true)
     Clutch        = IN_KEY.WALK,      -- Clutch pedal
     GearUp        = IN_KEY.ATTACK,    -- Next PRND range or manual upshift (M1)
     GearDown      = IN_KEY.ATTACK2,   -- Previous PRND range or manual downshift (M2)
@@ -604,7 +699,7 @@ CONFIG.SOUND_CFG = {
     TurboBOVVolume         = 1.0,
     Horn = { -- Hold CONTROLS_CFG.Horn to sound horn (local sound path or https:// URL)
         enabled   = true,
-        sndsource = "ambient/alarms/klaxon1.wav",
+        sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/horn/horn_moto_02.ogg",
         loadMode  = "stream", -- "stream" or "download" for web URLs
         volume    = 0.85,
         pitch     = 1.0,
@@ -1030,6 +1125,9 @@ CONFIG.ADDON_MODULES = {
             WheelRPMToSpeed = 0.15, -- km/h per RPM for external wheel props
             CoolRate = 0.08, SpeedCoolScale = 0.15,
             StoppedCoolMult = 0.5, -- passive cooling below 2 km/h
+            EnableFade = false, -- Reduce service brake torque linearly between FadeStartTemp and FadeFullTemp
+            FadeStartTemp = 400, FadeFullTemp = 750, -- degrees Celsius
+            MinFadeMult = 0.45, -- Minimum brake torque fraction at full fade
         },
     },
     {
@@ -1046,8 +1144,8 @@ CONFIG.ADDON_MODULES = {
             ShowOccupied      = true,  -- Show "OCCUPIED" indicator on occupied seats
             CurveSegments          = 24,    -- Fixed holo pool size for the 3D Bezier curve
             LabelOffsetZ      = 16,    -- Height above seat center for the floating label
-            AllowEnterVehicle      = true,  -- Press [E] while aiming at a seat to enter via enterVehicle (when permitted)
-            RequestEnterPermission = true,  -- Prompt once for player.enterVehicle permission if not yet granted
+            AllowEnterVehicle      = false,  -- Press [E] while aiming at a seat to enter via enterVehicle (when permitted)
+            RequestEnterPermission = false,  -- Prompt once for player.enterVehicle permission if not yet granted
             -- SeatLabels     = { "Driver", "Shotgun", "Rear Left", "Rear Right" }, -- Optional custom names by seat order
         },
     },

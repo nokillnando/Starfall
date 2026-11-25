@@ -37,6 +37,7 @@ function SimcadeWire.initPorts(VEHICLE_CFG, WHEELS, extraInputs, extraOutputs)
         "SlipAngle", "LongSlipRatio", "IsDrifting", "IsSlipping",
         "ActiveCompound", "AppliedForce",
         "FrontDiffLocked", "RearDiffLocked", "AllDiffLocked", "FrontActiveLockPct", "RearActiveLockPct", "ABSActive",
+        "JakeBrakeStage", "JakeBrakeActive",
         "FL_Load", "FR_Load", "RL_Load", "RR_Load",
         "GroundedCount", "TotalMass",
         "SteeringAngleDeg", "FrontAxle", "RearAxle"
@@ -49,6 +50,7 @@ function SimcadeWire.initPorts(VEHICLE_CFG, WHEELS, extraInputs, extraOutputs)
         "Number", "Number", "Number", "Number",
         "String", "Number",
         "Number", "Number", "Number", "Number", "Number", "Number",
+        "Number", "Number",
         "Number", "Number", "Number", "Number",
         "Number", "Number",
         "Number", "Entity", "Entity"
@@ -118,6 +120,8 @@ function SimcadeWire.writeOutputs(data)
     wire.ports.IsDrifting      = data.isDrifting and 1 or 0
     wire.ports.IsSlipping      = data.isSlipping and 1 or 0
     wire.ports.ActiveCompound  = tostring(data.activeCompound or "Sport")
+    wire.ports.JakeBrakeStage  = tonumber(data.jakeBrakeStage) or 0
+    wire.ports.JakeBrakeActive = data.jakeBrakeActive and 1 or 0
     wire.ports.AppliedForce    = math.round(data.appliedForce or 0)
     wire.ports.FrontDiffLocked    = data.frontDiffLocked and 1 or 0
     wire.ports.RearDiffLocked     = data.rearDiffLocked and 1 or 0

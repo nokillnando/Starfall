@@ -28,6 +28,7 @@ function SimcadeBraking.configure(engineCfg, massT, massScale)
         highSpeedScale = clamp(tonumber(engineCfg.BrakeHighSpeedScale) or 1.0, 0.1, 2.0),
         highSpeedStartKMH = brakeHighSpeedStartKMH,
         highSpeedRefKMH = max(brakeHighSpeedStartKMH + 10, tonumber(engineCfg.BrakeHighSpeedRefKMH) or 200),
+        burnoutAssist = (engineCfg.BurnoutAssist ~= false),
         abs = {
             enabled = (engineCfg.ABSEnabled ~= false),
             threshold = clamp(tonumber(engineCfg.ABSLockThreshold) or 0.22, 0.02, 0.85),
@@ -55,9 +56,12 @@ end
 function SimcadeBraking.applyWheelTorque(car, wheel, peakLongKN, vFwd, absFwd)
     local brakeCfg = car.braking
     local driver = car.drv
-    local isBurnout = (driver and (driver.thr or 0) > 0.5 and (driver.brk or 0) > 0.3 and absFwd < 8.0)
+    local isBurnout = (brakeCfg.burnoutAssist ~= false) and (driver and (driver.thr or 0) > 0.5 and (driver.brk or 0) > 0.3 and absFwd < 8.0)
     local pedalBrake = (isBurnout and wheel.i >= 2) and (absFwd * 0.05) or clamp((driver and driver.brk) or wheel.brk or 0, 0, 1)
     local brakeTorque = (wheel.i < 2) and (brakeCfg.frontBrakeKNm or 2.00) or (brakeCfg.rearBrakeKNm or 1.22)
+    if wheel.brakeTempMult ~= nil then
+        brakeTorque = brakeTorque * clamp(wheel.brakeTempMult, 0.15, 1.25)
+    end
     local highSpeedScale = brakeCfg.highSpeedScale or 1.0
     if abs(highSpeedScale - 1.0) > 0.001 then
         local startMS = (brakeCfg.highSpeedStartKMH or 80) / 3.6
