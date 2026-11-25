@@ -608,14 +608,14 @@ CONFIG.CONTROLS_CFG = {
     Headlights    = KEY.H,            -- Cycle Headlights (Off / Low / High)
     FullThrottle  = IN_KEY.SPEED,     -- Hold with W for 100% throttle (W alone = 50%)
     Handbrake     = IN_KEY.JUMP,      -- Handbrake
-    ParkingBrake  = KEY.P,            -- Toggle Parking Brake (stays engaged without holding Space)
+    ParkingBrake  = KEY.J,            -- Toggle Parking Brake (stays engaged without holding Space)
     JakeBrake     = KEY.X,            -- Cycle Jake / Exhaust Brake stages (when JakeBrakeEnabled = true)
     Clutch        = IN_KEY.WALK,      -- Clutch pedal
     GearUp        = IN_KEY.ATTACK,    -- Next PRND range or manual upshift (M1)
     GearDown      = IN_KEY.ATTACK2,   -- Previous PRND range or manual downshift (M2)
-    FrontLock     = KEY.K,            -- Toggle Front Diff Lock (when DiffLockToggleable = true)
-    RearLock      = KEY.L,            -- Toggle Rear Diff Lock (when DiffLockToggleable = true)
-    AllLock       = KEY.J,            -- Toggle All / Center Diff Lock (when DiffLockToggleable = true)
+    FrontLock     = KEY.I,            -- Toggle Front Diff Lock (when DiffLockToggleable = true)
+    RearLock      = KEY.K,            -- Toggle Rear Diff Lock (when DiffLockToggleable = true)
+    AllLock       = KEY.L,            -- Toggle All / Center Diff Lock (when DiffLockToggleable = true)
     Horn          = KEY.G,            -- Hold to sound horn (uses SOUND_CFG.Horn)
     RadioMenu     = KEY.N,            -- Open / close Vehicle Radio station selector
     RadioToggle   = KEY.B,            -- Toggle Vehicle Radio On / Off
