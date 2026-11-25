@@ -150,7 +150,7 @@ function SimcadeTires.resolveMaterial(hit, cfg)
     -- HitTexture identifies the struck brush face. Models can report generic
     -- placeholders here, so only consider explicit brush texture mappings.
     local textures = cfg and cfg.SurfaceTextureOverrides
-    if textures and type(hit.HitTexture) == "string" and hit.HitTexture:sub(1, 1) ~= "*" then
+    if textures and next(textures) ~= nil and type(hit.HitTexture) == "string" and hit.HitTexture:sub(1, 1) ~= "*" then
         local key = hit.HitTexture:lower():gsub("\\", "/")
         if textures[key] then return textures[key] end
     end

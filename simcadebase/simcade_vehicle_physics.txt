@@ -2545,7 +2545,7 @@ local function initializeVehiclePhysicsBridge(PhysicsApi)
         end
 
         local totalSpd = sqrt(vFwd * vFwd + vLat * vLat)
-        local latVelRamp = min(1.0, totalSpd / 0.55)
+        local latVelRamp = min(1.0, totalSpd / 0.20)
         local latSign = (vLat > 0) and -1 or ((vLat < 0) and 1 or 0)
         local latShape = evaluateMagicFormula(spec.Lat_B, spec.Lat_C, spec.Lat_E, abs(alphaRad))
         W.Fy = peakLatKN * latShape * latSign * latVelRamp
@@ -2587,8 +2587,10 @@ local function initializeVehiclePhysicsBridge(PhysicsApi)
             W.sliding = 1
             if W.locked ~= 0 then
                 -- A stopped tread scrubs against the road in the direction of travel.
+                -- Keep full Coulomb friction down to 0.12 m/s (ellipse() clamps against substep reversal)
+                -- so locked tires can actually arrest slow creep on slopes before static grip captures.
                 local slide = evaluateMagicFormula(spec.Long_B, spec.Long_C, spec.Long_E, 1)
-                local scale = slide / max(totalSpd, 0.8)
+                local scale = slide / max(totalSpd, 0.12)
                 W.Fx = -peakLongKN * vFwd * scale
                 W.Fy = -peakLatKN * vLat * scale
             else
@@ -2654,6 +2656,12 @@ local function initializeVehiclePhysicsBridge(PhysicsApi)
         if abs(W.Fy) > jyMax then
             W.camberFy = W.camberFy * (jyMax / abs(W.Fy))
             W.Fy = (W.Fy >= 0 and 1 or -1) * jyMax
+        end
+        if W.locked ~= 0 then
+            local jxMax = (0.90 * abs(vFwd) * cornerMass) / hdt
+            if abs(W.Fx) > jxMax then
+                W.Fx = (W.Fx >= 0 and 1 or -1) * jxMax
+            end
         end
 
         local activeSpd = max(sqrt(vFwd * vFwd + vLat * vLat), abs(W.radius * W.w))
@@ -2787,7 +2795,7 @@ local function initializeVehiclePhysicsBridge(PhysicsApi)
 
     -- Synchronize the solver state from GMod VPhysics and advance across 0.0044s substeps
     function Chassis:stepVPhysics(dt, pos_m, R, vel_m, angVel_rad, wheelGrounds, controls)
-        dt = clamp(dt or 0.015, 0.001, 0.05)
+        dt = clamp(dt or 0.015, 0.001, 0.067)
         self._vphysMode = true
 
         -- 1. Update wheel ground planes from Base raycasts

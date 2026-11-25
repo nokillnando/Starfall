@@ -157,6 +157,10 @@ CONFIG.SUSPENSION_CFG = {
 
     -- Wheel traces and curb response
     useTreadTrace       = true,       -- Sample the curved tread across the configured wheel width
+    treadRayCount       = 9,          -- Number of curved-tread rays per wheel when useTreadTrace = true (1..25; auto-positioned across tire arc & width).
+                                      -- 1 = center only (fastest), 3 = front/center/rear arc, 5 = cross, 7 = staggered corners,
+                                      -- 9 = default 3x3 curved tread, 15 = 5x3 high-res, 25 = 5x5 ultra-res.
+                                      -- Flat open roads use a 2-trace broadphase fast-path; full ray count only runs on curbs, slopes, or with ShowSuspensionRays.
     useHullTrace        = false,      -- Enable to override tread sampling with the legacy square hull
     curbTripEnabled      = true,      -- Extra curb resistance and jolt. Wheel-wall contact also works with this disabled.
     curbClimbRatio       = 0.42,      -- Fraction of wheel radius a tire can climb before catching

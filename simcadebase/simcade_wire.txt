@@ -6,6 +6,14 @@ if CLIENT then return end
 
 local solverSlotsInWireOrder = { 0, 1, 3, 2 } -- FL, FR, RL, RR
 local detailedWheelOutputs = false
+local lastOutputs = {}
+
+local function writePort(name, val)
+    if lastOutputs[name] ~= val then
+        lastOutputs[name] = val
+        wire.ports[name] = val
+    end
+end
 
 function SimcadeWire.initPorts(VEHICLE_CFG, WHEELS, extraInputs, extraOutputs)
     local inNames = { "Pod", "Base", "EngineSound", "ExtraFilterStatic", "ExtraFilterSemiDynamic" }
@@ -93,53 +101,54 @@ function SimcadeWire.initPorts(VEHICLE_CFG, WHEELS, extraInputs, extraOutputs)
             end
         end
     end
+    lastOutputs = {}
     wire.adjustOutputs(outNames, outTypes)
     return inNames
 end
 
 function SimcadeWire.writeOutputs(data)
-    wire.ports.SpeedKMH        = data.kmh or 0
-    wire.ports.SpeedMPH        = data.mph or 0
-    wire.ports.Throttle        = math.round(data.throttle or 0, 3)
-    wire.ports.Brake           = math.round(data.brake or 0, 3)
-    wire.ports.Handbrake       = math.round(data.handbrake or 0, 3)
-    wire.ports.Ignition        = data.ignitionMode or data.ignitionState or 0
-    wire.ports.Active          = data.engineRunning and 1 or 0
-    wire.ports.RPM             = math.round(data.rpm or 0)
-    wire.ports.FlywheelRPM     = math.round(data.flywheelRPM or 0)
-    wire.ports.Gear            = tonumber(data.gearNumber) or 0
-    wire.ports.GearName        = tostring(data.gearName or "N")
-    wire.ports.Clutch          = math.round(data.clutch or 0, 2)
-    wire.ports.Torque          = math.round(data.torqueNm or 0)
-    wire.ports.MaxTorque       = math.round(data.maxTorque or data.maxTorqueNm or 0)
-    wire.ports.EngineLoad      = math.round(data.engineLoad or 0, 3)
-    wire.ports.BoostPSI        = data.boostPSI or data.turboPSI or 0
-    wire.ports.TurboPSI        = data.turboPSI or data.boostPSI or 0
-    wire.ports.SlipAngle       = math.round(data.slipAngleDeg or 0, 1)
-    wire.ports.LongSlipRatio   = math.round(data.longSlipPct or 0, 1)
-    wire.ports.IsDrifting      = data.isDrifting and 1 or 0
-    wire.ports.IsSlipping      = data.isSlipping and 1 or 0
-    wire.ports.ActiveCompound  = tostring(data.activeCompound or "Sport")
-    wire.ports.JakeBrakeStage  = tonumber(data.jakeBrakeStage) or 0
-    wire.ports.JakeBrakeActive = data.jakeBrakeActive and 1 or 0
-    wire.ports.AppliedForce    = math.round(data.appliedForce or 0)
-    wire.ports.FrontDiffLocked    = data.frontDiffLocked and 1 or 0
-    wire.ports.RearDiffLocked     = data.rearDiffLocked and 1 or 0
-    wire.ports.AllDiffLocked      = data.allDiffLocked and 1 or 0
-    wire.ports.FrontActiveLockPct = math.round(data.frontActiveLockPct or 0, 1)
-    wire.ports.RearActiveLockPct  = math.round(data.rearActiveLockPct or 0, 1)
-    wire.ports.ABSActive       = data.absActive and 1 or 0
-    wire.ports.FL_Load         = math.round(data.flLoad or 0)
-    wire.ports.FR_Load         = math.round(data.frLoad or 0)
-    wire.ports.RL_Load         = math.round(data.rlLoad or 0)
-    wire.ports.RR_Load         = math.round(data.rrLoad or 0)
-    wire.ports.GroundedCount   = data.groundedCount or 0
-    wire.ports.TotalMass       = math.round(data.totalMass or 0)
-    wire.ports.SteeringAngleDeg = math.round(data.steerDeg or 0, 2)
+    writePort("SpeedKMH",           data.kmh or 0)
+    writePort("SpeedMPH",           data.mph or 0)
+    writePort("Throttle",           math.round(data.throttle or 0, 3))
+    writePort("Brake",              math.round(data.brake or 0, 3))
+    writePort("Handbrake",          math.round(data.handbrake or 0, 3))
+    writePort("Ignition",           data.ignitionMode or data.ignitionState or 0)
+    writePort("Active",             data.engineRunning and 1 or 0)
+    writePort("RPM",                math.round(data.rpm or 0))
+    writePort("FlywheelRPM",        math.round(data.flywheelRPM or 0))
+    writePort("Gear",               tonumber(data.gearNumber) or 0)
+    writePort("GearName",           tostring(data.gearName or "N"))
+    writePort("Clutch",             math.round(data.clutch or 0, 2))
+    writePort("Torque",             math.round(data.torqueNm or 0))
+    writePort("MaxTorque",          math.round(data.maxTorque or data.maxTorqueNm or 0))
+    writePort("EngineLoad",         math.round(data.engineLoad or 0, 3))
+    writePort("BoostPSI",           data.boostPSI or data.turboPSI or 0)
+    writePort("TurboPSI",           data.turboPSI or data.boostPSI or 0)
+    writePort("SlipAngle",          math.round(data.slipAngleDeg or 0, 1))
+    writePort("LongSlipRatio",      math.round(data.longSlipPct or 0, 1))
+    writePort("IsDrifting",         data.isDrifting and 1 or 0)
+    writePort("IsSlipping",         data.isSlipping and 1 or 0)
+    writePort("ActiveCompound",     tostring(data.activeCompound or "Sport"))
+    writePort("JakeBrakeStage",     tonumber(data.jakeBrakeStage) or 0)
+    writePort("JakeBrakeActive",    data.jakeBrakeActive and 1 or 0)
+    writePort("AppliedForce",       math.round(data.appliedForce or 0))
+    writePort("FrontDiffLocked",    data.frontDiffLocked and 1 or 0)
+    writePort("RearDiffLocked",     data.rearDiffLocked and 1 or 0)
+    writePort("AllDiffLocked",      data.allDiffLocked and 1 or 0)
+    writePort("FrontActiveLockPct", math.round(data.frontActiveLockPct or 0, 1))
+    writePort("RearActiveLockPct",  math.round(data.rearActiveLockPct or 0, 1))
+    writePort("ABSActive",          data.absActive and 1 or 0)
+    writePort("FL_Load",            math.round(data.flLoad or 0))
+    writePort("FR_Load",            math.round(data.frLoad or 0))
+    writePort("RL_Load",            math.round(data.rlLoad or 0))
+    writePort("RR_Load",            math.round(data.rrLoad or 0))
+    writePort("GroundedCount",      data.groundedCount or 0)
+    writePort("TotalMass",          math.round(data.totalMass or 0))
+    writePort("SteeringAngleDeg",   math.round(data.steerDeg or 0, 2))
     if detailedWheelOutputs then
-        wire.ports.SteeringInput   = data.steerInput or 0
-        wire.ports.FL_SteerDeg = math.round(math.deg(data.frontLeftSteerRad or 0), 2)
-        wire.ports.FR_SteerDeg = math.round(math.deg(data.frontRightSteerRad or 0), 2)
+        writePort("SteeringInput", data.steerInput or 0)
+        writePort("FL_SteerDeg", math.round(math.deg(data.frontLeftSteerRad or 0), 2))
+        writePort("FR_SteerDeg", math.round(math.deg(data.frontRightSteerRad or 0), 2))
         -- Wire arrays use vehicle corner order FL, FR, RL, RR. Solver slots are FL, FR, RR, RL.
         local camber, thrust, lateral, slip, contact = {}, {}, {}, {}, {}
         for corner, slot in ipairs(solverSlotsInWireOrder) do
@@ -161,7 +170,7 @@ function SimcadeWire.writeOutputs(data)
         local names = SimcadeWire._wheelPortNames or {}
         for i = 1, #data.wheelEntities do
             local pName = names[i] or ("Wheel" .. i)
-            wire.ports[pName] = data.wheelEntities[i]
+            writePort(pName, data.wheelEntities[i])
         end
     end
 end

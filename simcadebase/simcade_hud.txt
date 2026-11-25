@@ -32,14 +32,14 @@ function SimcadeHUD.wheelFields(previous, writing)
     function io.float(v) return field(v, net.writeFloat, net.readFloat) end
     function io.point(v)
         local function coordinate(x)
-            return io.int(x and math.clamp(math.round(x * 8), -32768, 32767), 16) / 8
+            return (io.int(x and math.clamp(math.round(x * 8), -32768, 32767), 16) or 0) / 8
         end
         local x, y, z = coordinate(v and v.x), coordinate(v and v.y), coordinate(v and v.z)
         if not writing then return Vector(x, y, z) end
     end
     function io.direction(v)
         local function coordinate(x)
-            return io.int(x and math.clamp(math.round(x * 127), -127, 127), 8)
+            return io.int(x and math.clamp(math.round(x * 127), -127, 127), 8) or 0
         end
         local x, y, z = coordinate(v and v.x), coordinate(v and v.y), coordinate(v and v.z)
         if not writing then return Vector(x, y, z):getNormalized() end
@@ -235,34 +235,40 @@ function SimcadeHUD.initClient(cfg)
         end
         local full = net.readBool()
         local first, count = net.readUInt(32), net.readUInt(4)
-        if not full and not wheelBaselines[first] then return end
+        if not full then
+            for i = first, first + count - 1 do
+                local b = wheelBaselines[i]
+                if not b or #b == 0 then return end
+            end
+        end
         local list = wheelDebug.wheels
+        local pendingBaselines = {}
         for i = first, first + count - 1 do
             local io, values = SimcadeHUD.wheelFields(not full and wheelBaselines[i], false)
-            wheelBaselines[i] = values
-            local hx = io.int(nil, 16) * 0.1
-            local hy = io.int(nil, 16) * 0.1
-            local hz = io.int(nil, 16) * 0.1
+            pendingBaselines[i] = values
+            local hx = (io.int(nil, 16) or 0) * 0.1
+            local hy = (io.int(nil, 16) or 0) * 0.1
+            local hz = (io.int(nil, 16) or 0) * 0.1
             list[i] = {
                 hubLocal   = Vector(hx, hy, hz),
-                latRatio   = io.int(nil, 16) * 0.001,
-                longRatio  = io.int(nil, 16) * 0.001,
-                slipAngle  = io.int(nil, 16) * 0.01,
-                slipRatio  = io.int(nil, 16) * 0.001,
-                isFront    = io.bool(),
+                latRatio   = (io.int(nil, 16) or 0) * 0.001,
+                longRatio  = (io.int(nil, 16) or 0) * 0.001,
+                slipAngle  = (io.int(nil, 16) or 0) * 0.01,
+                slipRatio  = (io.int(nil, 16) or 0) * 0.001,
+                isFront    = io.bool() == true,
                 name       = (cfg.WHEELS[i] and cfg.WHEELS[i].name) or ("W" .. i),
-                isGrounded = io.bool(),
-                loadKN     = io.uint(nil, 16) * 0.01,
-                camberDeg  = io.int(nil, 16) * 0.01,
-                camberFy   = io.float(),
-                lateralFy  = io.float(),
-                isRightSide = io.bool(),
+                isGrounded = io.bool() == true,
+                loadKN     = (io.uint(nil, 16) or 0) * 0.01,
+                camberDeg  = (io.int(nil, 16) or 0) * 0.01,
+                camberFy   = io.float() or 0,
+                lateralFy  = io.float() or 0,
+                isRightSide = io.bool() == true,
                 axleLocal   = io.direction(),
                 normalLocal = io.direction(),
             }
             if io.bool() then
                 list[i].springTop = io.point()
-                list[i].seatNear = io.uint(nil, 8) / 255
+                list[i].seatNear = (io.uint(nil, 8) or 0) / 255
             end
             if hasRays then
                 local debugRays = {}
@@ -270,18 +276,21 @@ function SimcadeHUD.initClient(cfg)
                 local mount, axle = io.point(), io.direction()
                 local up = wheelDebug.rightLocal:cross(wheelDebug.fwdLocal):getNormalized()
                 local function readRay(start)
-                    local state = io.uint(nil, 2)
+                    local state = io.uint(nil, 2) or 3
                     if state == 3 then return end
-                    local depth = io.uint(nil, 16) / 8
+                    local depth = (io.uint(nil, 16) or 0) / 8
                     debugRays[#debugRays + 1] = { startLocal = start, hitLocal = start - up * depth, state = state }
                 end
                 if io.bool() then
                     local w = cfg.WHEELS[i]
-                    SimcadeSuspension.eachTreadPoint(mount, up, axle, w.radius or 15, w.width or 9, readRay)
+                    SimcadeSuspension.eachTreadPoint(mount, up, axle, w.radius or 15, w.width or 9, readRay, cfg.SUSPENSION_CFG)
                 else
                     readRay(mount)
                 end
             end
+        end
+        for i, values in pairs(pendingBaselines) do
+            wheelBaselines[i] = values
         end
     end)
 

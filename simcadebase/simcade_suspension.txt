@@ -20,26 +20,120 @@ function SimcadeSuspension.mountHeight(w, cfg)
     return w.pos.z
 end
 
-local stations = {0, 1, -1}
-local lanes = {0, 0.5, -0.5}
+-- Auto-positioned curved tread ray layouts, cached by ray count (1..25).
+-- Center point (0, 0) is placed first so traceTread can broadphase-skip outer rays on flat roads.
+local treadPointCache = {}
+local function buildTreadPoints(count)
+    local n = math.floor(clamp(tonumber(count) or 9, 1, 25))
+    local cached = treadPointCache[n]
+    if cached then return cached end
+    local pts
+    if n == 1 then
+        pts = { { 0, 0, 1.0, true } }
+    elseif n == 3 then
+        local rz = math.sqrt(1 - 0.65 * 0.65)
+        pts = {
+            { 0,     0, 1.0, true  },
+            { 0.65,  0, rz,  false },
+            { -0.65, 0, rz,  false },
+        }
+    elseif n == 5 then
+        local rz = math.sqrt(1 - 0.65 * 0.65)
+        pts = {
+            { 0,     0,    1.0, true  },
+            { 0.65,  0,    rz,  false },
+            { -0.65, 0,    rz,  false },
+            { 0,     0.5,  1.0, false },
+            { 0,    -0.5,  1.0, false },
+        }
+    elseif n == 7 then
+        local rzMid = math.sqrt(1 - 0.45 * 0.45)
+        local rzEnd = math.sqrt(1 - 0.80 * 0.80)
+        pts = {
+            { 0,     0,    1.0,   true  },
+            { 0.45,  0,    rzMid, false },
+            { -0.45, 0,    rzMid, false },
+            { 0.80,  0.5,  rzEnd, false },
+            { 0.80, -0.5,  rzEnd, false },
+            { -0.80, 0.5,  rzEnd, false },
+            { -0.80,-0.5,  rzEnd, false },
+        }
+    elseif n == 9 then
+        pts = {}
+        local stations = { 0, 1, -1 }
+        local lanes = { 0, 0.5, -0.5 }
+        for _, station in ipairs(stations) do
+            for _, y in ipairs(lanes) do
+                local x = station * (y == 0 and 0.45 or 0.80)
+                pts[#pts + 1] = { x, y, math.sqrt(1 - x * x), x == 0 and y == 0 }
+            end
+        end
+    else
+        local lanes = (n >= 20) and 5 or ((n >= 9) and 3 or ((n == 2) and 1 or 2))
+        local stations = math.max(1, math.ceil(n / lanes))
+        pts = {}
+        local hasCenter = (lanes % 2 == 1) and (stations % 2 == 1)
+        if hasCenter then
+            pts[1] = { 0, 0, 1.0, true }
+        end
+        local laneVals = {}
+        if lanes == 1 then
+            laneVals[1] = 0
+        else
+            for li = 0, lanes - 1 do
+                laneVals[#laneVals + 1] = -0.5 + (li / (lanes - 1))
+            end
+        end
+        local stationVals = {}
+        if stations == 1 then
+            stationVals[1] = 0
+        else
+            for si = 0, stations - 1 do
+                stationVals[#stationVals + 1] = -0.80 + 1.60 * (si / (stations - 1))
+            end
+        end
+        for _, x in ipairs(stationVals) do
+            for _, y in ipairs(laneVals) do
+                local isCenter = (math.abs(x) < 1e-4 and math.abs(y) < 1e-4)
+                if not (hasCenter and isCenter) and #pts < n then
+                    pts[#pts + 1] = { x, y, math.sqrt(math.max(0, 1 - x * x)), isCenter }
+                end
+            end
+        end
+        if not hasCenter and #pts > 0 then
+            pts[1][4] = true
+        end
+    end
+    treadPointCache[n] = pts
+    return pts
+end
 
-function SimcadeSuspension.eachTreadPoint(mount, up, axle, radius, width, visit)
+function SimcadeSuspension.getTreadPoints(cfg)
+    local count = (type(cfg) == "table" and cfg.treadRayCount) or (type(cfg) == "number" and cfg) or 9
+    return buildTreadPoints(count)
+end
+
+function SimcadeSuspension.eachTreadPoint(mount, up, axle, radius, width, visit, cfg)
+    local pts = SimcadeSuspension.getTreadPoints(cfg)
     local forward = axle:cross(up):getNormalized()
     local radialUp = forward:cross(axle):getNormalized()
-    for _, station in ipairs(stations) do
-        for _, y in ipairs(lanes) do
-            local x = station * (y == 0 and 0.45 or 0.8)
-            local arc = (forward * x - radialUp * math.sqrt(1 - x*x)) * radius
-            local tread = arc + axle * (y * width)
-            local height = tread:dot(up)
-            visit(mount + tread - up * height, radius + height, x == 0 and y == 0)
-        end
+    for i = 1, #pts do
+        local pt = pts[i]
+        local x, y, rz = pt[1], pt[2], pt[3]
+        local arc = (forward * x - radialUp * rz) * radius
+        local tread = arc + axle * (y * width)
+        local height = tread:dot(up)
+        visit(mount + tread - up * height, radius + height, pt[4])
     end
 end
 
 if CLIENT then return end
 
 local function supportTrace(startPos, endPos, filter, minMass, hullSize)
+    if type(filter) == "function" then
+        return hullSize and trace.hull(startPos, endPos, -hullSize, hullSize, filter, MASK.SOLID)
+            or trace.line(startPos, endPos, filter, MASK.SOLID)
+    end
     for attempt = 1, 4 do
         local tr = hullSize and trace.hull(startPos, endPos, -hullSize, hullSize, filter, MASK.SOLID)
             or trace.line(startPos, endPos, filter, MASK.SOLID)
@@ -74,8 +168,18 @@ function SimcadeSuspension.traceWheelWall(w, mount, up, axle, phys, dt, mass, cf
     if prior and (prior - origin):getLengthSqr() < (radius * 3 + travel:getLength())^2 then
         start = prior + up * (origin - prior):dot(up)
     end
+    -- Broadphase hull encloses all 8 directional tips; skips all 8 line traces on open roads.
+    local hx = math.abs(forward.x) * length + math.abs(side.x) * width + 0.25
+    local hy = math.abs(forward.y) * length + math.abs(side.y) * width + 0.25
+    local hz = math.abs(forward.z) * length + math.abs(side.z) * width + 0.25
+    local broad = supportTrace(start, origin + travel, filter, 0, Vector(hx, hy, hz))
+    if not broad or not broad.Hit then
+        w.wallProbeOrigin = origin
+        return
+    end
     local best, bestGap, bestNormal, recovering
-    local filterSize = #filter
+    local filterTable = type(filter) == "table" and filter or nil
+    local filterSize = filterTable and #filterTable or 0
     for _, direction in ipairs(wallDirections) do
         local tip = origin + forward * (direction[1] * length) + side * (direction[2] * width)
         local tr = supportTrace(start, tip + travel, filter, 0)
@@ -95,7 +199,9 @@ function SimcadeSuspension.traceWheelWall(w, mount, up, axle, phys, dt, mass, cf
             end
         end
     end
-    for i = #filter, filterSize + 1, -1 do filter[i] = nil end
+    if filterTable then
+        for i = #filterTable, filterSize + 1, -1 do filterTable[i] = nil end
+    end
     w.wallProbeOrigin = origin
     if not best then return end
     -- Keep a free-space trace origin even if VPhysics pushed the hub into a face.
@@ -122,7 +228,8 @@ function SimcadeSuspension.traceWheelWall(w, mount, up, axle, phys, dt, mass, cf
 end
 
 function SimcadeSuspension.traceTread(w, mount, up, axle, reach, filter, minMass, cfg, recordRays, wallPoint, wallNormal)
-    local filterSize = #filter
+    local filterTable = type(filter) == "table" and filter or nil
+    local filterSize = filterTable and #filterTable or 0
     local rays = recordRays and {} or nil
     local best, bestDist, selected
     local forward = axle:cross(up):getNormalized()
@@ -169,9 +276,45 @@ function SimcadeSuspension.traceTread(w, mount, up, axle, reach, filter, minMass
         local hw = math.max(2, w.width * 0.25)
         sample(mount, 0, true, cfg.useHullTrace and Vector(hw, hw, 1))
     else
-        SimcadeSuspension.eachTreadPoint(mount, up, axle, w.radius, w.width, sample)
+        local pts = SimcadeSuspension.getTreadPoints(cfg)
+        local radialUpVec = forward:cross(axle):getNormalized()
+        local r, wid = w.radius, w.width
+        local skipOuter = (#pts <= 1)
+        -- Sample the first (center) ray first; on flat unobstructed ground a single downward
+        -- broadphase hull proves no obstacle rises above the road under the outer rays.
+        do
+            local pt = pts[1]
+            local arc = (forward * pt[1] - radialUpVec * pt[3]) * r
+            local tread = arc + axle * (pt[2] * wid)
+            local height = tread:dot(up)
+            sample(mount + tread - up * height, r + height, pt[4])
+        end
+        if not skipOuter and not recordRays and not wallPoint and not w.curbNormal and best and bestDist and not best.StartSolid
+            and best.HitNormal:dot(up) > 0.9996 and up.z > 0.9994 and math.abs(axle:dot(up)) * (wid * 0.5) < 0.05 then
+            local hx = math.abs(forward.x) * (0.8 * r) + math.abs(axle.x) * (0.5 * wid) + 0.25
+            local hy = math.abs(forward.y) * (0.8 * r) + math.abs(axle.y) * (0.5 * wid) + 0.25
+            local hz = math.abs(forward.z) * (0.8 * r) + math.abs(axle.z) * (0.5 * wid) + 0.25
+            local sweepDist = bestDist - hz - 0.05
+            if sweepDist > 0.5 then
+                local broad = supportTrace(mount, mount - up * sweepDist, filter, minMass, Vector(hx, hy, hz))
+                if not broad or not broad.Hit then
+                    skipOuter = true
+                end
+            end
+        end
+        if not skipOuter then
+            for i = 2, #pts do
+                local pt = pts[i]
+                local arc = (forward * pt[1] - radialUpVec * pt[3]) * r
+                local tread = arc + axle * (pt[2] * wid)
+                local height = tread:dot(up)
+                sample(mount + tread - up * height, r + height, pt[4])
+            end
+        end
     end
-    for i = #filter, filterSize + 1, -1 do filter[i] = nil end
+    if filterTable then
+        for i = #filterTable, filterSize + 1, -1 do filterTable[i] = nil end
+    end
     if selected then rays[selected].selected = true end
     return best, bestDist, rays
 end
@@ -264,7 +407,7 @@ end
 
 -- Tangential contact impulses in Source units. Store anchors on the support so a
 -- stationary tire can ride a moving prop. Forces at the patches also resist yaw.
-function SimcadeSuspension.staticGripImpulse(w, tire, canPark, brake, forward, left, com, vel, omega, mass, brakeMass, scale, gravity, dt, base, suspensionScale, motionMassRatio, yawMassFactor, parkingHold)
+function SimcadeSuspension.staticGripImpulse(w, tire, canPark, brake, forward, left, com, vel, omega, mass, brakeMass, scale, gravity, dt, base, suspensionScale, motionMassRatio, yawMassFactor, parkingHold, chassisStaticHoriz, grossPhysical)
     if not w.isGrounded or w.normalLoad <= 0 or not tire or (tire.load or 0) <= 0 then
         w.restAnchor = nil
         return
@@ -319,11 +462,12 @@ function SimcadeSuspension.staticGripImpulse(w, tire, canPark, brake, forward, l
         w.restAnchor = nil
         return
     end
+    local hasChassisGrade = chassisStaticHoriz ~= nil and chassisStaticHoriz:getLengthSqr() > 1e-6
     local gradeError
     if parkingHold or parked then
         -- A grade needs a fixed reference on the supporting surface. On level
         -- ground keep dissipating a shove at the truck's new position.
-        if 1 - n.z^2 > 0.000001 then
+        if 1 - n.z^2 > 0.000001 or hasChassisGrade then
             local displacement = anchor - tracked
             gradeError = displacement - n * displacement:dot(n)
             if not parked then
@@ -356,28 +500,43 @@ function SimcadeSuspension.staticGripImpulse(w, tire, canPark, brake, forward, l
         motion = motion * ((motionMassRatio or 1) / (1 + tangentArm:getLengthSqr() * 0.0254^2 * (yawMassFactor or 0)))
     end
     local lift = w.suspImpulseVec * (suspensionScale or scale)
-    -- On a grade the normal impulse is weight impulse times cos(slope).
-    -- Balance the weight actually carried here, including when a chassis
-    -- contact or settling payload carries some of the estimated vehicle mass.
-    local weightImpulse = mass * gravity * dt
-    if n.z > 0.55 then weightImpulse = math.max(0, lift:dot(n)) / n.z end
-    local staticDemand = Vector(0, 0, weightImpulse) - lift
-    local demand = motion * mass + staticDemand
+    local staticRoll, staticLat
+    if chassisStaticHoriz and grossPhysical and grossPhysical > 0 and n.z > 0.55 then
+        -- Share the chassis's net horizontal suspension push across patches by holding
+        -- capacity so a sloped ray on one axle is balanced cleanly without over/under-scaling.
+        local hRoll = chassisStaticHoriz * (brakeMass / grossPhysical)
+        local hLat  = chassisStaticHoriz * (mass / grossPhysical)
+        staticRoll = hRoll - Vector(0, 0, hRoll:dot(n) / n.z)
+        staticLat  = hLat  - Vector(0, 0, hLat:dot(n) / n.z)
+    else
+        -- On a grade the normal impulse is weight impulse times cos(slope).
+        -- Balance the weight actually carried here, including when a chassis
+        -- contact or settling payload carries some of the estimated vehicle mass.
+        local weightImpulse = mass * gravity * dt
+        if n.z > 0.55 then weightImpulse = math.max(0, lift:dot(n)) / n.z end
+        local staticDemand = Vector(0, 0, weightImpulse) - lift
+        staticRoll = staticDemand
+        staticLat  = staticDemand
+    end
     local targetX = fx
     local requestedX = fx
     if parked then
-        requestedX = demand:dot(rolling) * brakeMass / (mass * knImpulse)
+        requestedX = (motion:dot(rolling) * brakeMass + staticRoll:dot(rolling)) / knImpulse
         targetX = clamp(requestedX, -peakX * brake, peakX * brake)
     end
     local sideLimit = peakY * math.sqrt(math.max(0, 1 - (targetX / peakX)^2))
-    local bank = staticDemand:dot(lateral)
+    local bank = staticLat:dot(lateral)
     local spareAccel = math.max(0, sideLimit * knImpulse - math.abs(bank)) / (mass * dt)
     local captureSpeedSq = 2 * spareAccel * contactLength
     local sideRatioSq = sideSpeed^2 / math.max(0.001, captureSpeedSq)
     local adhesion = clamp(1 - sideRatioSq * sideRatioSq, 0, 1)
-    local requestedY = demand:dot(lateral) / knImpulse
+    local requestedY = (motion:dot(lateral) * mass + bank) / knImpulse
     local targetY = clamp(requestedY, -sideLimit, sideLimit)
     local correction = rolling * (targetX - fx) + lateral * (targetY - fy)
+    -- Pure gravity-balancing tangential hold (no velocity-arrest component), safe to spread across skipped ticks.
+    local staticX = parked and clamp(staticRoll:dot(rolling) / knImpulse, -peakX * brake, peakX * brake) or 0
+    local staticY = clamp(bank / knImpulse, -sideLimit, sideLimit)
+    local staticHold = (rolling * staticX + lateral * staticY) * (adhesion * dt)
 
     -- A steered tire can roll along its tread while its lateral contact
     -- still sticks. Release only the saturated axis of a parked patch.
@@ -393,7 +552,7 @@ function SimcadeSuspension.staticGripImpulse(w, tire, canPark, brake, forward, l
     else
         w.restAnchor = nil
     end
-    return correction * (adhesion * dt), tracked -- kN s, world-space point in Source units
+    return correction * (adhesion * dt), tracked, staticHold -- kN s, world-space point in Source units, static slope hold kN s
 end
 
 -- Sweep the leading tread and sidewall independently. A glancing scrape can
@@ -421,7 +580,8 @@ function SimcadeSuspension.applyCurbBlock(phys, w, up, axle, dt, mass, wheels, g
     local wallHeight = radius * clamp(cfg.curbWallHeightRatio or 0.82, 0.1, 1.5)
     local minHeight = math.max(0.25, cfg.curbMinHeight or 1.75, radius * (cfg.curbClimbRatio or 0.42))
     local best, bestClosing = nil, -1
-    local filterSize = #filter
+    local filterTable = type(filter) == "table" and filter or nil
+    local filterSize = filterTable and #filterTable or 0
     local minMass = math.max(35, mass * 0.15)
 
     -- Previous tick's road plane (before the tread may have stepped onto a lip).
@@ -555,7 +715,9 @@ function SimcadeSuspension.applyCurbBlock(phys, w, up, axle, dt, mass, wheels, g
             end
         end
     end
-    for i = #filter, filterSize + 1, -1 do filter[i] = nil end
+    if filterTable then
+        for i = #filterTable, filterSize + 1, -1 do filterTable[i] = nil end
+    end
     if not best then w.curbNormal, w.curbJolted = nil, nil return end
 
     local sideBlend = clamp((best.sideDot - (cfg.curbSideAlignMin or 0.45)) /
