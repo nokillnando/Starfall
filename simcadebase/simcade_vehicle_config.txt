@@ -1157,7 +1157,7 @@ CONFIG.ADDON_MODULES = {
         file = "simcadebase/addons/vehicle_radio.txt",
         enabled = true, -- rRadio-style vehicle radio with lazy-loaded country catalog + seamless Cabin <-> 3D audio
         options = {
-            CatalogBaseURL       = "https://raw.githubusercontent.com/nokillnando/Starfall/main/simcadebase/radio_catalog",
+            CatalogBaseURL       = "https://raw.githubusercontent.com/nokillnando/Starfall/main/simcadebase/addons/radio_catalog",
             DriverOnly           = true,  -- Only the driver can change stations / volume / power
             DefaultVolume        = 1.0,   -- Initial radio volume (1.0 = 100%)
             MaxVolume            = 2.5,   -- Max volume boost (2.5 = 250% for quiet radio streams)
