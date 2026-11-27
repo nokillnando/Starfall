@@ -4,9 +4,9 @@ Extract rRadio's builtin_registry.lua station catalog into per-country JSON file
 suitable for lazy-loading in Starfall via raw.githubusercontent.com.
 
 Output:
-  simcadebase/radio_catalog/index.json
+  simcadebase/addons/radio_catalog/index.json
       [[countryKey, displayName, stationCount], ...]
-  simcadebase/radio_catalog/countries/<countryKey>.json
+  simcadebase/addons/radio_catalog/countries/<countryKey>.json
       [[stationName, streamUrl], ...]
 """
 
@@ -23,7 +23,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SOURCE_FILE = os.path.join(
     ROOT, "radioaddon", "lua", "rradio", "server", "stations", "builtin_registry.lua"
 )
-OUT_DIR = os.path.join(ROOT, "simcadebase", "radio_catalog")
+OUT_DIR = os.path.join(ROOT, "simcadebase", "addons", "radio_catalog")
 COUNTRIES_DIR = os.path.join(OUT_DIR, "countries")
 
 SPECIAL_NAMES = {

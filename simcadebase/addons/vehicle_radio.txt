@@ -4,7 +4,7 @@
 --[[
     Vehicle Radio Addon for SimcadeBase:
       - Ready-made country/station catalog lazy-loaded per country via http.get
-        (defaulting to simcadebase/radio_catalog on raw.githubusercontent.com)
+        (defaulting to simcadebase/addons/radio_catalog on raw.githubusercontent.com)
         plus a built-in offline preset list.
       - Driver-controlled by default (configurable via DriverOnly).
       - Customizable keybinds (CONTROLS_CFG or addon options):
@@ -66,7 +66,7 @@ return function(options, config)
         return defaultKey
     end
 
-    local CatalogBaseURL       = tostring(options.CatalogBaseURL or "https://raw.githubusercontent.com/nokillnando/Starfall/main/simcadebase/radio_catalog"):gsub("/+$", "")
+    local CatalogBaseURL       = tostring(options.CatalogBaseURL or "https://raw.githubusercontent.com/nokillnando/Starfall/main/simcadebase/addons/radio_catalog"):gsub("/+$", "")
     local DriverOnly           = options.DriverOnly ~= false
     local MaxVolume            = clamp(tonumber(options.MaxVolume) or 2.5, 0.5, 5.0)
     local DefaultVolume        = clamp(tonumber(options.DefaultVolume) or 1.0, 0, MaxVolume)
@@ -1058,6 +1058,12 @@ return function(options, config)
                     count = #Presets,
                 }
             end
+            if catalogState == "error" and #countriesList == 0 then
+                filteredRows[#filteredRows + 1] = {
+                    kind = "retry",
+                    name = "Catalog error (" .. (catalogError ~= "" and catalogError or "failed") .. ")",
+                }
+            end
             for i = 1, #countriesList do
                 local c = countriesList[i]
                 if q == "" or string.find(c.lowerName, q, 1, true) then
@@ -1102,10 +1108,12 @@ return function(options, config)
         if not (http and http.get and json and json.decode) then
             catalogState = "error"
             catalogError = "HTTP/JSON unavailable"
+            filteredDirty = true
             return
         end
         catalogState = "loading"
         catalogError = ""
+        filteredDirty = true
 
         local function tryFetch()
             if not http.canRequest() then
@@ -1116,12 +1124,14 @@ return function(options, config)
                 if code ~= 200 or not body or body == "" then
                     catalogState = "error"
                     catalogError = "HTTP " .. tostring(code)
+                    filteredDirty = true
                     return
                 end
                 local okJ, parsed = pcall(json.decode, body)
                 if not okJ or type(parsed) ~= "table" then
                     catalogState = "error"
                     catalogError = "Invalid catalog index"
+                    filteredDirty = true
                     return
                 end
                 countriesList = {}
@@ -1141,10 +1151,12 @@ return function(options, config)
             end, function(reason)
                 catalogState = "error"
                 catalogError = tostring(reason or "Fetch failed")
+                filteredDirty = true
             end)
             if not ok then
                 catalogState = "error"
-                catalogError = tostring(err)
+                catalogError = (type(err) == "table" and err.message) and err.message or tostring(err)
+                filteredDirty = true
             end
         end
         tryFetch()
@@ -1547,7 +1559,7 @@ return function(options, config)
                 end
 
                 if fontSmall then render.setFont(fontSmall) end
-                render.setColor(isPlayingThis and COL_ACCENT or COL_TEXT)
+                render.setColor(isPlayingThis and COL_ACCENT or (row.kind == "retry" and COL_STOP or COL_TEXT))
                 local label = row.name or ""
                 if #label > 44 then label = string.sub(label, 1, 41) .. "..." end
                 render.drawSimpleText(rx + 12, ry + rowH * 0.5, label, 0, 1)
@@ -1556,6 +1568,10 @@ return function(options, config)
                     if fontTiny then render.setFont(fontTiny) end
                     render.setColor(COL_TEXT_DIM)
                     render.drawSimpleText(rx + rw - 10, ry + rowH * 0.5, tostring(row.count) .. " >", 2, 1)
+                elseif row.kind == "retry" then
+                    if fontTiny then render.setFont(fontTiny) end
+                    render.setColor(COL_ACCENT)
+                    render.drawSimpleText(rx + rw - 10, ry + rowH * 0.5, "RETRY", 2, 1)
                 elseif isPlayingThis then
                     if fontTiny then render.setFont(fontTiny) end
                     render.setColor(COL_ACCENT)
@@ -1570,6 +1586,8 @@ return function(options, config)
                         searchFocused = false
                         fetchCountryStations(row.key)
                         filteredDirty = true
+                    elseif row.kind == "retry" then
+                        fetchCatalogIndex()
                     elseif row.kind == "station" then
                         local cName = selectedCountry and selectedCountry.name or ""
                         sendCmd(CMD_PLAY, row.url, row.name, cName)

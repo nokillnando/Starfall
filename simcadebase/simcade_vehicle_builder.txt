@@ -212,7 +212,8 @@ function SimcadeVehicleBuilder.buildCarData(vehicleCfg, tireCfg, suspCfg, engine
     }
 
     -- Brake configuration is owned by the braking module.
-    local braking = Braking.configure(engineCfg, targetMassT, massScale)
+    local brakeCfg = dependencies.brakeCfg or engineCfg
+    local braking = Braking.configure(brakeCfg, targetMassT, massScale, engineCfg)
     c[152], c[153], c[154] = Aero.buildSolverCoefficients(aeroCfg, massScale)
 
     -- Transmission, Ratios & Automatic gearSpeeds Calibration (unlimited forward + reverse gears)
@@ -338,7 +339,7 @@ function SimcadeVehicleBuilder.buildCarData(vehicleCfg, tireCfg, suspCfg, engine
                 local overU = clamp((rpm - redRpm) / max(100, limRpm - redRpm), 0, 1)
                 bz = bz * (1.0 - 0.06 * overU)
             end
-            c[128 + i] = max(0.05, (baseNm * bz * breathingMult) / 1000)
+            c[128 + i] = max(0.001, (baseNm * bz * breathingMult) / 1000)
         end
     else
         local curPeak = 0.001
@@ -346,13 +347,13 @@ function SimcadeVehicleBuilder.buildCarData(vehicleCfg, tireCfg, suspCfg, engine
             if c[128 + i] > curPeak then curPeak = c[128 + i] end
         end
         local desiredPeakKNm = baseNm / 1000
-        if desiredPeakKNm > 0.05 then
+        if desiredPeakKNm > 0.001 then
             local tqScale = desiredPeakKNm / curPeak
             for i = 0, 8 do c[128 + i] = c[128 + i] * tqScale end
         end
     end
 
-    local engineTorqueCurve, enginePeakTorqueNm, engineSpec
+    local engineTorqueCurve, enginePeakTorqueNm, engineBasePeakTorqueNm, engineSpec
     if SimcadeEngine and engineCfg and (engineCfg.PeakTorqueNm or engineCfg.PeakHP or engineCfg.DisplacementLiters or engineCfg.TorqueCurve) then
         local spec = SimcadeEngine.synthesizeSpec(engineCfg)
         engineSpec = spec
@@ -362,13 +363,18 @@ function SimcadeVehicleBuilder.buildCarData(vehicleCfg, tireCfg, suspCfg, engine
         c[127] = clamp(spec.flywheelInertia * 0.001, 0.00003, 0.0015)
         engineTorqueCurve = spec.torqueCurve
         enginePeakTorqueNm = spec.peakTorqueNm
+        engineBasePeakTorqueNm = spec.basePeakTorqueNm
         for i = 0, 8 do
             c[128 + i] = spec.torqueCurveKNm[i]
         end
         for i = 0, 2 do
             c[146 + i] = spec.brakeCurveKNm[i]
         end
-        if SERVER and engineCfg.WarnEngineCurveMismatch ~= false and spec.warnings and #spec.warnings > 0 then
+        local debugCfg = dependencies.debugCfg or {}
+        local warnCurveMismatch = (debugCfg.warnEngineCurveMismatch ~= nil)
+            and (debugCfg.warnEngineCurveMismatch ~= false)
+            or (debugCfg.warnEngineCurveMismatch == nil and engineCfg.WarnEngineCurveMismatch ~= false)
+        if SERVER and warnCurveMismatch and spec.warnings and #spec.warnings > 0 then
             local warningKey = table.concat(spec.warnings, "|")
             if SimcadeEngine._lastSpecWarningKey ~= warningKey then
                 SimcadeEngine._lastSpecWarningKey = warningKey
@@ -410,9 +416,10 @@ function SimcadeVehicleBuilder.buildCarData(vehicleCfg, tireCfg, suspCfg, engine
 
     return {
         c                  = c,
-        engineTorqueCurve  = engineTorqueCurve,
-        enginePeakTorqueNm = enginePeakTorqueNm,
-        engineSpec         = engineSpec,
+        engineTorqueCurve      = engineTorqueCurve,
+        enginePeakTorqueNm     = enginePeakTorqueNm,
+        engineBasePeakTorqueNm = engineBasePeakTorqueNm,
+        engineSpec             = engineSpec,
         top               = top,
         minGear           = minGear,
         gearRatioMap      = gearRatioMap,

@@ -8,36 +8,45 @@ local clamp = math.clamp or function(v, a, b) return v < a and a or (v > b and b
 local max = math.max
 local min = math.min
 
-function SimcadeBraking.configure(engineCfg, massT, massScale)
+function SimcadeBraking.configure(brakeCfg, massT, massScale, engineCfg)
+    brakeCfg = brakeCfg or {}
     engineCfg = engineCfg or {}
+    local function pick(k)
+        if brakeCfg[k] ~= nil then return brakeCfg[k] end
+        return engineCfg[k]
+    end
 
-    local baseBrakeNm = max(50, engineCfg.brakeTorque or 2800)
+    local baseBrakeNm = max(50, pick("brakeTorque") or 2800)
     local brakeMultiplier = baseBrakeNm / 2800
     local frontBias = 0.535
-    if engineCfg.frontBrakeBias then
-        frontBias = clamp(engineCfg.frontBrakeBias, 0.15, 0.85)
+    local cfgFrontBias = pick("frontBrakeBias")
+    if cfgFrontBias then
+        frontBias = clamp(cfgFrontBias, 0.15, 0.85)
     end
     local baseBrakeKNm = baseBrakeNm * 0.001
     local fallbackRearBrake = max(0.5 * massScale * brakeMultiplier, 2.2 * massT)
-    local brakeHighSpeedStartKMH = max(0, tonumber(engineCfg.BrakeHighSpeedStartKMH) or 80)
+    local brakeHighSpeedStartKMH = max(0, tonumber(pick("BrakeHighSpeedStartKMH")) or 80)
+    local frontBrakeTorque = pick("FrontBrakeTorque")
+    local rearBrakeTorque = pick("RearBrakeTorque")
+    local handbrakeTorque = pick("HandbrakeTorque")
 
     return {
-        frontBrakeKNm = engineCfg.FrontBrakeTorque and max(0.05, engineCfg.FrontBrakeTorque * 0.001) or (baseBrakeKNm * frontBias * 2.0),
-        rearBrakeKNm = engineCfg.RearBrakeTorque and max(0.05, engineCfg.RearBrakeTorque * 0.001) or (baseBrakeKNm * (1.0 - frontBias) * 2.0),
-        rampTime = clamp(tonumber(engineCfg.BrakeRampTime) or 0.18, 0.02, 1.0),
-        highSpeedScale = clamp(tonumber(engineCfg.BrakeHighSpeedScale) or 1.0, 0.1, 2.0),
+        frontBrakeKNm = frontBrakeTorque and max(0.05, frontBrakeTorque * 0.001) or (baseBrakeKNm * frontBias * 2.0),
+        rearBrakeKNm = rearBrakeTorque and max(0.05, rearBrakeTorque * 0.001) or (baseBrakeKNm * (1.0 - frontBias) * 2.0),
+        rampTime = clamp(tonumber(pick("BrakeRampTime")) or 0.18, 0.02, 1.0),
+        highSpeedScale = clamp(tonumber(pick("BrakeHighSpeedScale")) or 1.0, 0.1, 2.0),
         highSpeedStartKMH = brakeHighSpeedStartKMH,
-        highSpeedRefKMH = max(brakeHighSpeedStartKMH + 10, tonumber(engineCfg.BrakeHighSpeedRefKMH) or 200),
-        burnoutAssist = (engineCfg.BurnoutAssist ~= false),
+        highSpeedRefKMH = max(brakeHighSpeedStartKMH + 10, tonumber(pick("BrakeHighSpeedRefKMH")) or 200),
+        burnoutAssist = (pick("BurnoutAssist") ~= false),
         abs = {
-            enabled = (engineCfg.ABSEnabled ~= false),
-            threshold = clamp(tonumber(engineCfg.ABSLockThreshold) or 0.22, 0.02, 0.85),
-            pulseRate = clamp(tonumber(engineCfg.ABSPulseRate) or 14, 4, 120),
-            release = clamp(tonumber(engineCfg.ABSReleaseRatio) or 0.25, 0.05, 0.90),
+            enabled = (pick("ABSEnabled") ~= false),
+            threshold = clamp(tonumber(pick("ABSLockThreshold")) or 0.22, 0.02, 0.85),
+            pulseRate = clamp(tonumber(pick("ABSPulseRate")) or 14, 4, 120),
+            release = clamp(tonumber(pick("ABSReleaseRatio")) or 0.25, 0.05, 0.90),
         },
         handbrake = {
-            torqueKNm = engineCfg.HandbrakeTorque and max(0.05, engineCfg.HandbrakeTorque * 0.001) or (fallbackRearBrake * 10),
-            lockWheels = (engineCfg.HandbrakeLockWheels ~= false),
+            torqueKNm = handbrakeTorque and max(0.05, handbrakeTorque * 0.001) or (fallbackRearBrake * 10),
+            lockWheels = (pick("HandbrakeLockWheels") ~= false),
         },
     }
 end

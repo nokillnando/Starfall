@@ -42,48 +42,118 @@ end
 
 function SimcadeAero.applyForces(chassis)
     local A, c, v, R = chassis.aero, chassis.c, chassis.v, chassis.R
-    local speed = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+    local v0, v1, v2 = v[0], v[1], v[2]
+    local speedSq = v0 * v0 + v1 * v1 + v2 * v2
+    if speedSq < 1e-12 then return end
+    local speed = sqrt(speedSq)
     local scaledSpeed = speed / chassis.perf
-    local drag = -(A.grip * c[152] * scaledSpeed * A.on)
-    local armz = 0
-    if A.grounded >= 0.5 then armz = (1 - A.T) * -0.10000000149011612 end
-    chassis:addForce3(drag * v[0], drag * v[1], drag * v[2], 0, 0, armz)
+    local aOn = A.on
+    local drag = -(A.grip * c[152] * scaledSpeed * aOn)
+    local F, Tq = chassis.F, chassis.Tq
 
-    local groundFactor = R[8]
+    -- Inline drag force at (0, 0, armz)
+    do
+        local f0, f1, f2 = drag * v0, drag * v1, drag * v2
+        local lsq = f0 * f0 + f1 * f1 + f2 * f2
+        if lsq > 1440000 then
+            local k = 1200 / sqrt(lsq)
+            f0, f1, f2 = f0 * k, f1 * k, f2 * k
+        end
+        F[0], F[1], F[2] = F[0] + f0, F[1] + f1, F[2] + f2
+        if A.grounded >= 0.5 then
+            local armz = (1 - A.T) * -0.10000000149011612
+            local t0, t1 = -armz * f1, armz * f0
+            local ltsq = t0 * t0 + t1 * t1
+            if ltsq > 10000 then
+                local k = 100 / sqrt(ltsq)
+                t0, t1 = t0 * k, t1 * k
+            end
+            Tq[0], Tq[1] = Tq[0] + t0, Tq[1] + t1
+        end
+    end
+
+    local r0, r1, r2 = R[0], R[1], R[2]
+    local r6, r7, r8 = R[6], R[7], R[8]
+    local groundFactor = r8
     if groundFactor < 0 then groundFactor = 0 end
     if A.grounded >= 0.5 then groundFactor = 1 end
-    local n0, n1, n2 = 1, 0, 0
+    local alignment
     if scaledSpeed > 0.0001 then
-        n0, n1, n2 = v[0] / scaledSpeed, v[1] / scaledSpeed, v[2] / scaledSpeed
+        alignment = (v2 * r2 + v1 * r1 + v0 * r0) / scaledSpeed
+    else
+        alignment = r0
     end
-    local alignment = n2 * R[2] + n1 * R[1] + n0 * R[0]
     if alignment < 0 then alignment = 0 end
     local alignmentSq = alignment * alignment
     if alignmentSq < 0.4000000059604645 then alignmentSq = 0.4000000059604645 end
 
     local frontLoad, rearLoad
+    local c153, c154 = c[153], c[154]
     if A.grounded == 0 then
-        local totalLoad = groundFactor * ((c[154] + c[153]) * alignmentSq) * scaledSpeed
+        local totalLoad = groundFactor * ((c154 + c153) * alignmentSq) * scaledSpeed
         frontLoad = 0.4000000059604645 * totalLoad
         rearLoad = totalLoad * 0.4099999964237213
     else
-        frontLoad = alignmentSq * c[153] * groundFactor * scaledSpeed
-        rearLoad = alignmentSq * c[154] * groundFactor * scaledSpeed
+        local common = alignmentSq * groundFactor * scaledSpeed
+        frontLoad = common * c153
+        rearLoad = common * c154
     end
 
-    local af = chassis.T.aero_front or SimcadeAero.frontForceOffset
-    local ar = chassis.T.aero_rear or SimcadeAero.rearForceOffset
-    local force = -(frontLoad * A.on)
-    chassis:addForce3(force * R[6], force * R[7], force * R[8],
-        af[0] * R[0] + af[1] * R[3] + af[2] * R[6],
-        af[0] * R[1] + af[1] * R[4] + af[2] * R[7],
-        af[0] * R[2] + af[1] * R[5] + af[2] * R[8])
+    if frontLoad ~= 0 then
+        local af = chassis.T.aero_front or SimcadeAero.frontForceOffset
+        local force = -(frontLoad * aOn)
+        local f0, f1, f2 = force * r6, force * r7, force * r8
+        local lsq = f0 * f0 + f1 * f1 + f2 * f2
+        if lsq > 1440000 then
+            local k = 1200 / sqrt(lsq)
+            f0, f1, f2 = f0 * k, f1 * k, f2 * k
+        end
+        F[0], F[1], F[2] = F[0] + f0, F[1] + f1, F[2] + f2
+        local af0, af1, af2 = af[0], af[1], af[2]
+        local rx, ry, rz
+        if af1 == 0 and af2 == 0 then
+            rx, ry, rz = af0 * r0, af0 * r1, af0 * r2
+        else
+            rx = af0 * r0 + af1 * R[3] + af2 * r6
+            ry = af0 * r1 + af1 * R[4] + af2 * r7
+            rz = af0 * r2 + af1 * R[5] + af2 * r8
+        end
+        local t0, t1, t2 = ry * f2 - rz * f1, rz * f0 - rx * f2, rx * f1 - ry * f0
+        local ltsq = t0 * t0 + t1 * t1 + t2 * t2
+        if ltsq > 10000 then
+            local k = 100 / sqrt(ltsq)
+            t0, t1, t2 = t0 * k, t1 * k, t2 * k
+        end
+        Tq[0], Tq[1], Tq[2] = Tq[0] + t0, Tq[1] + t1, Tq[2] + t2
+    end
 
-    force = -(rearLoad * A.on)
-    chassis:addForce3(force * R[6], force * R[7], force * R[8],
-        ar[0] * R[0] + ar[1] * R[3] + ar[2] * R[6],
-        ar[0] * R[1] + ar[1] * R[4] + ar[2] * R[7],
-        ar[0] * R[2] + ar[1] * R[5] + ar[2] * R[8])
+    if rearLoad ~= 0 then
+        local ar = chassis.T.aero_rear or SimcadeAero.rearForceOffset
+        local force = -(rearLoad * aOn)
+        local f0, f1, f2 = force * r6, force * r7, force * r8
+        local lsq = f0 * f0 + f1 * f1 + f2 * f2
+        if lsq > 1440000 then
+            local k = 1200 / sqrt(lsq)
+            f0, f1, f2 = f0 * k, f1 * k, f2 * k
+        end
+        F[0], F[1], F[2] = F[0] + f0, F[1] + f1, F[2] + f2
+        local ar0, ar1, ar2 = ar[0], ar[1], ar[2]
+        local rx, ry, rz
+        if ar1 == 0 and ar2 == 0 then
+            rx, ry, rz = ar0 * r0, ar0 * r1, ar0 * r2
+        else
+            rx = ar0 * r0 + ar1 * R[3] + ar2 * r6
+            ry = ar0 * r1 + ar1 * R[4] + ar2 * r7
+            rz = ar0 * r2 + ar1 * R[5] + ar2 * r8
+        end
+        local t0, t1, t2 = ry * f2 - rz * f1, rz * f0 - rx * f2, rx * f1 - ry * f0
+        local ltsq = t0 * t0 + t1 * t1 + t2 * t2
+        if ltsq > 10000 then
+            local k = 100 / sqrt(ltsq)
+            t0, t1, t2 = t0 * k, t1 * k, t2 * k
+        end
+        Tq[0], Tq[1], Tq[2] = Tq[0] + t0, Tq[1] + t1, Tq[2] + t2
+    end
 end
 
 return SimcadeAero

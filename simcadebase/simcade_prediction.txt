@@ -14,6 +14,9 @@ local function vector(a)
 end
 
 if SERVER then
+    local floor = math.floor
+    local clamp = math.clamp or function(v, a, b) return v < a and a or (v > b and b or v) end
+    local tmpVec = Vector(0, 0, 0)
     function P.send(driver, base, pod, car, pos, fwd, up, vel, omega, ground, loads, mass, compound, ignition, active, gearUp, gearDown, turboRPM, comLocal, sendPacket)
         net.start(snapshotChannel)
         net.writeEntity(base)
@@ -21,7 +24,7 @@ if SERVER then
         net.writeFloat(timer.curtime())
         net.writeBool(active)
         if not active then return sendPacket(driver, true) end
-        net.writeFloat(driver:getPing() / 1000)
+        net.writeFloat(driver:getPing() * 0.001)
         net.writeBool(gearUp == true)
         net.writeBool(gearDown == true)
         net.writeVector(pos)
@@ -36,36 +39,49 @@ if SERVER then
         net.writeFloat(ignition.crankRPM or 0)
         net.writeBool(car.manualBox)
         net.writeUInt(car.autoRange or 0, 2)
-        net.writeFloat(car.eng.w)
-        net.writeFloat(car.eng.T)
+        local eng = car.eng
+        net.writeFloat(eng.w)
+        net.writeFloat(eng.T)
         net.writeFloat(car.simClutch or 1)
-        net.writeFloat(car.eng.inductionTorqueRatio or 1)
+        net.writeFloat(eng.inductionTorqueRatio or 1)
         net.writeFloat(turboRPM)
-        net.writeFloat(car.drv.u16Deg or 0)
-        net.writeFloat(car.drv.smoothedLat or 0)
-        net.writeInt(car.drv.gear, 8)
-        net.writeBool(car.drv.reversing or false)
-        net.writeBool(car.drv.brakeLatch or false)
-        net.writeBool(car.drv.revBrakeLatch or false)
-        net.writeBool(car.drv.reverseLaunch or false)
-        net.writeFloat(car.drv.reverseHold or 0)
-        net.writeFloat(car.drv.brk or 0)
-        net.writeBool(car.drv.forwardLaunch or false)
-        net.writeFloat(car.drv.forwardHold or 0)
+        local drv = car.drv
+        net.writeFloat(drv.u16Deg or 0)
+        net.writeFloat(drv.smoothedLat or 0)
+        net.writeInt(drv.gear, 8)
+        net.writeBool(drv.reversing or false)
+        net.writeBool(drv.brakeLatch or false)
+        net.writeBool(drv.revBrakeLatch or false)
+        net.writeBool(drv.reverseLaunch or false)
+        net.writeFloat(drv.reverseHold or 0)
+        net.writeFloat(drv.brk or 0)
+        net.writeBool(drv.forwardLaunch or false)
+        net.writeFloat(drv.forwardHold or 0)
         net.writeBool(car.frontLockActive or false)
         net.writeBool(car.rearLockActive or false)
         net.writeBool(car.allLockActive or false)
-        for _, k in ipairs(gears) do net.writeFloat(car.dt[k]) end
+        local dt = car.dt
+        net.writeFloat(dt.gear)
+        net.writeFloat(dt.req)
+        net.writeFloat(dt.state)
+        net.writeFloat(dt.want)
+        net.writeFloat(dt.shifting)
+        net.writeFloat(dt.clutch)
+        local wheels = car.wheels
         for i = 0, 3 do
             local g = ground[i]
-            net.writeVector(vector(g.p))
-            net.writeVector(vector(g.n))
+            local gp, gn = g.p, g.n
+            tmpVec.x, tmpVec.y, tmpVec.z = gp[0], gp[1], gp[2]
+            net.writeVector(tmpVec)
+            tmpVec.x, tmpVec.y, tmpVec.z = gn[0], gn[1], gn[2]
+            net.writeVector(tmpVec)
             net.writeUInt(g.s, 8)
             net.writeUInt(g.matType or 0, 8)
             net.writeFloat(loads[i] or 0)
-            net.writeFloat(car.wheels[i].w)
-            net.writeInt(math.clamp(math.round((car.wheels[i].travelCamberDeg or 0) * 100), -32768, 32767), 16)
-            if i == 0 or i == 3 then net.writeFloat(car.wheels[i].beamRollDeg or 0) end
+            local w = wheels[i]
+            net.writeFloat(w.w)
+            net.writeInt(clamp(floor((w.travelCamberDeg or 0) * 100 + 0.5), -32768, 32767), 16)
+            if i == 0 or i == 3 then net.writeFloat(w.beamRollDeg or 0) end
         end
         return sendPacket(driver, true)
     end
@@ -111,7 +127,7 @@ function P.initClient(cfg)
         local m, c = net.readFloat(), net.readString()
         if not car or compound ~= c or mass ~= m then
             car = SimcadeVehiclePhysics.newFromConfig(cfg.VEHICLE_CFG, cfg.TIRE_CFG, cfg.SUSPENSION_CFG, cfg.ENGINE_CFG,
-                cfg.STEERING_CFG, cfg.WHEELS, m, c, cfg.AERO_CFG)
+                cfg.STEERING_CFG, cfg.WHEELS, m, c, cfg.AERO_CFG, cfg.BRAKE_CFG, cfg.DEBUG_CFG)
             car.activeDiffCfg = cfg.ACTIVE_DIFF_CFG
             for i, w in ipairs(cfg.WHEELS) do
                 local front = w.isFront

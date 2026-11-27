@@ -1,0 +1,159 @@
+--@name Simcade Aerodynamics Module
+--@shared
+
+SimcadeAero = SimcadeAero or {}
+
+local clamp = math.clamp or function(v, a, b)
+    if v < a then return a elseif v > b then return b else return v end
+end
+local max = math.max
+local sqrt = math.sqrt
+
+SimcadeAero.frontForceOffset = SimcadeAero.frontForceOffset or { len = 3, [0] = 1, 0, 0 }
+SimcadeAero.rearForceOffset = SimcadeAero.rearForceOffset or { len = 3, [0] = -1, 0, 0 }
+
+local function computeWheelLoadKN(aeroCfg, totalMassKG, speedMs, isFront)
+    if not aeroCfg then return 0 end
+    local factor = isFront and (aeroCfg.FrontAeroFactor or 0) or (aeroCfg.RearAeroFactor or 0)
+    if factor <= 0 then return 0 end
+    local speedMph = math.abs(speedMs or 0) * 2.23693629
+    local mphDiv100 = speedMph / 100.0
+    return max(0, factor * (totalMassKG * 0.004905) * (mphDiv100 * mphDiv100))
+end
+
+function SimcadeAero.addTireLoadKN(tireLoadKN, aeroCfg, totalMassKG, speedMs, isFront)
+    return (tireLoadKN or 0) + computeWheelLoadKN(aeroCfg, totalMassKG, speedMs, isFront)
+end
+
+function SimcadeAero.buildSolverCoefficients(aeroCfg, massScale)
+    local dragCoeff
+    if aeroCfg and (aeroCfg.DragCoeff or aeroCfg.FrontalAreaM2) then
+        local cd = max(0.01, aeroCfg.DragCoeff or 0.32)
+        local area = max(0.1, aeroCfg.FrontalAreaM2 or 2.15)
+        dragCoeff = clamp(0.5 * 1.225 * cd * area * 0.001, 0.0, 0.0025)
+    else
+        dragCoeff = clamp(0.00034 * (0.85 + 0.15 * massScale), 0.00024, 0.00058)
+    end
+
+    return dragCoeff,
+        clamp(0.00020 * massScale, 0.00012, 0.00055),
+        clamp(0.00024 * massScale, 0.00015, 0.00065)
+end
+
+function SimcadeAero.applyForces(chassis)
+    local A, c, v, R = chassis.aero, chassis.c, chassis.v, chassis.R
+    local v0, v1, v2 = v[0], v[1], v[2]
+    local speedSq = v0 * v0 + v1 * v1 + v2 * v2
+    if speedSq < 1e-12 then return end
+    local speed = sqrt(speedSq)
+    local scaledSpeed = speed / chassis.perf
+    local aOn = A.on
+    local drag = -(A.grip * c[152] * scaledSpeed * aOn)
+    local F, Tq = chassis.F, chassis.Tq
+
+    -- Inline drag force at (0, 0, armz)
+    do
+        local f0, f1, f2 = drag * v0, drag * v1, drag * v2
+        local lsq = f0 * f0 + f1 * f1 + f2 * f2
+        if lsq > 1440000 then
+            local k = 1200 / sqrt(lsq)
+            f0, f1, f2 = f0 * k, f1 * k, f2 * k
+        end
+        F[0], F[1], F[2] = F[0] + f0, F[1] + f1, F[2] + f2
+        if A.grounded >= 0.5 then
+            local armz = (1 - A.T) * -0.10000000149011612
+            local t0, t1 = -armz * f1, armz * f0
+            local ltsq = t0 * t0 + t1 * t1
+            if ltsq > 10000 then
+                local k = 100 / sqrt(ltsq)
+                t0, t1 = t0 * k, t1 * k
+            end
+            Tq[0], Tq[1] = Tq[0] + t0, Tq[1] + t1
+        end
+    end
+
+    local r0, r1, r2 = R[0], R[1], R[2]
+    local r6, r7, r8 = R[6], R[7], R[8]
+    local groundFactor = r8
+    if groundFactor < 0 then groundFactor = 0 end
+    if A.grounded >= 0.5 then groundFactor = 1 end
+    local alignment
+    if scaledSpeed > 0.0001 then
+        alignment = (v2 * r2 + v1 * r1 + v0 * r0) / scaledSpeed
+    else
+        alignment = r0
+    end
+    if alignment < 0 then alignment = 0 end
+    local alignmentSq = alignment * alignment
+    if alignmentSq < 0.4000000059604645 then alignmentSq = 0.4000000059604645 end
+
+    local frontLoad, rearLoad
+    local c153, c154 = c[153], c[154]
+    if A.grounded == 0 then
+        local totalLoad = groundFactor * ((c154 + c153) * alignmentSq) * scaledSpeed
+        frontLoad = 0.4000000059604645 * totalLoad
+        rearLoad = totalLoad * 0.4099999964237213
+    else
+        local common = alignmentSq * groundFactor * scaledSpeed
+        frontLoad = common * c153
+        rearLoad = common * c154
+    end
+
+    if frontLoad ~= 0 then
+        local af = chassis.T.aero_front or SimcadeAero.frontForceOffset
+        local force = -(frontLoad * aOn)
+        local f0, f1, f2 = force * r6, force * r7, force * r8
+        local lsq = f0 * f0 + f1 * f1 + f2 * f2
+        if lsq > 1440000 then
+            local k = 1200 / sqrt(lsq)
+            f0, f1, f2 = f0 * k, f1 * k, f2 * k
+        end
+        F[0], F[1], F[2] = F[0] + f0, F[1] + f1, F[2] + f2
+        local af0, af1, af2 = af[0], af[1], af[2]
+        local rx, ry, rz
+        if af1 == 0 and af2 == 0 then
+            rx, ry, rz = af0 * r0, af0 * r1, af0 * r2
+        else
+            rx = af0 * r0 + af1 * R[3] + af2 * r6
+            ry = af0 * r1 + af1 * R[4] + af2 * r7
+            rz = af0 * r2 + af1 * R[5] + af2 * r8
+        end
+        local t0, t1, t2 = ry * f2 - rz * f1, rz * f0 - rx * f2, rx * f1 - ry * f0
+        local ltsq = t0 * t0 + t1 * t1 + t2 * t2
+        if ltsq > 10000 then
+            local k = 100 / sqrt(ltsq)
+            t0, t1, t2 = t0 * k, t1 * k, t2 * k
+        end
+        Tq[0], Tq[1], Tq[2] = Tq[0] + t0, Tq[1] + t1, Tq[2] + t2
+    end
+
+    if rearLoad ~= 0 then
+        local ar = chassis.T.aero_rear or SimcadeAero.rearForceOffset
+        local force = -(rearLoad * aOn)
+        local f0, f1, f2 = force * r6, force * r7, force * r8
+        local lsq = f0 * f0 + f1 * f1 + f2 * f2
+        if lsq > 1440000 then
+            local k = 1200 / sqrt(lsq)
+            f0, f1, f2 = f0 * k, f1 * k, f2 * k
+        end
+        F[0], F[1], F[2] = F[0] + f0, F[1] + f1, F[2] + f2
+        local ar0, ar1, ar2 = ar[0], ar[1], ar[2]
+        local rx, ry, rz
+        if ar1 == 0 and ar2 == 0 then
+            rx, ry, rz = ar0 * r0, ar0 * r1, ar0 * r2
+        else
+            rx = ar0 * r0 + ar1 * R[3] + ar2 * r6
+            ry = ar0 * r1 + ar1 * R[4] + ar2 * r7
+            rz = ar0 * r2 + ar1 * R[5] + ar2 * r8
+        end
+        local t0, t1, t2 = ry * f2 - rz * f1, rz * f0 - rx * f2, rx * f1 - ry * f0
+        local ltsq = t0 * t0 + t1 * t1 + t2 * t2
+        if ltsq > 10000 then
+            local k = 100 / sqrt(ltsq)
+            t0, t1, t2 = t0 * k, t1 * k, t2 * k
+        end
+        Tq[0], Tq[1], Tq[2] = Tq[0] + t0, Tq[1] + t1, Tq[2] + t2
+    end
+end
+
+return SimcadeAero

@@ -32,117 +32,141 @@ NOTES:
     
     
     Changelog:
-        R3 - Initial public release, needs player testing, releases together with the Peugeot 106 S16 dupe
+        R4:
+         New Boost settings, for when theres only the boosted specs available
+         Better climbing gear hold system
+         Better optimization overall up to 45% less, do contact me if something feels wrong or bugged though.
+         New Config Schema with better organization overall   
+        
+        R3:
+         Initial public release, needs player testing, releases together with the Peugeot 106 S16 dupe
 ]]--
-
-
 
 local CONFIG = {}
 -- Advance only after applying the required settings for the new config format.
-CONFIG.SCHEMA_VERSION = 2
+CONFIG.SCHEMA_VERSION = 3
 
-CONFIG.CORE_UPDATE = {
-    enabled = true,
-    baseURL = "https://raw.githubusercontent.com/nokillnando/Starfall/main/simcadebase/releases", -- The loader appends /latest.txt
-    format = "source", -- Reuse matching local files when the release includes a source index
+-- ============================================================================
+-- 1. Debug, Telemetry & HUD
+-- ============================================================================
+
+CONFIG.DEBUG_CFG = {
+    enabled                 = false, -- Master switch for all debug/telemetry overlays (independent of HUD_CFG.enabled)
+    wheelRadiusHolo         = false, -- Spawn translucent cylinder sized to exact physics wheel radius
+    suspensionRays          = true, -- Draw 3D suspension contact traces
+    telemetryHUD            = true,  -- Master toggle for 3D & 2D tire telemetry
+    telemetry3D             = true,  -- Wheel grip bars and chassis axes
+    pacejkaGraph            = true,  -- 2D Pacejka tire telemetry panel
+    tireDebug               = true,  -- Fallback tire debug overlay when telemetry3D / pacejkaGraph are omitted
+    camberDebug             = true,  -- Camber and lateral-force readings at each wheel
+    axleDebug               = true,  -- Solid axle beam, spring seats, center height and articulation
+    weightShift             = true,  -- Weight shift panel, G-ball and vertical-G bar
+    profileCPU              = false, -- Print Starfall CPU profiling breakdown to console
+    warnEngineCurveMismatch = true,  -- Log once at init if requested torque/power/RPM targets conflict or are clamped
+}
+
+CONFIG.HUD_CFG = {
+    enabled    = true,  -- Master switch for vehicle HUD (speedo + addon HUDs)
+    showSpeedo = false, -- Set false to disable the default speed/RPM/gear HUD and use your own
 }
 
 -- ============================================================================
--- Chassis, wheels and suspension
+-- 2. Chassis, Wheels, Suspension & Steering (Per-Car Setup)
 -- ============================================================================
 
 CONFIG.VEHICLE_CFG = {
-    DefaultMassKG               = 950,      -- Initial fallback for the vehicle solver until the Base prop mass is read.
-    VirtualMassKG               = 950,      -- Solver mass override in kg. 0 uses the Base prop mass once available.
-                                            -- The override changes the simulation without changing the Base prop mass in GMod.
-    BaseInertia                 = nil,       -- Optional absolute inertia for the wired Base prop, e.g. Vector(300, 900, 1000).
-                                            -- X/Y/Z are prop-local axes. Higher values resist rotation around that axis.
-    frontWeightBias             = 0.65,
-    chassisForward              = Vector(1, 0, 0),
-    comOffset                   = Vector(0, 0, 0),       -- Shifts the wheel/suspension origin relative to the Base prop's mass center (Source units: X=fwd, Y=left, Z=up). Does not move GMod's VPhysics COM; use frontWeightBias / centerOfMassHeight / CGHeight for weight balance.
-    angularDrag                 = Vector(3.6, 3.8, 0), -- Chassis roll (X) and pitch (Y) damping (scaled 0.55 on ground, 0.15 airborne). Z is unused (yaw damping uses STEERING_CFG.yawStabilityAssist).
-
-    -- Simulation and networking
-    DriverPrediction            = true,      -- Predict the driver's Simcade gauges, sounds and tire effects
-    UpdateRate                  = 20,        -- Target physics rate (Hz); 30Hz prevents Starfall 6000us CPU spikes
-    NetworkRate                 = 20,        -- Target active telemetry rate per stream (Hz), limited by physics ticks and available bytes
-    NetworkBudgetBytesPerSecond = 4300,      -- Server telemetry budget per chip (bytes/s; 4300 fits default 5 kB/s servers). 0 disables telemetry.
-    MaxCPUPercent               = 75,        -- Above this %, reduce substeps & skip non-critical FX
-
-    -- Wire integration
-    enableExternalWireOverrides = false,
-    detailedWheelWireOutputs    = false, -- Enable raw steering input, individual steer angles and per-wheel telemetry arrays
+    DefaultMassKG   = 950,                -- Initial fallback for the vehicle solver until the Base prop mass is read.
+    VirtualMassKG   = 950,                -- Solver mass override in kg. 0 uses the Base prop mass once available.
+                                          -- The override changes the simulation without changing the Base prop mass in GMod.
+    BaseInertia     = nil,                -- Optional absolute inertia for the wired Base prop, e.g. Vector(300, 900, 1000).
+                                          -- X/Y/Z are prop-local axes. Higher values resist rotation around that axis.
+    frontWeightBias = 0.65,
+    chassisForward  = Vector(1, 0, 0),
+    comOffset       = Vector(0, 0, 0),    -- Shifts the wheel/suspension origin relative to the Base prop's mass center (Source units: X=fwd, Y=left, Z=up). Does not move GMod's VPhysics COM; use frontWeightBias / centerOfMassHeight / CGHeight for weight balance.
+    angularDrag     = Vector(3.6, 3.8, 0),-- Chassis roll (X) and pitch (Y) damping (scaled 0.55 on ground, 0.15 airborne). Z is unused (yaw damping uses STEERING_CFG.yawStabilityAssist).
+    -- Simulation, networking & Wire settings are in Section 8 below.
 }
 
 CONFIG.WHEELS = {
-    { name = "FL", pos = Vector( 47,  28, -1.5), isFront = true,  steer = 1, drive = true, radius = 11, width = 7 },
-    { name = "FR", pos = Vector( 47, -28, -1.5), isFront = true,  steer = 1, drive = true, radius = 11, width = 7 },
-    { name = "RL", pos = Vector(-46.75,27,-0.5), isFront = false, steer = 0, drive = true, radius = 11, width = 7 },
-    { name = "RR", pos = Vector(-46.75,-27, -0.5), isFront = false, steer = 0, drive = true, radius = 11, width = 7 },
+    { name = "FL", pos = Vector( 47,     28, -1.5), isFront = true,  steer = 1, drive = true, radius = 11, width = 7 },
+    { name = "FR", pos = Vector( 47,    -28, -1.5), isFront = true,  steer = 1, drive = true, radius = 11, width = 7 },
+    { name = "RL", pos = Vector(-46.75,  27, -0.5), isFront = false, steer = 0, drive = true, radius = 11, width = 7 },
+    { name = "RR", pos = Vector(-46.75, -27, -0.5), isFront = false, steer = 0, drive = true, radius = 11, width = 7 },
 }
 
 CONFIG.WHEEL_DEFAULTS = {
-    visible         = true,           -- Set false to hide wheel holos (e.g. using custom body/prop wheels)
-    model           = "models/sprops/trans/wheel_d/t_wheel20.mdl",
-    leftModelAng    = Angle(0, 0, 0),
-    rightModelAng   = Angle(0,180, 0),
-    angOffset       = Angle(0, 0, 0), -- Extra per-wheel/per-axle rotation offset
-    visualOffset    = Vector(0, 0, 0),-- Local hub offset if model origin is off-center
-    scale           = Vector(1.05, 1, 1.05),
-    skin            = 0,              -- Model skin index, starting at 0
-    reverseFaces    = false,          -- Flip winding for an inside-out model; negative scales are handled automatically
-    bodygroups      = {1,1},             -- [group ID] = variant ID, both starting at 0
-    material        = nil,            -- Optional override material string
-    color           = Color(255,255,255,0),            -- Optional Color(r, g, b, a)
-    debugHolo       = true,
-    debugRadiusHolo = false,          -- Spawn translucent cylinder sized to exact physics wheel radius
+    visible       = true,           -- Set false to hide wheel holos (e.g. using custom body/prop wheels)
+    model         = "models/sprops/trans/wheel_d/t_wheel20.mdl",
+    leftModelAng  = Angle(0, 0, 0),
+    rightModelAng = Angle(0, 180, 0),
+    angOffset     = Angle(0, 0, 0), -- Extra per-wheel/per-axle rotation offset
+    visualOffset  = Vector(0, 0, 0),-- Local hub offset if model origin is off-center
+    scale         = Vector(1.05, 1, 1.05),
+    skin          = 0,              -- Model skin index, starting at 0
+    reverseFaces  = false,          -- Flip winding for an inside-out model; negative scales are handled automatically
+    bodygroups    = { 1, 1 },       -- [group ID] = variant ID, both starting at 0
+    material      = nil,            -- Optional override material string
+    color         = Color(255, 255, 255, 0), -- Optional Color(r, g, b, a)
     -- Optional per-axle overrides (any key above can be overridden per axle or per wheel in CONFIG.WHEELS)
-    Front = {},                       -- Example: Front = { skin = 1, bodygroups = { [1] = 2 } }
-    Rear  = {},
+    Front         = {},             -- Example: Front = { skin = 1, bodygroups = { [1] = 2 } }
+    Rear          = {},
 }
 
 CONFIG.SUSPENSION_CFG = {
-    -- Axle travel, alignment, springs and dampers
     Front = {
-        camberDeg           = -0.5, -- Negative tilts the tire tops inward
-        bumpCamberDeg       = -2.0, -- Added to static camber at full bump; zero change at rest, linear between
-        droopCamberDeg      =  1.0, -- Added at full droop. Both travel settings apply only to independent wheels
-        solidAxle           = false, -- Enable beam suspension and the FrontAxle Wire entity for mesh parenting
-        -- axleCenterZ = 0.3, -- Nominal hub center above chassis COM (Source units); omit to use wheel mount Z
-        maxAxleRollDeg      = 15,   -- Articulation stop relative to chassis
-        springSpanRatio     = 0.75, -- Solid axle spring spacing / wheel track (1 = springs at hubs)
-        casterDeg           = 6,    -- Positive tips the upper steering pivot rearward and adds camber in turns
-        rideHeight          = 15.5,
-        airTravel           = 3,
-        restCompression     = 0.45,
-        springStiffnessMult = 1.45,
-        helperSpringMult    = nil,  -- Extra corner weights at full bump. Automatic value is 8 at 2600 kg virtual mass or above, otherwise 0.
-        helperStartCompression = nil, -- Fraction of rideHeight where the helper starts. Defaults to restCompression.
-        levelCapacityKG     = 0,    -- Extra payload capacity for this axle in kg. 0 disables leveling.
-        levelCompression    = 0.35, -- Target compression as a fraction of rideHeight when leveling is enabled.
-        bumpDampingRatio    = 1.12,
-        reboundDampingRatio = 0.75,
-        antiRollStiffness   = 0.16,
+        -- Ride height, springs and dampers
+        rideHeight             = 15.5,
+        airTravel              = -2,
+        restCompression        = 0.45,
+        springStiffnessMult    = 1.45,
+        bumpDampingRatio       = 1.12,
+        reboundDampingRatio    = 0.75,
+        antiRollStiffness      = 0.16,
+
+        -- Alignment
+        camberDeg              = -0.5, -- Negative tilts the tire tops inward
+        bumpCamberDeg          = -2.0, -- Added to static camber at full bump; zero change at rest, linear between
+        droopCamberDeg         =  1.0, -- Added at full droop. Both travel settings apply only to independent wheels
+        casterDeg              = 6,    -- Positive tips the upper steering pivot rearward and adds camber in turns
+
+        -- Solid axle (beam suspension)
+        solidAxle              = false, -- Enable beam suspension and the FrontAxle Wire entity for mesh parenting
+        -- axleCenterZ         = 0.3,  -- Nominal hub center above chassis COM (Source units); omit to use wheel mount Z
+        maxAxleRollDeg         = 15,   -- Articulation stop relative to chassis
+        springSpanRatio        = 0.75, -- Solid axle spring spacing / wheel track (1 = springs at hubs)
+
+        -- Load leveling & helper springs
+        helperSpringMult       = nil,  -- Extra corner weights at full bump. Automatic value is 8 at 2600 kg virtual mass or above, otherwise 0.
+        helperStartCompression = nil,  -- Fraction of rideHeight where the helper starts. Defaults to restCompression.
+        levelCapacityKG        = 0,    -- Extra payload capacity for this axle in kg. 0 disables leveling.
+        levelCompression       = 0.35, -- Target compression as a fraction of rideHeight when leveling is enabled.
     },
     Rear = {
-        camberDeg           = 0,
-        bumpCamberDeg       = -3.0, -- Added to static camber at full bump; zero change at rest, linear between
-        droopCamberDeg      =  2.0, -- Added at full droop. Both travel settings apply only to independent wheels
-        solidAxle           = false, -- Enable beam suspension and the RearAxle Wire entity for mesh parenting
-        -- axleCenterZ = 0.3, -- Optional beam height override. Omit to keep the wheel mount height when enabling solidAxle.
-        maxAxleRollDeg      = 15,  -- Maximum beam tilt in either direction relative to chassis
-        springSpanRatio     = 0.75,
-        rideHeight          = 14,
-        airTravel           = 3,
-        restCompression     = 0.45,
-        springStiffnessMult = 1.25,
-        helperSpringMult    = nil,
+        -- Ride height, springs and dampers
+        rideHeight             = 14,
+        airTravel              = 0,
+        restCompression        = 0.45,
+        springStiffnessMult    = 1.25,
+        bumpDampingRatio       = 0.52,
+        reboundDampingRatio    = 0.75,
+        antiRollStiffness      = 0.14,
+
+        -- Alignment
+        camberDeg              = 0,
+        bumpCamberDeg          = -3.0, -- Added to static camber at full bump; zero change at rest, linear between
+        droopCamberDeg         =  2.0, -- Added at full droop. Both travel settings apply only to independent wheels
+
+        -- Solid axle (beam suspension)
+        solidAxle              = false, -- Enable beam suspension and the RearAxle Wire entity for mesh parenting
+        -- axleCenterZ         = 0.3,  -- Optional beam height override. Omit to keep the wheel mount height when enabling solidAxle.
+        maxAxleRollDeg         = 15,   -- Maximum beam tilt in either direction relative to chassis
+        springSpanRatio        = 0.75,
+
+        -- Load leveling & helper springs
+        helperSpringMult       = nil,
         helperStartCompression = nil,
-        levelCapacityKG     = 0,
-        levelCompression    = 0.35,
-        bumpDampingRatio    = 0.52,
-        reboundDampingRatio = 0.75,
-        antiRollStiffness   = 0.14,
+        levelCapacityKG        = 0,
+        levelCompression       = 0.35,
     },
 
     -- Chassis pitch and roll
@@ -154,65 +178,7 @@ CONFIG.SUSPENSION_CFG = {
     rollRecoveryMult       = 1.0, -- How quickly the tire-driven roll couple fades on turn exit. 1 = normal, higher unwinds sooner.
     invertPitchTransfer    = false,
     invertRollTransfer     = false,
-
-    -- Wheel traces and curb response
-    useTreadTrace       = true,       -- Sample the curved tread across the configured wheel width
-    treadRayCount       = 9,          -- Number of curved-tread rays per wheel when useTreadTrace = true (1..25; auto-positioned across tire arc & width).
-                                      -- 1 = center only (fastest), 3 = front/center/rear arc, 5 = cross, 7 = staggered corners,
-                                      -- 9 = default 3x3 curved tread, 15 = 5x3 high-res, 25 = 5x5 ultra-res.
-                                      -- Flat open roads use a 2-trace broadphase fast-path; full ray count only runs on curbs, slopes, or with ShowSuspensionRays.
-    useHullTrace        = false,      -- Enable to override tread sampling with the legacy square hull
-    curbTripEnabled      = true,      -- Extra curb resistance and jolt. Wheel-wall contact also works with this disabled.
-    curbClimbRatio       = 0.42,      -- Fraction of wheel radius a tire can climb before catching
-    curbMinHeight        = 1.75,      -- Minimum rise in Source units for a curb jolt. The larger of this and radius * curbClimbRatio applies.
-    curbProbeHeightRatio = 0.14,      -- Lower curb probe height as fraction of wheel radius
-    curbProbeMaxHeight   = 4.5,       -- Max height (units) above ground for lower probe (so big wheels still catch curbs)
-    curbProbeDistMult    = 1.00,      -- Scale the forward tread and lateral half-width probe reach
-    curbWallHeightRatio  = 0.82,      -- Obstacles taller than this fraction of wheel radius act as walls
-    curbWallImpulseMult  = 0.80,      -- Per-wheel horizontal wall-block impulse multiplier
-    curbSideImpulseMult  = 0.25,      -- Per-wheel lateral curb catch strength
-    curbVerticalHopMult  = 0.02,      -- Per-wheel upward suspension jolt on sideways curb impact
-    curbSideAlignMin     = 0.45,      -- Min sideways alignment (0..1) to trigger curb trip
-    curbCooldown         = 0.16,      -- Min seconds between upward jolts on distinct curb strikes
-    curbMinSpeed         = 90,        -- Min inward speed for the lateral jolt; sidewall resistance also works below this
-    curbFwdEnabled       = true,      -- Enable forward/backward curb bump jolt
-    curbFwdImpulseMult   = 0.00,      -- Extra braking on a rolling curb strike; 0 disables this resistance
-    curbFwdHopMult       = 3.64,      -- Rolling curb kick; above 1 also scales hop height, limited by approach speed and curb size
-    curbFwdMinSpeed      = 80,        -- Min speed into curb (in/s, ~4.5 mph) to trigger forward/backward jolt
-
-    -- Suspension sound triggers
-    SuspensionSounds = {
-        enabled       = true,
-        minBumpVel    = 45,           -- Min upward compression speed (in/s) to trigger bumpstop sound
-        maxBumpVel    = 260,          -- Speed (in/s) for full bumpstop sound volume
-        minDroopVel   = 125,           -- Min downward extension speed (in/s) to trigger droop sound
-        maxDroopVel   = 280,          -- Speed (in/s) for full droop sound volume
-        bumpCooldown  = 0.15,         -- Min seconds between bumpstop sounds per wheel
-        droopCooldown = 0.35,         -- Min seconds between droop sounds per wheel
-    },
-}
-
--- Dynamic tire load and grip during acceleration, braking and cornering
-CONFIG.WEIGHT_SHIFT_CFG = {
-    Enabled              = true,  -- Enable simulated dynamic weight transfer on tire normal loads (Fz)
-    LongitudinalTransfer = 4.0,   -- Pitch transfer multiplier (braking -> front, accel -> rear)
-    LateralTransfer      = 1.5,   -- Roll transfer multiplier (cornering -> outside wheels)
-    VerticalTransfer     = 0.75,   -- Vertical G load scale (crests unload <1.0g, dips/half-pipes load >1.0g)
-    MinVertLoadMult      = 0.20,  -- Minimum vertical load multiplier over crests
-    MaxVertLoadMult      = 2.00,  -- Maximum vertical load multiplier in dips/compression
-    CGHeight             = 0.55,  -- Effective center-of-gravity height (meters)
-    Wheelbase            = 2.38,  -- Effective wheelbase (meters)
-    TrackWidth           = 1.39,  -- Effective track width (meters)
-    Smoothing            = 10.0,  -- Acceleration filter rate (Hz)
-    MaxTransferFrac      = 0.45,  -- Max load fraction transferred per axis (0 - 0.85)
-    MinWheelLoadFrac     = 0.15,  -- Minimum load fraction kept on unloaded wheel
-    GripEffectMult       = 0.65,  -- Master grip-effect scale (0 = display only, 1 = full)
-    GripEffectLongMult   = 1.0,   -- Forward/back weight shift effect on tire grip
-    GripEffectLatMult    = 1.0,   -- Sideways weight shift effect on tire grip
-    FrontLongMult        = 1.0,   -- Front axle longitudinal transfer grip scale
-    RearLongMult         = 1.0,   -- Rear axle longitudinal transfer grip scale
-    FrontLateralMult     = 1.0,   -- Front axle lateral transfer grip scale (ARB/sway feel)
-    RearLateralMult      = 1.0,   -- Rear axle lateral transfer grip scale (ARB/sway feel)
+    -- Tread/curb traces and SuspensionSounds thresholds are in Section 9 below.
 }
 
 CONFIG.STEERING_CFG = {
@@ -230,16 +196,766 @@ CONFIG.STEERING_CFG = {
     ReturnSpeedAttenuation = 40, -- Higher softens centering at low speeds. 40 reaches full return at about 53 km/h.
 
     -- Drift key rates and straight-line stability
-    DriftTurnInMultiplier       = 2.5, -- Input rate when steering farther into an established drift. 1 is normal.
-    DriftCountersteerMultiplier = 3, -- Input rate when countersteering to catch a drift. 1 is normal.
+    DriftTurnInMultiplier       = 2.5,  -- Input rate when steering farther into an established drift. 1 is normal.
+    DriftCountersteerMultiplier = 3,    -- Input rate when countersteering to catch a drift. 1 is normal.
     yawStabilityAssist          = 0.38, -- Body yaw damping above 8 km/h with steering near center, 3+ wheels grounded and handbrake released. 0 disables it.
 }
 
 -- ============================================================================
--- Tires, road surfaces and aerodynamics
+-- 3. Tires (Per-Car Sizing & Grip), Weight Shift & Aerodynamics
 -- ============================================================================
 
--- Source Engine MatType IDs (for SurfaceMultipliers)
+CONFIG.TIRE_CFG = {
+    DefaultCompound      = "Sport", -- "Slick", "Sport", "Comfort", "Drift", "Rally"
+    UseDirectMultipliers = true,
+    Grip                 = 1.00,    -- Global tire grip multiplier
+    LateralGrip          = 1.00,    -- Lateral cornering grip multiplier
+    LongitudinalGrip     = 1.00,    -- Acceleration/braking grip multiplier
+    GripDampingFactor    = 1.18,
+    RollingResistance    = 0.015,   -- Rolling drag coefficient
+
+    Front = {
+        Width            = 185,
+        Aspect           = 55,      -- Sidewall profile % (50 = baseline; lower = stiffer/snappier Lat_B & Long_B, higher = softer)
+        LateralGrip      = 1.15,
+        LongitudinalGrip = 1.15,
+        GripBias         = 1.0,
+    },
+    Rear = {
+        Width            = 185,
+        Aspect           = 55,
+        LateralGrip      = 1.15,
+        LongitudinalGrip = 1.15,
+        GripBias         = 1.05,
+    },
+
+    Formula = { CamberStiffness = 0.65 }, -- Small-angle thrust per radian as a fraction of peak lateral force
+    -- Compounds, SurfaceMultipliers & SurfaceRollingResistance are in Section 9 below.
+}
+
+-- Dynamic tire load and grip during acceleration, braking and cornering
+CONFIG.WEIGHT_SHIFT_CFG = {
+    Enabled              = true,  -- Enable simulated dynamic weight transfer on tire normal loads (Fz)
+
+    -- Real-car dimensions (meters)
+    CGHeight             = 0.55,  -- Effective center-of-gravity height (meters)
+    Wheelbase            = 2.38,  -- Effective wheelbase (meters)
+    TrackWidth           = 1.39,  -- Effective track width (meters)
+
+    -- Transfer multipliers & limits
+    LongitudinalAccelTransfer = 4.0,  -- Pitch transfer multiplier when gaining longitudinal speed (accel -> rear)
+    LongitudinalBrakeTransfer = 2.0,  -- Pitch transfer multiplier when slowing down / braking (braking -> front)
+    -- Legacy LongitudinalTransfer is the fallback for either multiplier when omitted.
+    LateralTransfer      = 1.5,   -- Roll transfer multiplier (cornering -> outside wheels)
+    VerticalTransfer     = 0.75,  -- Vertical G load scale (crests unload <1.0g, dips/half-pipes load >1.0g)
+    MinVertLoadMult      = 0.20,  -- Minimum vertical load multiplier over crests
+    MaxVertLoadMult      = 2.00,  -- Maximum vertical load multiplier in dips/compression
+    Smoothing            = 10.0,  -- Acceleration filter rate (Hz)
+    MaxTransferFrac      = 0.45,  -- Max load fraction transferred per axis (0 - 0.85)
+    MinWheelLoadFrac     = 0.15,  -- Minimum load fraction kept on unloaded wheel
+
+    -- Tire grip effect scaling
+    GripEffectMult       = 0.65,  -- Master grip-effect scale (0 = display only, 1 = full)
+    GripEffectLongMult   = 1.0,   -- Forward/back weight shift effect on tire grip
+    GripEffectLatMult    = 1.0,   -- Sideways weight shift effect on tire grip
+    FrontLongMult        = 1.0,   -- Front axle longitudinal transfer grip scale
+    RearLongMult         = 1.0,   -- Rear axle longitudinal transfer grip scale
+    FrontLateralMult     = 1.0,   -- Front axle lateral transfer grip scale (ARB/sway feel)
+    RearLateralMult      = 1.0,   -- Rear axle lateral transfer grip scale (ARB/sway feel)
+}
+
+CONFIG.AERO_CFG = {
+    FrontAeroFactor     = 0.0,   -- Downforce coefficient (fraction of vehicle weight at 100 mph)
+    RearAeroFactor      = 7.0,
+    DragCoeff           = 0.17,
+    FrontalAreaM2       = 1.25,
+    WaterDragEnabled    = true,  -- Slow down when submerged in water
+    WaterDragMultiplier = 0.015, -- Hydrodynamic water drag strength
+}
+
+-- ============================================================================
+-- 4. Engine, Transmission, Differentials & Forced Induction
+-- ============================================================================
+
+CONFIG.ENGINE_CFG = {
+    -- ------------------------------------------------------------------------
+    -- 4.1 Engine & Powerband
+    -- ------------------------------------------------------------------------
+    EngineType               = "gasoline", -- "gasoline" | "diesel" (unthrottled fuel metering, smooth governor, no BOV/vacuum, boost smoke limit)
+    DisplacementLiters       = 1.6,
+    Cylinders                = 4,
+    PeakHP                   = 118,
+    PeakTorqueNm             = 142,
+    -- Optional exact curve: { { rpm = ..., torqueNm = ... }, ... }; overrides the generated curve and peak values.
+    -- Add points at the desired torque peak and any sharp high-RPM drop. RPMs must be
+    -- increasing and stay between idleRPM and limiterRPM; endpoint torque is held outside them.
+    -- TorqueCurve = {
+    --     { rpm = 950,  torqueNm = 280 },
+    --     { rpm = 1500, torqueNm = 420 },
+    --     { rpm = 2500, torqueNm = 500 },
+    --     { rpm = 3500, torqueNm = 420 },
+    --     { rpm = 4500, torqueNm = 300 },
+    --     { rpm = 6500, torqueNm = 180 },
+    --     { rpm = 7500, torqueNm = 100 },
+    -- },
+    idleRPM                  = 950,
+    PowerbandStartRPM        = 2600,   -- RPM where engine comes "on cam" / enters powerband
+    PowerbandRiseSharpness   = 1.0,    -- Generated curve only; 1 = smooth, >1 brings torque in sooner (minimum 0.25)
+    PowerbandEndRPM          = 6850,   -- Must be >= peakPowerRPM and < limiterRPM for PowerbandDropSharpness to take effect
+    PowerbandDropSharpness   = 1.0,    -- Generated curve only; 1 = linear, >1 drops faster (minimum 0.25)
+    -- Optional fine shaping for generated curves: Powerband = { lowEndScale = 0.60, topEndScale = 0.78 },
+    ConstrainGeneratedPeakHP = false,  -- Generated curve only: cap high-RPM torque to the requested PeakHP envelope
+    peakTorqueRPM            = 5200,
+    peakPowerRPM             = 6600,
+    redlineRPM               = 7200,
+    limiterRPM               = 7350,   -- Must be >= redlineRPM (values below redlineRPM are clamped up to redlineRPM)
+    revLimitDrop             = 280,    -- RPM drop below limiterRPM before ignition returns (0 = pure time-based cut, 60-120 = rapid race bounce, 250-500+ = deep drop)
+    revLimitDelay            = 0.04,   -- Minimum ignition-cut hold time in seconds (e.g. 0.01-0.03 = ultra-quick race cut, 0.04-0.12 = slower/heavier cut)
+    RevLimiterMode           = "hard", -- "hard" (ignition cut bounce) | "soft" (progressive torque taper before hard ceiling backstop)
+    RevLimiterSoftWindowRPM  = 250,    -- RPM window below limiterRPM where soft-cut taper ramps down (when RevLimiterMode = "soft")
+    RevLimiterSoftMinTorque  = 0.05,   -- Residual torque fraction at the top of the soft-cut ramp before hard cut catches
+    flywheelInertia          = nil,    -- Rotational inertia (kg·m²; nil/0 = auto from displacement & cylinders). Lower = faster rev up & down (0.03-0.08 race, 0.10-0.22 street, 0.25-0.45+ heavy; clamped 0.03..1.50)
+
+    -- Diesel-only tuning (used when EngineType = "diesel"; ignored on gasoline engines)
+    DieselGovernorWindowRPM  = nil,    -- Smooth fuel-taper governor window below limiterRPM (nil = auto ~12% of RPM span)
+    DieselSmokeLimit         = 0.25,   -- Off-boost AFC fuel cap when Turbo = true (0..0.65; 0 disables off-boost limiting)
+    DieselCoastBrakeScale    = 0.55,   -- Natural unthrottled coast braking fraction (diesels lack throttle-plate vacuum drag)
+
+    -- ------------------------------------------------------------------------
+    -- 4.2 Ignition, Starter & Idle (4-state: 0=Off, 1=Ignition On, 2=Cranking, 3=Catch)
+    -- ------------------------------------------------------------------------
+    StartRunning       = false,
+    crankRPM           = 320,
+    crankTime          = 0.65,
+    PhysicalStarter    = true,   -- Opt-in torque-based starter motor & RPM catch threshold (false keeps timed crankTime)
+    StarterTorqueNm    = nil,    -- Starter torque at flywheel in Nm (nil/0 = auto-sized to hold ~crankRPM against compression drag)
+    StarterCatchRPM    = 260,    -- Minimum crank RPM required for combustion to catch (when PhysicalStarter = true)
+    StarterCatchTime   = 0.25,   -- Seconds held >= StarterCatchRPM before engine catches (when PhysicalStarter = true)
+    BumpStartEnabled   = true,   -- Allow push/bump-starting when Ignition is ON (state 1) and rolling in gear spins the engine
+    BumpStartRPM       = nil,    -- Min wheel-driven RPM to bump-start (nil = auto above StallRPM, ~55-65% of idleRPM)
+    BumpStartTime      = 0.22,   -- Seconds held >= BumpStartRPM before the engine catches while rolling in gear
+    PhysicalIdle       = true,   -- Opt-in bounded idle torque controller & engine stalling (false preserves legacy idleRPM floor)
+    IdleControllerGain = 0.0018, -- Proportional idle torque gain per RPM of droop below idleRPM (when PhysicalIdle = true)
+    IdleMaxTorqueFrac  = 0.28,   -- Max fraction of idle torque curve the idle controller can add above self-sustain (0..0.75)
+    StallRPM           = 450,    -- RPM below which the engine stalls if held for StallDelay seconds (when PhysicalIdle = true)
+    StallDelay         = 0.35,   -- Seconds below StallRPM before combustion shuts down (ignition stays ON for immediate re-crank)
+
+    -- ------------------------------------------------------------------------
+    -- 4.3 Transmission & Gear Ratios
+    -- ------------------------------------------------------------------------
+    isAutomatic                   = true,
+    ClassicAuto                   = false,     -- Start in Park. GearUp/GearDown step through P, R, N, D. False enables pedal-selected direction.
+    SpeedToReverse                = 5,         -- km/h limit for selecting Park or Reverse
+    ReverseWSonReverse            = false,     -- In PRND Reverse, S accelerates and W brakes. False keeps W as throttle.
+    AlwaysSportMode               = true,
+    ComfortUpshiftRPM             = 62,        -- % of redline
+    ComfortDownshiftRPM           = 34,
+    SportUpshiftRPM               = 98,
+    SportDownshiftRPM             = 55,
+    shiftDelay                    = 0.34,
+    DownshiftCooldown             = 1.15,
+    UphillGradeLogic              = true,      -- Hold lower gears on climbs when the next gear lacks wheel force to pull the slope
+    UphillShiftMargin             = 1.20,      -- Required next-gear wheel-force / road-load ratio to allow an uphill upshift (1.0..2.5; higher holds gears longer)
+    UphillRedlineHold             = "redline", -- Held climb gear at redline: "redline" (ride rev limiter) | "soft" (smooth ECU governor) | "upshift" (force shift at 97% redline)
+    finalDrive                    = 3.511,
+    AutoCalibrateFinalDrive       = true,      -- false = pure mechanical finalDrive; true = scale finalDrive to hit top ForwardGearSpeeds at redline
+    AutoCalibrateRatiosFromSpeeds = true,      -- true = auto-calculate gear ratios from Forward/ReverseGearSpeeds, redlineRPM & finalDrive
+    ForwardGearRatios             = { 3.321, 1.902, 1.308, 1.000, 0.759 }, -- Unlimited forward gears
+    ForwardGearSpeeds             = { 51, 89, 128, 165, 205 },             -- Add one speed per gear when auto-calibrating ratios
+    ReverseGearRatios             = { -3.38 },                             -- Unlimited reverse gears (e.g. { -3.58, -2.10 })
+    ReverseGearSpeeds             = { 33 },                                -- Add one speed per reverse gear when auto-calibrating ratios
+
+    -- ------------------------------------------------------------------------
+    -- 4.4 Differentials & Drivetrain
+    -- ------------------------------------------------------------------------
+    PowerDistribution    = 100,   -- 0 = RWD, 100 = FWD, 50 = AWD, 35 = 35/65 AWD
+    DrivetrainEfficiency = nil,   -- Flywheel-to-wheel torque efficiency (0.50..1.00; nil = auto: 0.88 FWD, 0.85 RWD, 0.82 AWD; 1.0 = lossless)
+    FrontDiffType        = 0,     -- 0 = Open, 1 = LSD (torque + viscous), 2 = Locked
+    FrontLSDStiffness    = 3.0,   -- Front LSD viscous speed-diff ramp (higher = locks faster on wheel speed diff)
+    FrontLSDLockRatio    = 0.75,  -- Front LSD max viscous lock ratio (0..1)
+    FrontLSDPreload      = 15,    -- Front LSD static preload locking torque (Nm)
+    FrontLSDAccelLock    = 0.65,  -- Front LSD torque-sensitive lock under drive (0..1; 1-way/1.5-way/2-way accel ramp)
+    FrontLSDDecelLock    = 0.25,  -- Front LSD torque-sensitive lock on coast/overrun (0..1; 0 = 1-way, <accel = 1.5-way, =accel = 2-way)
+    RearDiffType         = 0,     -- 0 = Open, 1 = LSD (torque + viscous), 2 = Locked
+    RearLSDStiffness     = 3.0,   -- Rear LSD viscous speed-diff ramp (higher = locks faster on wheel speed diff)
+    RearLSDLockRatio     = 0.75,  -- Rear LSD max viscous lock ratio (0..1)
+    RearLSDPreload       = 15,    -- Rear LSD static preload locking torque (Nm)
+    RearLSDAccelLock     = 0.65,  -- Rear LSD torque-sensitive lock under drive (0..1)
+    RearLSDDecelLock     = 0.25,  -- Rear LSD torque-sensitive lock on coast/overrun (0..1)
+    CenterDiffType       = 0,     -- 0 = Open, 1 = LSD, 2 = Locked (AWD)
+    DiffLockToggleable   = false, -- Allow diff lock keys (CONTROLS_CFG.FrontLock/RearLock/AllLock) to toggle locks
+
+    -- ------------------------------------------------------------------------
+    -- 4.5 Throttle, Engine Braking & Clutch
+    -- ------------------------------------------------------------------------
+    -- Throttle pedal response
+    ThrottleResponseExp     = 1.0,  -- Partial-throttle load curve (1.0 = linear, <1 = snappier tip-in, >1 = progressive; WOT unchanged)
+    ThrottleRPMScale        = 0.7,  -- RPM-dependent partial throttle (0 = off; 0.8-1.2 = stronger low-RPM tip-in, progressive high-RPM; WOT unchanged)
+    ThrottleRiseTime        = 0.05, -- Throttle response time constant in seconds. 0 uses the standard pedal response.
+
+    -- Engine braking & Jake / exhaust brake
+    engineBrakeTorque       = 45,    -- Base engine braking torque (Nm; higher = stronger off-throttle decel)
+    EngineBrakeMult         = 1.0,   -- Multiplier for base and manual over-rev engine braking (0 = freewheel, 1 = normal, 2+ = strong)
+    EngineBrakeThrottleFade = 0.15,  -- Throttle fraction (0.02..1.0) over which closed-throttle engine braking fades out
+    JakeBrakeEnabled        = false, -- Enable driver-toggleable compression-release / exhaust brake (CONTROLS_CFG.JakeBrake)
+    JakeBrakeStages         = 3,     -- Number of Jake brake stages (1 = Off/On, 3 = Off / Low / Med / High)
+    JakeBrakeMult           = 3.2,   -- Top-stage engine braking multiplier when off-throttle in gear above JakeBrakeMinRPM
+    JakeBrakeMinRPM         = nil,   -- Min RPM for Jake brake activation (nil = idleRPM + 300)
+
+    -- Clutch (friction, torque converter, or centrifugal)
+    ClutchType              = "friction", -- "friction" | "torque_converter" | "centrifugal"
+    ClutchMaxTorqueNm       = nil,        -- Dry-plate clutch clamping capacity in Nm (nil = auto ~1.85x peak torque with boost headroom)
+    ClutchEngageTime        = 0,          -- Friction clutch take-up time in seconds. 0 uses the standard engagement behavior.
+    HardRPMLimit            = false,      -- Enable to cap RPM during wheel-driven overrun.
+    ClutchLerp              = 0.40,
+    ClutchLerpReverse       = 0.50,
+    UseClutchLerpInManual   = true,
+    -- Torque Converter settings (used when ClutchType = "torque_converter")
+    TC_StallRPM             = 2200, -- Nominal stall speed (RPM); calibrates hydrodynamic K-factor (higher torque naturally raises stall)
+    TC_MaxMult              = 2.0,  -- Peak torque multiplication at stall
+    TC_CouplingRatio        = 0.85, -- Turbine/impeller speed ratio where multiplication ends
+    TC_LockupRPM            = 3200, -- Lockup threshold RPM (0 = disable lockup)
+    TC_CreepTorque          = 0.12, -- Idle creep scale (0.12 = normal; 0 disables idle creep)
+    -- Centrifugal Clutch settings (used when ClutchType = "centrifugal")
+    CentrifugalEngageRPM    = 1800, -- RPM where clutch shoes begin engaging
+    CentrifugalFullRPM      = 3200, -- RPM where clutch reaches 100% lock
+
+    -- ------------------------------------------------------------------------
+    -- 4.6 Forced Induction (Turbocharger & Supercharger)
+    -- ------------------------------------------------------------------------
+    -- How PeakHP, PeakTorqueNm and TorqueCurve relate to Turbo / Supercharger boost:
+    --   false = Naturally aspirated base (default): PeakHP / PeakTorqueNm are the 0 PSI base engine
+    --           and boost multiplies power on top (best for NA cars and aftermarket turbo/SC builds).
+    --   true  = Factory-boosted specs (for stock turbo/SC cars): enter the real-world advertised
+    --           HP/torque directly. At startup Simcade automatically scales down the off-boost (0 PSI)
+    --           base curve so full boost hits your exact PeakHP / PeakTorqueNm, just like
+    --           AutoCalibrateRatiosFromSpeeds does for gear ratios. All live spool/lag tuning
+    --           (Turbo_StartRPM, Turbo_Exp, Turbo_Inertia, etc.) works normally.
+    --           (Note: with a custom dyno TorqueCurve that already drops off below spool RPM,
+    --           low-RPM off-boost torque will feel softer; peak boosted output stays exact.)
+    SpecsIncludeBoost      = false,
+    -- Shared absolute reference pressure (PSI absolute) for pressure-ratio = (gaugePSI + ref) / ref.
+    -- 14.696 = standard sea-level atmosphere; legacy configs without this key fall back to 18.4.
+    Induction_ReferencePSI = 14.696,
+    ManifoldModel          = true,  -- Opt-in intake manifold pressure (MAP) state: separates pre-throttle boost from post-throttle vacuum/load
+    ManifoldTimeConstant   = 0.06,  -- Manifold fill/empty time constant in seconds (0.005..0.50; lower = snappier throttle/lift response)
+    ManifoldIdleAbsPSI     = nil,   -- Closed-throttle idle MAP in PSI absolute (nil = ~5.0 PSI abs / -9.7 PSI vacuum @ sea level)
+
+    -- Turbocharger
+    Turbo                  = false, -- Enable turbocharger torque and boost simulation
+    Turbo_PSIMax           = 10,    -- Compressor pressure ceiling (PSI gauge)
+    Turbo_StartRPM         = 1700,  -- Engine RPM where spool flow begins; not the RPM for full boost
+    -- Optional per-system override (omit to use Induction_ReferencePSI; legacy default was 18.4)
+    -- Turbo_AirPressure   = 18.4,
+    Turbo_MaxRPM           = 9000,  -- Calibrated turbo spool proxy limit (not literal ~150k turbine RPM)
+    Turbo_MaxFlow          = 9000,  -- Flow scale; higher values generally spool more slowly
+    Turbo_FlowScale        = 750,   -- Exhaust-flow drive strength; higher values spool faster
+    Turbo_DragScale        = 0.055, -- Rotor drag; higher values reduce spool and speed up pressure decay
+    Turbo_Inertia          = 0.015, -- Rotor inertia; lower values respond/spool faster
+    Turbo_Exp              = 0.90,  -- Flow response exponent; >1 delays low-flow spool, <1 builds it earlier
+    Turbo_CoastFlow        = 0.0,   -- Off-throttle spool retention (0..1); softens lift-off drag between shifts without ever building/holding boost at 0% throttle
+    Turbo_LoadExp          = 1.0,   -- Throttle-to-exhaust-drive exponent (0.1..3.0; 1 = linear, WOT unchanged)
+    Turbo_TorqueGain       = 0.80,  -- Scales pressure-ratio torque gain (0.80 @ 14.696 PSI matches legacy 1.0 @ 18.4 PSI; 0 disables)
+    Turbo_BOVThresholdPSI  = 3.5,   -- Minimum gauge PSI for the lift-off blow-off sound
+    -- Optional wastegate cap (PSI gauge); defaults to Turbo_PSIMax when omitted.
+    -- Turbo_WastegatePSI  = 10.0,
+    -- Optional factory rating boost (PSI gauge); only used when SpecsIncludeBoost = true.
+    -- nil = auto-match current max boost so full boost hits PeakHP / PeakTorqueNm.
+    -- Set to the stock boost PSI only if you want to keep stock PeakHP/PeakTorqueNm and raise/lower
+    -- Turbo_PSIMax / Turbo_WastegatePSI like a boost controller to gain/lose power relative to stock.
+    Turbo_RatedPSI         = nil,
+
+    -- Supercharger (independent; both systems may be enabled for compound/twincharging)
+    Supercharger              = false,
+    Supercharger_Type         = "centrifugal", -- Approximate response: "roots", "twin_screw", or "centrifugal"
+    Supercharger_MaxPSI       = 8.0,           -- Maximum boost (PSI gauge) at Supercharger_RatedRPM
+    Supercharger_RatedRPM     = 6500,          -- Engine RPM at which the configured maximum boost is reached
+    -- Optional factory rating boost (PSI gauge); only used when SpecsIncludeBoost = true (nil = auto-match Supercharger_MaxPSI).
+    Supercharger_RatedPSI     = nil,
+    -- Optional per-system override (omit to use Induction_ReferencePSI; legacy default was 18.4)
+    -- Supercharger_AirPressure = 18.4,
+    -- Optional response-curve exponent; otherwise selected from Supercharger_Type.
+    -- Supercharger_PressureExp = 2.0,
+    Supercharger_TorqueGain   = 0.80,  -- Scales torque added by boost (0.80 @ 14.696 PSI matches legacy 1.0 @ 18.4 PSI; 0 disables)
+    Supercharger_DriveLoss    = 0.08,  -- Legacy multiplier loss at max boost (ignored when Supercharger_PhysicalLoss = true)
+    Supercharger_PhysicalLoss = false, -- Opt-in crankshaft compressor-power loss model (replaces Supercharger_DriveLoss)
+    Supercharger_Efficiency   = 0.65,  -- Adiabatic compressor efficiency (0.25..0.95; used when Supercharger_PhysicalLoss = true)
+    Supercharger_BaseDragNm   = nil,   -- Residual mechanical/belt drag in Nm even when bypassed (nil = 4 Nm in physical mode, 0 in legacy mode)
+}
+
+-- ============================================================================
+-- 5. Braking, ABS & Handbrake
+-- ============================================================================
+
+CONFIG.BRAKE_CFG = {
+    -- Service brakes
+    brakeTorque              = 750,   -- Base total brake torque (Nm)
+    frontBrakeBias           = 0.62,  -- Front/rear brake balance (0.15..0.85)
+    -- FrontBrakeTorque      = nil,   -- Optional explicit front brake torque override (Nm)
+    -- RearBrakeTorque       = nil,   -- Optional explicit rear brake torque override (Nm)
+    -- BrakeRampTime         = 0.18,  -- Brake pedal ramp-in time in seconds (0.02..1.0)
+    BurnoutAssist            = false, -- True releases rear service brakes when holding throttle + brake at low speed; false allows normal left-foot braking
+    BrakeHighSpeedScale      = 1.0,   -- Brake torque multiplier at BrakeHighSpeedRefKMH (e.g. 0.60 = 40% less brake force at 200 km/h)
+    BrakeHighSpeedStartKMH   = 80,    -- Speed (km/h) below which braking stays at 100%
+    BrakeHighSpeedRefKMH     = 200,   -- Speed (km/h) where BrakeHighSpeedScale is reached
+    StoppedPhaseBrakeSpeed   = 5,     -- Speed (km/h) below which vehicle enters stopped/hold braking phase
+
+    -- Anti-lock Braking System (ABS)
+    ABSEnabled               = true,  -- Enable Anti-lock Braking System above ~8 km/h
+    ABSLockThreshold         = 0.16,  -- Slip ratio (0..1) where ABS triggers: 0.08-0.16 = tight (no skids), 0.25-0.35 = street, >=0.45 = loose (allows lockup)
+    ABSPulseRate             = 14,    -- ABS release/apply cycles per second (Hz); higher = smoother pedal modulation
+    ABSReleaseRatio          = 0.15,  -- Brake torque fraction kept during release pulse (0.05-0.25 = clean release, >=0.65 = weak release/allows lockup)
+
+    -- Handbrake, Parking Brake & Auto-Hold
+    HandbrakeTorque          = 2400,  -- Rear handbrake torque (Nm)
+    HandbrakeLockWheels      = true,  -- Lock rear wheels immediately when handbrake is pulled
+    ParkingBrakeToggle       = true,  -- Allow toggling the parking brake on/off with CONTROLS_CFG.ParkingBrake
+    AutoReleaseParkingBrake  = true,  -- Automatically release the toggled parking brake when pressing throttle
+    AutoHoldBrake            = false, -- Automatically hold the parking brake while stopped (releases on throttle)
+    AutoHoldBrakeSpeed       = 3,     -- Max speed (km/h) at which AutoHoldBrake engages when off-throttle
+    AutoHandbrakeOnExitSpeed = 15,    -- Auto-engage handbrake when driver exits at <= this speed (km/h; 0 = off)
+}
+
+-- ============================================================================
+-- 6. Vehicle Audio & Camera (Per-Car Setup)
+-- ============================================================================
+
+CONFIG.SOUND_CFG = {
+    enabled                 = true, -- Master audio switch (engine, turbo, horn, suspension & tire sounds)
+
+    -- Engine & drivetrain sounds
+    Engine_SoundOn          = "acf_extra/vehiclefx/engines/l4/mini_onhigh.WAV",
+    Engine_SoundOff         = "acf_extra/vehiclefx/engines/l4/mini_onlow.WAV",
+    Engine_SoundOnDiv       = 4000,
+    Engine_SoundOnPitchMult = 1.0,
+    Engine_SoundOnVolume    = 1,
+    Engine_SoundOffDiv      = 3500,
+    Engine_SoundOffPitchMult= 1.0,
+    Engine_SoundOffVolume   = 0.5,
+    Engine_SoundOverallDiv  = 1.0,
+    Engine_SoundBlendRate   = 8.0,
+    Starter                 = "acf_extra/vehiclefx/starters/starter2.wav",
+    StarterPitch            = 1.0,
+    StarterVolume           = 0.75,
+    GearChange              = "physics/plaster/ceiling_tile_impact_hard3.wav",
+
+    -- Turbocharger sounds
+    TurboSound              = "acf_engines/turbine_small.wav",
+    TurboBOV                = "acf_extra/vehiclefx/boost/turbo_hiss1.wav",
+    TurboPitch              = 1.0,
+    TurboVolume             = 1.0,
+    TurboBOVPitch           = 1.0,
+    TurboBOVVolume          = 1.0,
+
+    -- Horn
+    Horn = { -- Hold CONTROLS_CFG.Horn to sound horn (local sound path or https:// URL)
+        enabled   = true,
+        sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/horn/horn_moto_02.ogg",
+        loadMode  = "stream", -- "stream" or "download" for web URLs
+        volume    = 0.85,
+        pitch     = 1.0,
+        loop      = true,     -- true = continuous while held, false = one-shot on press
+        fadeIn    = 25,       -- Ramp-in speed when loop = true
+        fadeOut   = 18,       -- Ramp-out speed when loop = true
+        cooldown  = 0.25,     -- Min seconds between presses when loop = false
+    },
+
+    -- Supercharger whine (optional loop; supply a path to enable)
+    SuperchargerSound = {
+        enabled     = false,
+        sndsource   = "",
+        loadMode    = "stream",
+        volume      = 0.65,
+        minRPM      = 1000,
+        maxRPM      = 6500,
+        pitchMin    = 0.75,
+        pitchMax    = 1.60,
+        pitchExp    = 1.0,
+        volExp      = 0.8,
+        coastVolume = 0.15,
+    },
+
+    -- Straight-cut / transmission gear whine & load-change clanks
+    GearWhine = {
+        enabled     = false,
+        minSpeed    = 5,
+        maxSpeed    = 180,
+        -- Legacy single-loop options remain supported when neither track path is set.
+        sndsource   = "",
+        loadMode    = "stream",
+        volume      = 0.65,
+        pitchMin    = 0.70,
+        pitchMax    = 1.60,
+        pitchExp    = 1.0,
+        volExp      = 0.8,
+        coastVolume = 0.35,
+        OnThrottle = {
+            sndsource = "", -- Loop for drive-side gear whine
+            loadMode  = "stream",
+            volume    = 0.65,
+            pitchMin  = 0.78,
+            pitchMax  = 1.65,
+            pitchExp  = 1.0,
+            volExp    = 0.8,
+        },
+        OffThrottle = {
+            sndsource = "", -- Loop for coast-side gear whine; may use a different recording/pitch
+            loadMode  = "stream",
+            volume    = 0.50,
+            pitchMin  = 0.65,
+            pitchMax  = 1.35,
+            pitchExp  = 1.0,
+            volExp    = 0.8,
+        },
+        OnClank = { -- Optional one-shot when throttle crosses this value upward
+            enabled   = false,
+            sndsource = "",
+            loadMode  = "stream",
+            threshold = 0.60,
+            minSpeed  = 10,
+            cooldown  = 0.35,
+            volume    = 0.55,
+            pitchMin  = 0.90,
+            pitchMax  = 1.05,
+        },
+        OffClank = { -- Optional one-shot when throttle crosses this value downward
+            enabled   = false,
+            sndsource = "",
+            loadMode  = "stream",
+            threshold = 0.40,
+            minSpeed  = 10,
+            cooldown  = 0.35,
+            volume    = 0.55,
+            pitchMin  = 0.90,
+            pitchMax  = 1.05,
+        },
+    },
+    -- BASS settings, suspension bump/droop sounds & surface sounds are in Section 9 below.
+}
+
+CONFIG.CAMERA_CFG = {
+    -- Driver camera
+    enabled                 = true,
+    chaseEnabled            = true,
+    fpvEnabled              = true,
+    freecamEnabled          = false,            -- Optional 360° orbit freecam mode for driver (no auto-recenter)
+    defaultMode             = 1,                -- 0 = Off, 1 = Chase Cam, 2 = FPV, 3 = Freecam (Press [V] in seat to cycle)
+    maxDist                 = 190,
+    minDist                 = 160,
+    heightOffset            = 45,
+    pitchOffset             = 5,
+    angleResponsiveness     = 3.5,
+    posDamping              = 15,
+    centerForce             = 15,
+    boundaryForce           = 75,
+    lookAhead               = true,
+    lookAheadDist           = 200,
+    idleTimeout             = 2.0,
+    mouseSens               = 0.05,
+    doCollision             = true,
+    colMask                 = 131083,           -- World-only trace mask so vehicle body collision props don't push the camera inside
+    colExtra                = 8,
+    fpvOffset               = Vector(-10, 0, 28),
+
+    -- Passenger camera (auto-detects constrained/parented passenger seats on Base)
+    passengerCamEnabled     = true,             -- Enable custom camera for passengers (avoids Source cam colliding with body props)
+    passengerDefaultMode    = 1,                -- 0 = Off, 1 = Chase, 2 = FPV (seat-anchored), 3 = Freecam (360° orbit, no auto-recenter)
+    passengerChaseEnabled   = true,
+    passengerFreecamEnabled = true,
+    passengerFpvEnabled     = true,
+    passengerDist           = 190,              -- Initial orbit distance for passenger Freecam (scroll wheel zooms)
+    passengerHeightOffset   = 55,               -- Orbit center height above Base for passenger Chase/Freecam
+    passengerFpvOffset      = Vector(-5, 0, 38), -- Eye offset from passenger seat in FPV
+}
+
+-- ============================================================================
+-- 7. Addons (Lights, Backfire, Brake Temp, Seat Indicator, Radio)
+-- ============================================================================
+
+-- Include your module at the top of this file, then list it here in hook order.
+-- A module returns function(options, config), which creates a fresh table of hooks.
+-- OnInit(ctx) registers server Wire ports and key handlers. OnClientInit(ctx)
+-- binds the same key IDs on the client. OnCleanup(ctx) runs in both realms.
+-- OnPrePhysics(ctx, dt, controls) and OnPostPhysics(ctx, dt, result) run on the
+-- server. dt is seconds. ctx.state, ctx.car and ctx.wheels describe this vehicle.
+CONFIG.ADDON_MODULES = {
+    {
+        file = "simcadebase/addons/lights.txt",
+        enabled = true,
+        options = {
+            SeparateBulbs         = true,  -- true = separate LowBeam & HighBeam bulbs; false = single bulb (HeadlightFOV/Brightness)
+            ExclusiveLowHigh      = false, -- When SeparateBulbs = true: true turns LowBeam off when HighBeam turns on
+            HoldOffTime           = 0.40,  -- Hold Headlights key (seconds) to turn headlights OFF; tap cycles Low <-> High
+            LowBeamFov            = 65,
+            LowBeamBrightness     = 1,
+            HighBeamFov           = 80,
+            HighBeamBrightness    = 2,
+            WireLColor            = Vector(255, 255, 255),
+            BrakeWireLightColor   = Vector(255, 0, 0),
+            ReverseWireLightColor = Vector(255, 255, 255),
+        },
+    },
+    {
+        file = "simcadebase/addons/backfire_antilag.txt",
+        enabled = false, -- Wire exhaust props to Exhausts (Array). Unwired pops originate at the chip.
+        options = {
+            TriggerMode = 3, -- 1 = lift-off, downshift and anti-lag; 2 = limiter; 3 = both groups
+
+            -- Lift-off and bursts (times in seconds, throttle and burst chances from 0 to 1)
+            MinRPMThreshold      = 4000, -- Minimum RPM to trigger overrun backfire
+            OverrunThrottleDrop  = 0.4,  -- Throttle must drop below this to trigger Overrun backfire
+            OverrunPopChance     = 0.35, -- Chance when throttle is released after load
+            OverrunSustainChance = 0.12, -- Chance per second for extra pops while coasting at high RPM
+            OverrunMinLoadTime   = 0.25, -- Must be on throttle this long before lift-off can pop
+            OverrunWindow        = 0.55, -- Seconds after lift-off where overrun pops are allowed
+            OverrunCooldownMin   = 0.06,
+            OverrunCooldownMax   = 0.25,
+            OverrunBurstChance   = 0.35,
+            OverrunBurstMin      = 2,
+            OverrunBurstMax      = 4,
+            BurstIntervalMin     = 0.04,
+            BurstIntervalMax     = 0.12,
+            RPMChancePower       = 1.35, -- Higher values make low-RPM pops rarer
+
+            -- Anti-lag pops under residual turbo boost
+            EnableAntiLag         = true,
+            AntiLagBoostThreshold = 1.05, -- Boost ratio; 1.0 is atmospheric pressure
+            AntiLagThrottleMax    = 0.35,
+            AntiLagMinRPM         = 3500,
+            AntiLagPopChance      = 0.45, -- Chance per second while off-throttle with boost
+            AntiLagCooldownMin    = 0.10,
+            AntiLagCooldownMax    = 0.24,
+
+            -- Downshift pops
+            EnableDownshiftPops    = true,
+            DownshiftPopChance     = 0.65, -- Chance when gear drops under RPM/load
+            DownshiftSustainChance = 0.18, -- Chance per second for follow-up burbles after downshift
+            DownshiftMinRPM        = 3200,
+            DownshiftThrottleMax   = 0.55,
+            DownshiftWindow        = 0.45,
+            DownshiftCooldownMin   = 0.05,
+            DownshiftCooldownMax   = 0.18,
+            DownshiftBurstChance   = 0.45,
+
+            -- Rev limiter
+            RevLimitPopChance    = 10,   -- Chance per second while on rev limiter
+            RevLimitRPMThreshold = 0.95, -- % of RevLimiter RPM required to start popping (0.95 = 95%)
+            RevLimitThrottle     = 0.4,  -- Minimum Throttle needed to trigger 2-Step / RevLimit popping
+            -- All sources share a minimum 0.10 s between audible pops.
+            RevLimitCooldownMin  = 0.01,
+            RevLimitCooldownMax  = 0.05,
+            RevLimitBurstChance  = 1,
+
+            -- Sounds
+            SoundVolume   = 1,
+            SoundPitchMin = 85,
+            SoundPitchMax = 115, -- 100 is normal pitch
+
+            -- Set UseURLSounds to false to select from InGameSounds.
+            UseURLSounds = true,
+            URLSounds = {
+                -- Add URLs to raw .ogg or .mp3 files here
+                "https://raw.githubusercontent.com/nokillnando/forzaapexsounds/main/misc/burble/burble_oneshot_test1.ogg",
+                "https://raw.githubusercontent.com/nokillnando/forzaapexsounds/main/misc/burble/burble_oneshot_test2.ogg",
+                "https://raw.githubusercontent.com/nokillnando/forzaapexsounds/main/misc/burble/burble_oneshot_test3.ogg",
+            },
+            InGameSounds = {
+                "acf_thecrew/useful/backfire/backfire_drain_10.wav",
+                "acf_thecrew/useful/backfire/backfire_gargle_15.wav",
+                "acf_thecrew/useful/backfire/backfire_splutter_20.wav",
+            },
+
+            -- Each exhaust plays every entry. Choose "effect", "particle", or "custom" (sprite).
+            Effects = {
+                { effecttype = "effect", effectname = "MuzzleEffect", scale = 0.4 },
+                { effecttype = "effect", effectname = "AirboatMuzzleFlash", scale = 0.7 },
+            },
+        },
+    },
+    {
+        file = "simcadebase/addons/brake_temperature.txt",
+        enabled = false, -- Enable to expose BrakeTempFL/FR/RL/RR and BrakeTempMax in Celsius.
+        -- BrakeWheelTemps follows CONFIG.WHEELS order. ExtraBrakeWheels accepts and
+        -- echoes an array of spinning wheel props. ExtraBrakeWheelTemps matches its order.
+        -- Client effects can read ctx.syncedState.BrakeTemperature.WheelTemps and ExtraWheelTemps.
+        options = {
+            AmbientTemp     = 20, MaxTemp = 800, -- degrees Celsius
+            HeatRate        = 0.35, SpeedHeatScale = 1.0,
+            WheelRPMToSpeed = 0.15,              -- km/h per RPM for external wheel props
+            CoolRate        = 0.08, SpeedCoolScale = 0.15,
+            StoppedCoolMult = 0.5,               -- passive cooling below 2 km/h
+            EnableFade      = false,             -- Reduce service brake torque linearly between FadeStartTemp and FadeFullTemp
+            FadeStartTemp   = 400, FadeFullTemp = 750, -- degrees Celsius
+            MinFadeMult     = 0.45,              -- Minimum brake torque fraction at full fade
+        },
+    },
+    {
+        file = "simcadebase/addons/seat_indicator.txt",
+        enabled = true, -- LVS-style seat indicator (billboard text + 3D Bezier + ghost glow; no HUD/enterVehicle permission needed)
+        options = {
+            AutoDetectSeats        = true,  -- Auto-find constrained/parented passenger seats on Base (or wire PassengerSeats Array to override)
+            MaxDistance            = 130,   -- Max distance (units) to show seat indicator
+            AimRadius              = 24,    -- Ray-to-seat-center tolerance (units)
+            ThroughWalls           = true,  -- Render through vehicle bodywork ($ignorez)
+            ShowLabel              = true,  -- Floating "[E] Enter / Driver" billboard (uses render.offscreen, no HUD permission)
+            ShowCurve              = true,  -- Animated LVS-style 3D cubic Bezier curve
+            ShowSeatGhost          = true,  -- Pulsing translucent highlight on the targeted seat
+            ShowOccupied           = true,  -- Show "OCCUPIED" indicator on occupied seats
+            CurveSegments          = 24,    -- Fixed holo pool size for the 3D Bezier curve
+            LabelOffsetZ           = 16,    -- Height above seat center for the floating label
+            AllowEnterVehicle      = false, -- Press [E] while aiming at a seat to enter via enterVehicle (when permitted)
+            RequestEnterPermission = false, -- Prompt once for player.enterVehicle permission if not yet granted
+            -- SeatLabels          = { "Driver", "Shotgun", "Rear Left", "Rear Right" }, -- Optional custom names by seat order
+        },
+    },
+    {
+        file = "simcadebase/addons/vehicle_radio.txt",
+        enabled = true, -- rRadio-style vehicle radio with lazy-loaded country catalog + seamless Cabin <-> 3D audio
+        options = {
+            CatalogBaseURL       = "https://raw.githubusercontent.com/nokillnando/Starfall/main/simcadebase/addons/radio_catalog",
+            DriverOnly           = true,  -- Only the driver can change stations / volume / power
+            DefaultVolume        = 1.0,   -- Initial radio volume (1.0 = 100%)
+            MaxVolume            = 2.5,   -- Max volume boost (2.5 = 250% for quiet radio streams)
+            VolumeStep           = 0.10,  -- Volume step per RadioVolDown / RadioVolUp press
+            FullVolumeDistance   = 120,   -- 3D audio full-volume radius outside the vehicle (units)
+            MaxHearingDistance   = 950,   -- 3D audio max hearing distance outside the vehicle (units)
+            FalloffExponent      = 1.35,  -- Distance rolloff curve outside the vehicle
+            OcclusionEnabled     = true,  -- Attenuate 3D radio when behind walls/props
+            OcclusionGain        = 0.35,  -- Volume multiplier when occluded
+            SourceOffset         = Vector(0, 0, 20), -- Local offset on Base for 3D audio source
+            CrossfadeTime        = 0.35,  -- Fade duration (seconds) when switching or stopping stations
+            ShowNowPlayingHUD    = true,  -- Compact now-playing bar + 5-bar FFT equalizer in vehicle
+            HUDAutoHideSeconds   = 5.0,   -- Auto-hide HUD bar after N seconds (0 = always visible in vehicle)
+            ShowChipPermHint     = true,  -- Show floating "[E] Chip to Hear Radio" hint above chip for nearby players lacking permission
+            RequestHUDPermission = true,  -- Prompt once for render.hud permission when opening the menu
+            EnableChatCommand    = true,  -- Allow driver to use !radio <url> [name], !radio stop, !radio vol <0-100>
+        },
+    },
+}
+
+-- Existing inline hook tables can also be used alongside file modules.
+CONFIG.ADDONS = {}
+
+-- ============================================================================
+-- 8. Controls, System, Networking & Auto-Update
+-- ============================================================================
+
+CONFIG.CONTROLS_CFG = {
+    -- Driving & pedals
+    FullThrottle  = IN_KEY.SPEED,   -- Hold with W for 100% throttle (W alone = 50%)
+    Handbrake     = IN_KEY.JUMP,    -- Handbrake
+    ParkingBrake  = KEY.J,          -- Toggle Parking Brake (stays engaged without holding Space)
+    Clutch        = IN_KEY.WALK,    -- Clutch pedal
+    JakeBrake     = KEY.L,          -- Cycle Jake / Exhaust Brake stages (when JakeBrakeEnabled = true)
+
+    -- Gearbox & differentials
+    ManualToggle  = KEY.M,          -- Toggle Automatic / Manual gearbox
+    GearUp        = IN_KEY.ATTACK,  -- Next PRND range or manual upshift (M1)
+    GearDown      = IN_KEY.ATTACK2, -- Previous PRND range or manual downshift (M2)
+    GearReset     = KEY.R,          -- Reset gear to Neutral while in Manual mode
+    FrontLock     = KEY.I,          -- Toggle Front Diff Lock (when DiffLockToggleable = true)
+    RearLock      = KEY.K,          -- Toggle Rear Diff Lock (when DiffLockToggleable = true)
+    AllLock       = KEY.L,          -- Toggle All / Center Diff Lock (when DiffLockToggleable = true)
+
+    -- Vehicle utilities
+    Ignition      = KEY.F,          -- Ignition / hold to crank starter
+    Headlights    = KEY.H,          -- Cycle Headlights (Off / Low / High)
+    CameraToggle  = KEY.V,          -- Cycle Camera mode (Chase / FPV / Off)
+    Horn          = KEY.G,          -- Hold to sound horn (uses SOUND_CFG.Horn)
+
+    -- Vehicle radio addon
+    RadioMenu     = KEY.N,          -- Open / close Vehicle Radio station selector
+    RadioToggle   = KEY.B,          -- Toggle Vehicle Radio On / Off
+    RadioVolDown  = KEY.COMMA,      -- Decrease Vehicle Radio volume
+    RadioVolUp    = KEY.PERIOD,     -- Increase Vehicle Radio volume
+}
+
+CONFIG.CORE_UPDATE = {
+    enabled = true,
+    baseURL = "https://raw.githubusercontent.com/nokillnando/Starfall/main/simcadebase/releases", -- The loader appends /latest.txt
+    format  = "source", -- Reuse matching local files when the release includes a source index
+}
+
+-- Simulation, networking and Wire integration
+CONFIG.VEHICLE_CFG.DriverPrediction            = true  -- Predict the driver's Simcade gauges, sounds and tire effects
+CONFIG.VEHICLE_CFG.UpdateRate                  = 20    -- Target physics rate (Hz); 30Hz prevents Starfall 6000us CPU spikes
+CONFIG.VEHICLE_CFG.NetworkRate                 = 20    -- Target active telemetry rate per stream (Hz), limited by physics ticks and available bytes
+CONFIG.VEHICLE_CFG.NetworkBudgetBytesPerSecond = 4300  -- Server telemetry budget per chip (bytes/s; 4300 fits default 5 kB/s servers). 0 disables telemetry.
+CONFIG.VEHICLE_CFG.MaxCPUPercent               = 75    -- Above this %, reduce substeps & skip non-critical FX
+CONFIG.VEHICLE_CFG.ConstraintRefreshInterval   = 60.0  -- Re-scan base constraints, parents & children this often (seconds)
+CONFIG.VEHICLE_CFG.enableExternalWireOverrides = false
+CONFIG.VEHICLE_CFG.detailedWheelWireOutputs    = false -- Enable raw steering input, individual steer angles and per-wheel telemetry arrays
+
+-- ============================================================================
+-- 9. Advanced & Shared Presets (Rarely Changed Per Vehicle)
+-- ============================================================================
+
+-- ----------------------------------------------------------------------------
+-- 9.1 Wheel Traces, Curb Response & Suspension Audio
+-- ----------------------------------------------------------------------------
+CONFIG.SUSPENSION_CFG.useTreadTrace        = true  -- Sample the curved tread across the configured wheel width
+CONFIG.SUSPENSION_CFG.treadRayCount        = 6     -- Number of curved-tread rays per wheel when useTreadTrace = true (1..25; auto-positioned across tire arc & width).
+                                                   -- 1 = center only (fastest), 3 = front/center/rear arc, 5 = cross, 7 = staggered corners,
+                                                   -- 9 = default 3x3 curved tread, 15 = 5x3 high-res, 25 = 5x5 ultra-res.
+                                                   -- Flat open roads use a 2-trace broadphase fast-path; full ray count only runs on curbs, slopes, or with DEBUG_CFG.suspensionRays.
+CONFIG.SUSPENSION_CFG.useHullTrace         = false -- Enable to override tread sampling with the legacy square hull
+CONFIG.SUSPENSION_CFG.curbTripEnabled      = true  -- Extra curb resistance and jolt. Wheel-wall contact also works with this disabled.
+CONFIG.SUSPENSION_CFG.curbClimbRatio       = 0.42  -- Fraction of wheel radius a tire can climb before catching
+CONFIG.SUSPENSION_CFG.curbMinHeight        = 1.75  -- Minimum rise in Source units for a curb jolt. The larger of this and radius * curbClimbRatio applies.
+CONFIG.SUSPENSION_CFG.curbProbeHeightRatio = 0.14  -- Lower curb probe height as fraction of wheel radius
+CONFIG.SUSPENSION_CFG.curbProbeMaxHeight   = 4.5   -- Max height (units) above ground for lower probe (so big wheels still catch curbs)
+CONFIG.SUSPENSION_CFG.curbProbeDistMult    = 1.00  -- Scale the forward tread and lateral half-width probe reach
+CONFIG.SUSPENSION_CFG.curbWallHeightRatio  = 0.82  -- Obstacles taller than this fraction of wheel radius act as walls
+CONFIG.SUSPENSION_CFG.curbWallImpulseMult  = 0.80  -- Per-wheel horizontal wall-block impulse multiplier
+CONFIG.SUSPENSION_CFG.curbSideImpulseMult  = 0.25  -- Per-wheel lateral curb catch strength
+CONFIG.SUSPENSION_CFG.curbVerticalHopMult  = 0.02  -- Per-wheel upward suspension jolt on sideways curb impact
+CONFIG.SUSPENSION_CFG.curbSideAlignMin     = 0.45  -- Min sideways alignment (0..1) to trigger curb trip
+CONFIG.SUSPENSION_CFG.curbCooldown         = 0.16  -- Min seconds between upward jolts on distinct curb strikes
+CONFIG.SUSPENSION_CFG.curbMinSpeed         = 90    -- Min inward speed for the lateral jolt; sidewall resistance also works below this
+CONFIG.SUSPENSION_CFG.curbFwdEnabled       = true  -- Enable forward/backward curb bump jolt
+CONFIG.SUSPENSION_CFG.curbFwdImpulseMult   = 0.00  -- Extra braking on a rolling curb strike; 0 disables this resistance
+CONFIG.SUSPENSION_CFG.curbFwdHopMult       = 3.64  -- Rolling curb kick; above 1 also scales hop height, limited by approach speed and curb size
+CONFIG.SUSPENSION_CFG.curbFwdMinSpeed      = 80    -- Min speed into curb (in/s, ~4.5 mph) to trigger forward/backward jolt
+
+-- Suspension sound triggers & impact audio
+CONFIG.SUSPENSION_CFG.SuspensionSounds = {
+    enabled       = true,
+    minBumpVel    = 45,   -- Min upward compression speed (in/s) to trigger bumpstop sound
+    maxBumpVel    = 260,  -- Speed (in/s) for full bumpstop sound volume
+    minDroopVel   = 125,  -- Min downward extension speed (in/s) to trigger droop sound
+    maxDroopVel   = 280,  -- Speed (in/s) for full droop sound volume
+    bumpCooldown  = 0.15, -- Min seconds between bumpstop sounds per wheel
+    droopCooldown = 0.35, -- Min seconds between droop sounds per wheel
+}
+
+CONFIG.SOUND_CFG.WebLoadMode      = "stream"   -- "stream" (bass.loadURL) or "download" (http.get + file.writeTemp + bass.loadFile); overridable per entry via loadMode
+CONFIG.SOUND_CFG.BassAnchorMode   = "overhead" -- "overhead" (Fake-2D overhead anchor to reduce BASS 3D speed stutter) or "world" (raw 3D at vehicle)
+CONFIG.SOUND_CFG.BassMinDist      = 200        -- Distance where overhead BASS sounds stay at 100% volume
+CONFIG.SOUND_CFG.BassMaxDist      = 1500       -- Distance where overhead BASS sounds fade to 0% volume
+CONFIG.SOUND_CFG.BassAnchorRadius = 950        -- Overhead offset from listener (within Starfall setFade min=1000)
+
+CONFIG.SOUND_CFG.SuspensionBump = { -- Upward compression limit hit (supports single sndsource or variants = { ... })
+    enabled  = true,
+    loadMode = "stream",
+    variants = {
+        { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/misc/suspsounds/suspension_velocity_2_variation_3.ogg", volume = 2.20, pitchMin = 0.90, pitchMax = 1.10 },
+        { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/misc/suspsounds/suspension_velocity_1_variation_4.ogg", volume = 2.65, pitchMin = 0.92, pitchMax = 1.15 },
+    },
+}
+
+CONFIG.SOUND_CFG.SuspensionDroop = { -- Downward droop limit hit (supports single sndsource or variants = { ... })
+    enabled  = true,
+    loadMode = "stream",
+    variants = {
+        { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/misc/suspsounds/car_susp_creak_03.ogg", volume = 0.75, pitchMin = 0.95, pitchMax = 1.12 },
+        { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/misc/suspsounds/car_susp_creak_04.ogg", volume = 0.65, pitchMin = 0.95, pitchMax = 1.18 },
+    },
+}
+
+-- ----------------------------------------------------------------------------
+-- 9.2 Tire Compounds & Road Surface Presets
+-- ----------------------------------------------------------------------------
+-- Source Engine MatType IDs (shared by Tire, Sound, Skidmark & Effect surface tables)
 local MAT_CONCRETE   = 67
 local MAT_DIRT       = 68
 local MAT_FLESH      = 70
@@ -259,83 +975,57 @@ local MAT_WOOD       = 87
 local MAT_DEFAULT    = 88
 local MAT_GLASS      = 89
 
-CONFIG.TIRE_CFG = {
-    DefaultCompound      = "Sport",   -- "Slick", "Sport", "Comfort", "Drift", "Rally"
-    UseDirectMultipliers = true,
-    Grip                 = 1.00,      -- Global tire grip multiplier
-    LateralGrip          = 1.00,      -- Lateral cornering grip multiplier
-    LongitudinalGrip     = 1.00,      -- Acceleration/braking grip multiplier
-    GripDampingFactor    = 1.18,
-    RollingResistance      = 0.015,     -- Rolling drag coefficient
-    ConstraintRefreshInterval = 60.0, -- Re-scan base constraints, parents & children this often (seconds)
+-- B controls initial stiffness, C controls shape, E controls curvature.
+-- CoF sets peak grip. Lateral input is slip angle (rad), longitudinal input is slip ratio.
+-- offroadRetain (0..1) controls how much grip the compound recovers on loose surfaces.
+-- Higher values recover more. At 0.02 or below, eligible off-road surfaces get an extra slick-tire penalty.
+-- Ice and explicit { lat, lon } surface multipliers use their configured grip directly.
+-- Each compound or Front/Rear can also set RollingResistance,
+-- SurfaceMultipliers = { ice = { lat = 0.12, lon = 0.14 }, [MAT_DIRT] = 0.7 },
+-- and SurfaceRollingResistance = { ice = 1.0, [MAT_DIRT] = 2.4 }.
+-- Override order (highest first): vehicle axle, compound.Front/Rear, compound, global.
+-- Example inside Rally: Rear = { SurfaceRollingResistance = { [MAT_DIRT] = 1.8 } },
+-- Front.Compound and Rear.Compound optionally pin an axle to a specific compound.
+CONFIG.TIRE_CFG.Compounds = {
+    Comfort = { CoF = 1.15, Lat_B =  8.0, Lat_C = 1.30, Lat_E = 0.10, Long_B = 10.0, Long_C = 1.50, Long_E = 0.40, LoadSens = 0.10, offroadRetain = 0.25 },
+    Sport   = { CoF = 1.72, Lat_B =  9.0, Lat_C = 1.75, Lat_E = 0.20, Long_B =  2.0, Long_C = 1.95, Long_E = 0.30, LoadSens = 0.10, offroadRetain = 0.15 },
+    Slick   = { CoF = 2.15, Lat_B = 12.0, Lat_C = 1.40, Lat_E = 0.10, Long_B = 14.0, Long_C = 1.60, Long_E = 0.60, LoadSens = 0.08, offroadRetain = 0.00 },
+    Rally   = { CoF = 1.52, Lat_B =  9.0, Lat_C = 1.45, Lat_E = 0.10, Long_B = 11.0, Long_C = 1.50, Long_E = 0.50, LoadSens = 0.08, offroadRetain = 0.95 },
+    Drift   = { CoF = 1.02, Lat_B =  8.5, Lat_C = 1.25, Lat_E = 0.25, Long_B = 11.0, Long_C = 1.45, Long_E = 0.50, LoadSens = 0.10, offroadRetain = 0.20 },
+}
 
-    Front = {
-        Width            = 185,
-        Aspect           = 55,        -- Sidewall profile % (50 = baseline; lower = stiffer/snappier Lat_B & Long_B, higher = softer)
-        LateralGrip      = 1.15,
-        LongitudinalGrip = 1.15,
-        GripBias         = 1.0,
-    },
-    Rear = {
-        Width            = 185,
-        Aspect           = 55,
-        LateralGrip      = 1.15,
-        LongitudinalGrip = 1.0,
-        GripBias         = 1,
-    },
+CONFIG.TIRE_CFG.SurfaceMultipliers = {
+    [MAT_CONCRETE]   = 1.00, -- Road / Concrete
+    [MAT_TILE]       = 1.05, -- Smooth Tile / Tarmac
+    [MAT_WOOD]       = 0.90, -- Wood
+    [MAT_METAL]      = 0.85, -- Metal
+    [MAT_GRATE]      = 0.80, -- Metal Grate
+    [MAT_VENT]       = 0.80, -- Metal Vent
+    [MAT_GLASS]      = 0.85, -- Glass
+    [MAT_SNOW]       = 0.30, -- Snow
+    [MAT_DIRT]       = 0.60, -- Dirt
+    [MAT_SAND]       = 0.50, -- Sand / Gravel
+    [MAT_GRASS]      = 0.55, -- Grass
+    [MAT_FOLIAGE]    = 0.60, -- Foliage
+    [MAT_FLESH]      = 0.40, -- Flesh
+    [MAT_ALIENFLESH] = 0.40, -- Alien Flesh
+    [MAT_PLASTIC]    = 1.00, -- Plastic
+    [MAT_COMPUTER]   = 0.95, -- Hard Brush / Computer
+    Default          = 1.00,
+}
 
-    -- B controls initial stiffness, C controls shape, E controls curvature.
-    -- CoF sets peak grip. Lateral input is slip angle (rad), longitudinal input is slip ratio.
-    -- offroadRetain (0..1) controls how much grip the compound recovers on loose surfaces.
-    -- Higher values recover more. At 0.02 or below, eligible off-road surfaces get an extra slick-tire penalty.
-    -- Ice and explicit { lat, lon } surface multipliers use their configured grip directly.
-    -- Each compound or Front/Rear can also set RollingResistance,
-    -- SurfaceMultipliers = { ice = { lat = 0.12, lon = 0.14 }, [MAT_DIRT] = 0.7 },
-    -- and SurfaceRollingResistance = { ice = 1.0, [MAT_DIRT] = 2.4 }.
-    -- Override order (highest first): vehicle axle, compound.Front/Rear, compound, global.
-    -- Example inside Rally: Rear = { SurfaceRollingResistance = { [MAT_DIRT] = 1.8 } },
-    -- Front.Compound and Rear.Compound optionally pin an axle to a specific compound.
-    Compounds = {
-        Comfort = { CoF = 1.15, Lat_B =  8.0, Lat_C = 1.30, Lat_E = 0.10, Long_B = 10.0, Long_C = 1.50, Long_E = 0.40, LoadSens = 0.10, offroadRetain = 0.25 },
-        Sport   = { CoF = 1.72, Lat_B = 9.0, Lat_C = 1.75, Lat_E = 0.20, Long_B = 2.0, Long_C = 1.95, Long_E = 0.30, LoadSens = 0.10, offroadRetain = 0.15 },
-        Slick   = { CoF = 2.15, Lat_B = 12.0, Lat_C = 1.40, Lat_E = 0.10, Long_B = 14.0, Long_C = 1.60, Long_E = 0.60, LoadSens = 0.08, offroadRetain = 0.00 },
-        Rally   = { CoF = 1.52, Lat_B =  9.0, Lat_C = 1.45, Lat_E = 0.10, Long_B = 11.0, Long_C = 1.50, Long_E = 0.50, LoadSens = 0.08, offroadRetain = 0.95 },
-        Drift   = { CoF = 1.02, Lat_B =  8.5, Lat_C = 1.25, Lat_E = 0.25, Long_B = 11.0, Long_C = 1.45, Long_E = 0.50, LoadSens = 0.10, offroadRetain = 0.20 },
-    },
-    Formula = { CamberStiffness = 0.65 }, -- Small-angle thrust per radian as a fraction of peak lateral force
-
-    SurfaceMultipliers = {
-        [MAT_CONCRETE]   = 1.00, -- Road / Concrete
-        [MAT_TILE]       = 1.05, -- Smooth Tile / Tarmac
-        [MAT_WOOD]       = 0.90, -- Wood
-        [MAT_METAL]      = 0.85, -- Metal
-        [MAT_GRATE]      = 0.80, -- Metal Grate
-        [MAT_VENT]       = 0.80, -- Metal Vent
-        [MAT_GLASS]      = 0.85, -- Glass
-        [MAT_SNOW]       = 0.30, -- Snow
-        [MAT_DIRT]       = 0.60, -- Dirt
-        [MAT_SAND]       = 0.50, -- Sand / Gravel
-        [MAT_GRASS]      = 0.55, -- Grass
-        [MAT_FOLIAGE]    = 0.60, -- Foliage
-        [MAT_FLESH]      = 0.40, -- Flesh
-        [MAT_ALIENFLESH] = 0.40, -- Alien Flesh
-        [MAT_PLASTIC]    = 1.00, -- Plastic
-        [MAT_COMPUTER]   = 0.95, -- Hard Brush / Computer
-        Default          = 1.00,
-    },
-    SurfaceRollingResistance = {      -- Per-material rolling resistance multipliers (scales RollingResistance)
-        [MAT_CONCRETE]   = 1.00,
-        [MAT_TILE]       = 1.00,
-        [MAT_METAL]      = 1.00,
-        [MAT_WOOD]       = 1.50,
-        [MAT_GRATE]      = 1.40,
-        [MAT_DIRT]       = 6.00,
-        [MAT_GRASS]      = 5.50,
-        [MAT_SNOW]       = 8.00,
-        [MAT_SAND]       = 10.00,
-        [MAT_SLOSH]      = 10.00, -- Water
-        Default          = 1.00,
-    },
+CONFIG.TIRE_CFG.SurfaceRollingResistance = { -- Per-material rolling resistance multipliers (scales RollingResistance)
+    [MAT_CONCRETE]   = 1.00,
+    [MAT_TILE]       = 1.00,
+    [MAT_METAL]      = 1.00,
+    [MAT_WOOD]       = 1.50,
+    [MAT_GRATE]      = 1.40,
+    [MAT_DIRT]       = 6.00,
+    [MAT_GRASS]      = 5.50,
+    [MAT_SNOW]       = 8.00,
+    [MAT_SAND]       = 10.00,
+    [MAT_SLOSH]      = 10.00, -- Water
+    Default          = 1.00,
 }
 
 -- Add a named entry here. By default its key matches the exact physics property
@@ -387,488 +1077,77 @@ CONFIG.SURFACE_PROFILES = {
     },
 }
 
-CONFIG.AERO_CFG = {
-    FrontAeroFactor     = 0.0,        -- Downforce coefficient (fraction of vehicle weight at 100 mph)
-    RearAeroFactor      = 7.0,
-    DragCoeff           = 0.22,
-    FrontalAreaM2       = 1.65,
-    WaterDragEnabled    = true,       -- Slow down when submerged in water
-    WaterDragMultiplier = 0.015,        -- Hydrodynamic water drag strength
-}
-
--- ============================================================================
--- Engine, transmission and reverse
--- ============================================================================
-
-CONFIG.ENGINE_CFG = {
-    -- ------------------------------------------------------------------------
-    -- 1. Engine & Powerband
-    -- ------------------------------------------------------------------------
-    EngineType         = "gasoline", -- "gasoline" | "diesel" (unthrottled fuel metering, smooth governor, no BOV/vacuum, boost smoke limit)
-    DisplacementLiters = 1.6,
-    PeakHP             = 118,
-    PeakTorqueNm       = 152,
-    -- Optional exact curve: { { rpm = ..., torqueNm = ... }, ... }; overrides the generated curve and peak values.
-    -- Add points at the desired torque peak and any sharp high-RPM drop. RPMs must be
-    -- increasing and stay between idleRPM and limiterRPM; endpoint torque is held outside them.
-    -- TorqueCurve = {
-    --     { rpm = 950,  torqueNm = 280 },
-    --     { rpm = 1500, torqueNm = 420 },
-    --     { rpm = 2500, torqueNm = 500 },
-    --     { rpm = 3500, torqueNm = 420 },
-    --     { rpm = 4500, torqueNm = 300 },
-    --     { rpm = 6500, torqueNm = 180 },
-    --     { rpm = 7500, torqueNm = 100 },
-    -- },
-    Cylinders          = 4,
-    idleRPM            = 950,
-    PowerbandStartRPM  = 2600,      -- RPM where engine comes "on cam" / enters powerband
-    PowerbandRiseSharpness = 1.0,   -- Generated curve only; 1 = smooth, >1 brings torque in sooner (minimum 0.25)
-    PowerbandEndRPM    = 6850,      -- Must be >= peakPowerRPM and < limiterRPM for PowerbandDropSharpness to take effect
-    PowerbandDropSharpness = 1.0,   -- Generated curve only; 1 = linear, >1 drops faster (minimum 0.25)
-    -- Optional fine shaping for generated curves: Powerband = { lowEndScale = 0.60, topEndScale = 0.78 },
-    ConstrainGeneratedPeakHP = false, -- Generated curve only: cap high-RPM torque to the requested PeakHP envelope
-    WarnEngineCurveMismatch  = true,  -- Log once at init if requested torque/power/RPM targets conflict or are clamped
-    peakTorqueRPM      = 5200,
-    peakPowerRPM       = 6600,
-    redlineRPM         = 7200,
-    limiterRPM         = 7350,      -- Must be >= redlineRPM (values below redlineRPM are clamped up to redlineRPM)
-    revLimitDrop       = 280,       -- RPM drop below limiterRPM before ignition returns (0 = pure time-based cut, 60-120 = rapid race bounce, 250-500+ = deep drop)
-    revLimitDelay      = 0.04,      -- Minimum ignition-cut hold time in seconds (e.g. 0.01-0.03 = ultra-quick race cut, 0.04-0.12 = slower/heavier cut)
-    RevLimiterMode     = "hard",    -- "hard" (ignition cut bounce) | "soft" (progressive torque taper before hard ceiling backstop)
-    RevLimiterSoftWindowRPM = 250,  -- RPM window below limiterRPM where soft-cut taper ramps down (when RevLimiterMode = "soft")
-    RevLimiterSoftMinTorque = 0.05, -- Residual torque fraction at the top of the soft-cut ramp before hard cut catches
-    -- Diesel-only tuning (used when EngineType = "diesel"; ignored on gasoline engines)
-    DieselGovernorWindowRPM = nil,  -- Smooth fuel-taper governor window below limiterRPM (nil = auto ~12% of RPM span)
-    DieselSmokeLimit        = 0.25, -- Off-boost AFC fuel cap when Turbo = true (0..0.65; 0 disables off-boost limiting)
-    DieselCoastBrakeScale   = 0.55, -- Natural unthrottled coast braking fraction (diesels lack throttle-plate vacuum drag)
-    flywheelInertia    = nil,       -- Rotational inertia (kg·m²; nil/0 = auto from displacement & cylinders). Lower = faster rev up & down (0.03-0.08 race, 0.10-0.22 street, 0.25-0.45+ heavy; clamped 0.03..1.50)
-
-    -- ------------------------------------------------------------------------
-    -- 2. Ignition, Starter & Idle (Sim-Engine 4-state: 0=Off, 1=Ignition On, 2=Cranking, 3=Catch)
-    -- ------------------------------------------------------------------------
-    StartRunning       = false,
-    crankRPM           = 320,
-    crankTime          = 0.65,
-    PhysicalStarter    = true,     -- Opt-in torque-based starter motor & RPM catch threshold (false keeps timed crankTime)
-    StarterTorqueNm    = nil,       -- Starter torque at flywheel in Nm (nil/0 = auto-sized to hold ~crankRPM against compression drag)
-    StarterCatchRPM    = 260,       -- Minimum crank RPM required for combustion to catch (when PhysicalStarter = true)
-    StarterCatchTime   = 0.25,      -- Seconds held >= StarterCatchRPM before engine catches (when PhysicalStarter = true)
-    BumpStartEnabled   = true,      -- Allow push/bump-starting when Ignition is ON (state 1) and rolling in gear spins the engine
-    BumpStartRPM       = nil,       -- Min wheel-driven RPM to bump-start (nil = auto above StallRPM, ~55-65% of idleRPM)
-    BumpStartTime      = 0.22,      -- Seconds held >= BumpStartRPM before the engine catches while rolling in gear
-    PhysicalIdle       = true,     -- Opt-in bounded idle torque controller & engine stalling (false preserves legacy idleRPM floor)
-    IdleControllerGain = 0.0018,    -- Proportional idle torque gain per RPM of droop below idleRPM (when PhysicalIdle = true)
-    IdleMaxTorqueFrac  = 0.28,      -- Max fraction of idle torque curve the idle controller can add above self-sustain (0..0.75)
-    StallRPM           = 450,       -- RPM below which the engine stalls if held for StallDelay seconds (when PhysicalIdle = true)
-    StallDelay         = 0.35,      -- Seconds below StallRPM before combustion shuts down (ignition stays ON for immediate re-crank)
-
-    -- ------------------------------------------------------------------------
-    -- 3. Transmission & Gear Ratios
-    -- ------------------------------------------------------------------------
-    isAutomatic         = true,
-    ClassicAuto         = false,      -- Start in Park. GearUp/GearDown step through P, R, N, D. False enables pedal-selected direction.
-    SpeedToReverse      = 5,         -- km/h limit for selecting Park or Reverse
-    ReverseWSonReverse  = false,      -- In PRND Reverse, S accelerates and W brakes. False keeps W as throttle.
-    AlwaysSportMode     = true,
-    ComfortUpshiftRPM   = 62,        -- % of redline
-    ComfortDownshiftRPM = 34,
-    SportUpshiftRPM     = 98,
-    SportDownshiftRPM   = 55,
-    shiftDelay          = 0.34,
-    DownshiftCooldown   = 1.15,
-    finalDrive          = 3.511,
-    AutoCalibrateFinalDrive = true,    -- false = pure mechanical finalDrive; true = scale finalDrive to hit top ForwardGearSpeeds at redline
-    AutoCalibrateRatiosFromSpeeds  = true, -- true = auto-calculate gear ratios from Forward/ReverseGearSpeeds, redlineRPM & finalDrive
-    ForwardGearRatios   = { 3.321, 1.902, 1.308, 1.000, 0.759 }, -- Unlimited forward gears
-    ForwardGearSpeeds   = { 51, 89, 128, 165, 205 },  -- Add one speed per gear when auto-calibrating ratios
-    ReverseGearRatios   = { -3.38},                            -- Unlimited reverse gears (e.g. { -3.58, -2.10 })
-    ReverseGearSpeeds   = { 33 },   -- Add one speed per reverse gear when auto-calibrating ratios
-
-
-    -- ------------------------------------------------------------------------
-    -- 4. Differentials & Torque Vectoring
-    -- ------------------------------------------------------------------------
-    PowerDistribution   = 100,         -- 0 = RWD, 100 = FWD, 50 = AWD, 35 = 35/65 AWD
-    DrivetrainEfficiency = nil,        -- Flywheel-to-wheel torque efficiency (0.50..1.00; nil = auto: 0.88 FWD, 0.85 RWD, 0.82 AWD; 1.0 = lossless)
-    FrontDiffType       = 0,           -- 0 = Open, 1 = LSD (torque + viscous), 2 = Locked
-    FrontLSDStiffness   = 3.0,         -- Front LSD viscous speed-diff ramp (higher = locks faster on wheel speed diff)
-    FrontLSDLockRatio   = 0.75,        -- Front LSD max viscous lock ratio (0..1)
-    FrontLSDPreload     = 15,          -- Front LSD static preload locking torque (Nm)
-    FrontLSDAccelLock   = 0.65,        -- Front LSD torque-sensitive lock under drive (0..1; 1-way/1.5-way/2-way accel ramp)
-    FrontLSDDecelLock   = 0.25,        -- Front LSD torque-sensitive lock on coast/overrun (0..1; 0 = 1-way, <accel = 1.5-way, =accel = 2-way)
-    RearDiffType        = 0,           -- 0 = Open, 1 = LSD (torque + viscous), 2 = Locked
-    RearLSDStiffness    = 3.0,         -- Rear LSD viscous speed-diff ramp (higher = locks faster on wheel speed diff)
-    RearLSDLockRatio    = 0.75,        -- Rear LSD max viscous lock ratio (0..1)
-    RearLSDPreload      = 15,          -- Rear LSD static preload locking torque (Nm)
-    RearLSDAccelLock    = 0.65,        -- Rear LSD torque-sensitive lock under drive (0..1)
-    RearLSDDecelLock    = 0.25,        -- Rear LSD torque-sensitive lock on coast/overrun (0..1)
-    CenterDiffType      = 0,           -- 0 = Open, 1 = LSD, 2 = Locked (AWD)
-    DiffLockToggleable  = false,       -- Allow K/L/J keys to toggle Front/Rear/All diff locks
-
-    -- ------------------------------------------------------------------------
-    -- 5. Clutch & Braking (Engine Braking, Service Brakes, ABS, Handbrake)
-    -- ------------------------------------------------------------------------
-    engineBrakeTorque      = 45,        -- Base engine braking torque (Nm; higher = stronger off-throttle decel)
-    EngineBrakeMult        = 1.0,       -- Multiplier for base and manual over-rev engine braking (0 = freewheel, 1 = normal, 2+ = strong)
-    EngineBrakeThrottleFade = 0.15,     -- Throttle fraction (0.02..1.0) over which closed-throttle engine braking fades out
-    JakeBrakeEnabled       = false,     -- Enable driver-toggleable compression-release / exhaust brake (CONTROLS_CFG.JakeBrake)
-    JakeBrakeStages        = 3,         -- Number of Jake brake stages (1 = Off/On, 3 = Off / Low / Med / High)
-    JakeBrakeMult          = 3.2,       -- Top-stage engine braking multiplier when off-throttle in gear above JakeBrakeMinRPM
-    JakeBrakeMinRPM        = nil,       -- Min RPM for Jake brake activation (nil = idleRPM + 300)
-    ThrottleResponseExp    =1.0,       -- Partial-throttle load curve (1.0 = linear, <1 = snappier tip-in, >1 = progressive; WOT unchanged)
-    ThrottleRPMScale       = 0.7,       -- RPM-dependent partial throttle (0 = off; 0.8-1.2 = stronger low-RPM tip-in, progressive high-RPM; WOT unchanged)
-    ClutchType             = "friction", -- "friction" | "torque_converter" | "centrifugal"
-    ClutchMaxTorqueNm      = nil,       -- Dry-plate clutch clamping capacity in Nm (nil = auto ~1.85x peak torque with boost headroom)
-    ThrottleRiseTime       = 0.05,     -- Throttle response time constant in seconds. 0 uses the standard pedal response.
-    ClutchEngageTime       = 0,     -- Friction clutch take-up time in seconds. 0 uses the standard engagement behavior.
-    HardRPMLimit           = false, -- Enable to cap RPM during wheel-driven overrun.
-    ClutchLerp             = 0.40,
-    ClutchLerpReverse      = 0.50,
-    UseClutchLerpInManual  = true,
-    -- Torque Converter settings (used when ClutchType = "torque_converter")
-    TC_StallRPM            = 2200,       -- Nominal stall speed (RPM); calibrates hydrodynamic K-factor (higher torque naturally raises stall)
-    TC_MaxMult             = 2.0,        -- Peak torque multiplication at stall
-    TC_CouplingRatio       = 0.85,       -- Turbine/impeller speed ratio where multiplication ends
-    TC_LockupRPM           = 3200,       -- Lockup threshold RPM (0 = disable lockup)
-    TC_CreepTorque         = 0.12,       -- Idle creep scale (0.12 = normal; 0 disables idle creep)
-    -- Centrifugal Clutch settings (used when ClutchType = "centrifugal")
-    CentrifugalEngageRPM   = 1800,       -- RPM where clutch shoes begin engaging
-    CentrifugalFullRPM     = 3200,       -- RPM where clutch reaches 100% lock
-    StoppedPhaseBrakeSpeed = 5,
-    brakeTorque            = 750,
-    frontBrakeBias         = 0.62,
-    BurnoutAssist          = false,     -- True releases rear service brakes when holding throttle + brake at low speed; false allows normal left-foot braking
-    BrakeHighSpeedScale    = 1.0,       -- Brake torque multiplier at BrakeHighSpeedRefKMH (e.g. 0.60 = 40% less brake force at 200 km/h)
-    BrakeHighSpeedStartKMH = 80,        -- Speed (km/h) below which braking stays at 100%
-    BrakeHighSpeedRefKMH   = 200,       -- Speed (km/h) where BrakeHighSpeedScale is reached
-    ABSEnabled             = true,      -- Enable Anti-lock Braking System above ~8 km/h
-    ABSLockThreshold       = 0.16,      -- Slip ratio (0..1) where ABS triggers: 0.08-0.16 = tight (no skids), 0.25-0.35 = street, >=0.45 = loose (allows lockup)
-    ABSPulseRate           = 14,        -- ABS release/apply cycles per second (Hz); higher = smoother pedal modulation
-    ABSReleaseRatio        = 0.15,      -- Brake torque fraction kept during release pulse (0.05-0.25 = clean release, >=0.65 = weak release/allows lockup)
-    HandbrakeTorque        = 2400,      -- Rear handbrake torque (Nm)
-    HandbrakeLockWheels    = true,      -- Lock rear wheels immediately when handbrake is pulled
-    ParkingBrakeToggle     = true,      -- Allow toggling the parking brake on/off with CONTROLS_CFG.ParkingBrake
-    AutoReleaseParkingBrake = true,     -- Automatically release the toggled parking brake when pressing throttle
-    AutoHoldBrake          = false,     -- Automatically hold the parking brake while stopped (releases on throttle)
-    AutoHoldBrakeSpeed     = 3,         -- Max speed (km/h) at which AutoHoldBrake engages when off-throttle
-    AutoHandbrakeOnExitSpeed = 15,      -- Auto-engage handbrake when driver exits at <= this speed (km/h; 0 = off)
-
-    -- ------------------------------------------------------------------------
-    -- 6. Forced Induction (exhaust-driven turbocharger & belt-driven supercharger)
-    -- ------------------------------------------------------------------------
-    -- Shared absolute reference pressure (PSI absolute) for pressure-ratio = (gaugePSI + ref) / ref.
-    -- 14.696 = standard sea-level atmosphere; legacy configs without this key fall back to 18.4.
-    Induction_ReferencePSI = 14.696,
-    ManifoldModel          = true, -- Opt-in intake manifold pressure (MAP) state: separates pre-throttle boost from post-throttle vacuum/load
-    ManifoldTimeConstant   = 0.06,  -- Manifold fill/empty time constant in seconds (0.005..0.50; lower = snappier throttle/lift response)
-    ManifoldIdleAbsPSI     = nil,   -- Closed-throttle idle MAP in PSI absolute (nil = ~5.0 PSI abs / -9.7 PSI vacuum @ sea level)
-    Turbo              = false,  -- Enable turbocharger torque and boost simulation
-    Turbo_PSIMax       = 12.0,   -- Compressor pressure ceiling (PSI gauge)
-    Turbo_StartRPM     = 2000,   -- Engine RPM where spool flow begins; not the RPM for full boost
-    -- Optional per-system override (omit to use Induction_ReferencePSI; legacy default was 18.4)
-    -- Turbo_AirPressure  = 18.4,
-    Turbo_MaxRPM       = 9000,   -- Calibrated turbo spool proxy limit (not literal ~150k turbine RPM)
-    Turbo_MaxFlow      = 9000,   -- Flow scale; higher values generally spool more slowly
-    Turbo_FlowScale    = 100,    -- Exhaust-flow drive strength; higher values spool faster
-    Turbo_DragScale    = 0.01,   -- Rotor drag; higher values reduce spool and speed up pressure decay
-    Turbo_Inertia      = 0.035,  -- Rotor inertia; lower values respond/spool faster
-    Turbo_Exp          = 1.0,    -- Flow response exponent; >1 delays low-flow spool, <1 builds it earlier
-    Turbo_CoastFlow    = 0.08,   -- Off-throttle exhaust-drive fraction (0..1); lower sheds boost faster on lift-off
-    Turbo_LoadExp      = 1.0,    -- Throttle-to-exhaust-drive exponent (0.1..3.0; 1 = linear, WOT unchanged)
-    Turbo_TorqueGain   = 0.80,   -- Scales pressure-ratio torque gain (0.80 @ 14.696 PSI matches legacy 1.0 @ 18.4 PSI; 0 disables)
-    Turbo_BOVThresholdPSI = 3.5, -- Minimum gauge PSI for the lift-off blow-off sound
-    -- Optional wastegate cap (PSI gauge); defaults to Turbo_PSIMax when omitted.
-    -- Turbo_WastegatePSI = 10.0,
-    -- Supercharger is independent; both systems may be enabled for compound/twincharging.
-    Supercharger = false,
-    Supercharger_Type = "centrifugal", -- Approximate response: "roots", "twin_screw", or "centrifugal"
-    Supercharger_MaxPSI = 8.0,          -- Maximum boost (PSI gauge) at Supercharger_RatedRPM
-    Supercharger_RatedRPM = 6500,       -- Engine RPM at which the configured maximum boost is reached
-    -- Optional per-system override (omit to use Induction_ReferencePSI; legacy default was 18.4)
-    -- Supercharger_AirPressure = 18.4,
-    -- Optional response-curve exponent; otherwise selected from Supercharger_Type.
-    -- Supercharger_PressureExp = 2.0,
-    Supercharger_TorqueGain   = 0.80,   -- Scales torque added by boost (0.80 @ 14.696 PSI matches legacy 1.0 @ 18.4 PSI; 0 disables)
-    Supercharger_DriveLoss    = 0.08,   -- Legacy multiplier loss at max boost (ignored when Supercharger_PhysicalLoss = true)
-    Supercharger_PhysicalLoss = false,  -- Opt-in crankshaft compressor-power loss model (replaces Supercharger_DriveLoss)
-    Supercharger_Efficiency   = 0.65,   -- Adiabatic compressor efficiency (0.25..0.95; used when Supercharger_PhysicalLoss = true)
-    Supercharger_BaseDragNm   = nil,    -- Residual mechanical/belt drag in Nm even when bypassed (nil = 4 Nm in physical mode, 0 in legacy mode)
-}
-
--- ============================================================================
--- Driver controls, camera and HUD
--- ============================================================================
-
-CONFIG.CONTROLS_CFG = {
-    ManualToggle  = KEY.M,            -- Toggle Automatic / Manual gearbox
-    GearReset     = KEY.R,            -- Reset gear to Neutral while in Manual mode
-    Ignition      = KEY.F,            -- Ignition / hold to crank starter
-    CameraToggle  = KEY.V,            -- Cycle Camera mode (Chase / FPV / Off)   
-    Headlights    = KEY.H,            -- Cycle Headlights (Off / Low / High)
-    FullThrottle  = IN_KEY.SPEED,     -- Hold with W for 100% throttle (W alone = 50%)
-    Handbrake     = IN_KEY.JUMP,      -- Handbrake
-    ParkingBrake  = KEY.J,            -- Toggle Parking Brake (stays engaged without holding Space)
-    JakeBrake     = KEY.X,            -- Cycle Jake / Exhaust Brake stages (when JakeBrakeEnabled = true)
-    Clutch        = IN_KEY.WALK,      -- Clutch pedal
-    GearUp        = IN_KEY.ATTACK,    -- Next PRND range or manual upshift (M1)
-    GearDown      = IN_KEY.ATTACK2,   -- Previous PRND range or manual downshift (M2)
-    FrontLock     = KEY.I,            -- Toggle Front Diff Lock (when DiffLockToggleable = true)
-    RearLock      = KEY.K,            -- Toggle Rear Diff Lock (when DiffLockToggleable = true)
-    AllLock       = KEY.L,            -- Toggle All / Center Diff Lock (when DiffLockToggleable = true)
-    Horn          = KEY.G,            -- Hold to sound horn (uses SOUND_CFG.Horn)
-    RadioMenu     = KEY.N,            -- Open / close Vehicle Radio station selector
-    RadioToggle   = KEY.B,            -- Toggle Vehicle Radio On / Off
-    RadioVolDown  = KEY.COMMA,        -- Decrease Vehicle Radio volume
-    RadioVolUp    = KEY.PERIOD,       -- Increase Vehicle Radio volume
-}
-
-CONFIG.CAMERA_CFG = {
-    enabled                 = true,
-    chaseEnabled            = true,
-    fpvEnabled              = true,
-    freecamEnabled          = false,     -- Optional 360° orbit freecam mode for driver (no auto-recenter)
-    defaultMode             = 1,         -- 0 = Off, 1 = Chase Cam, 2 = FPV, 3 = Freecam (Press [V] in seat to cycle)
-    maxDist                 = 190,
-    minDist                 = 160,
-    heightOffset            = 55,
-    pitchOffset             = 5,
-    angleResponsiveness     = 3.5,
-    posDamping              = 15,
-    centerForce             = 15,
-    boundaryForce           = 75,
-    lookAhead               = true,
-    lookAheadDist           = 200,
-    idleTimeout             = 2.0,
-    mouseSens               = 0.05,
-    doCollision             = true,
-    colMask                 = 131083,    -- World-only trace mask so vehicle body collision props don't push the camera inside
-    colExtra                = 8,
-    fpvOffset               = Vector(-10, 0, 28),
-
-    -- Passenger camera (auto-detects constrained/parented passenger seats on Base)
-    passengerCamEnabled     = true,      -- Enable custom camera for passengers (avoids Source cam colliding with body props)
-    passengerDefaultMode    = 1,         -- 0 = Off, 1 = Chase, 2 = FPV (seat-anchored), 3 = Freecam (360° orbit, no auto-recenter)
-    passengerChaseEnabled   = true,
-    passengerFreecamEnabled = true,
-    passengerFpvEnabled     = true,
-    passengerDist           = 190,       -- Initial orbit distance for passenger Freecam (scroll wheel zooms)
-    passengerHeightOffset   = 55,        -- Orbit center height above Base for passenger Chase/Freecam
-    passengerFpvOffset      = Vector(0, 0, 28), -- Eye offset from passenger seat in FPV
-}
-
-CONFIG.HUD_CFG = {
-    enabled      = true,             -- Master switch for vehicle HUD (speedo + addon HUDs)
-    showSpeedo   = false,             -- Set false to disable the default speed/RPM/gear HUD and use your own
-    debugEnabled = false,             -- Master switch for all debug/telemetry overlays (independent of HUD_CFG.enabled)
-}
-
--- Telemetry and debug overlays
-CONFIG.TIRE_CFG.ShowSuspensionRays  = false -- Draw the suspension contact traces
-CONFIG.TIRE_CFG.ShowTelemetryHUD    = true  -- Master toggle for 3D & 2D tire telemetry
-CONFIG.TIRE_CFG.ShowTelemetry3D     = true  -- Wheel grip bars and chassis axes
-CONFIG.TIRE_CFG.ShowPacejkaGraph    = true  -- 2D tire telemetry panel
-CONFIG.TIRE_CFG.ShowTireDebug       = true
-CONFIG.TIRE_CFG.ShowCamberDebug     = true  -- Camber and lateral-force readings at each wheel
-CONFIG.SUSPENSION_CFG.showAxleDebug = true  -- Beam, spring seats, center height and articulation
-CONFIG.WEIGHT_SHIFT_CFG.ShowDebug   = true  -- Weight shift, G-ball and per-wheel load
-
--- ============================================================================
--- Lighting, audio and tire effects
--- ============================================================================
-
-
-CONFIG.TIRE_CFG.EnableAudio = true
-
-CONFIG.SOUND_CFG = {
-    Engine_SoundOn         = "acf_extra/vehiclefx/engines/l4/mini_onhigh.WAV",
-    Engine_SoundOff        = "acf_extra/vehiclefx/engines/l4/mini_onlow.WAV",
-    Engine_SoundOnDiv      = 4000,
-    Engine_SoundOnPitchMult= 1.0,
-    Engine_SoundOnVolume   = 1,
-    Engine_SoundOffDiv     = 3500,
-    Engine_SoundOffPitchMult= 1.0,
-    Engine_SoundOffVolume  = 0.5,
-    Engine_SoundOverallDiv = 1.0,
-    Engine_SoundBlendRate  = 8.0,
-    Starter                = "acf_extra/vehiclefx/starters/starter2.wav",
-    StarterPitch           = 1.0,
-    StarterVolume          = 0.75,
-    GearChange             = "physics/plaster/ceiling_tile_impact_hard3.wav",
-    TurboSound             = "acf_engines/turbine_small.wav",
-    TurboBOV               = "acf_extra/vehiclefx/boost/turbo_hiss1.wav",
-    TurboPitch             = 1.0,
-    TurboVolume            = 1.0,
-    TurboBOVPitch          = 1.0,
-    TurboBOVVolume         = 1.0,
-    Horn = { -- Hold CONTROLS_CFG.Horn to sound horn (local sound path or https:// URL)
-        enabled   = true,
-        sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/horn/horn_moto_02.ogg",
-        loadMode  = "stream", -- "stream" or "download" for web URLs
-        volume    = 0.85,
-        pitch     = 1.0,
-        loop      = true, -- true = continuous while held, false = one-shot on press
-        fadeIn    = 25,   -- Ramp-in speed when loop = true
-        fadeOut   = 18,   -- Ramp-out speed when loop = true
-        cooldown  = 0.25, -- Min seconds between presses when loop = false
+-- ----------------------------------------------------------------------------
+-- 9.3 Tire Surface Audio, Skidmarks & Particle Effects
+-- ----------------------------------------------------------------------------
+-- Surfaces: skid supports minSkid, maxSkid, volExp, pitchExp, pitchMin, pitchMax, volume, loadMode
+--           roll supports minSpeed, maxSpeed (km/h), volExp, pitchExp, pitchMin, pitchMax, volume, loadMode
+CONFIG.SOUND_CFG.Surfaces = {
+    [0] = {
+        name = "default",
+        skid = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/tire_asphalt_lockup.ogg", pitchMin = 0.85, pitchMax = 1.25, volume = 1.70, pitchExp = 15 },
+        roll = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/tyres_asphalt_roll_smooth.ogg", pitchMin = 0.65, pitchMax = 1.45, volume = 0.75 },
     },
-    SuperchargerSound = { -- Optional loop; supply a supercharger whine path to enable
-        enabled = false,
-        sndsource = "",
-        loadMode = "stream",
-        volume = 0.65,
-        minRPM = 1000,
-        maxRPM = 6500,
-        pitchMin = 0.75,
-        pitchMax = 1.60,
-        pitchExp = 1.0,
-        volExp = 0.8,
-        coastVolume = 0.15,
+    [MAT_CONCRETE] = {
+        name = "concrete",
+        skid = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/tire_asphalt_lockup.ogg", pitchMin = 0.85, pitchMax = 1.25, volume = 1.70, pitchExp = 15 },
+        roll = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/tyres_asphalt_roll_smooth.ogg", pitchMin = 0.65, pitchMax = 1.45, volume = 0.75 },
     },
-    GearWhine = { -- Separate loopable load/coast whines and optional short load-change clanks
-        enabled = false,
-        minSpeed = 5,
-        maxSpeed = 180,
-        -- Legacy single-loop options remain supported when neither track path is set.
-        sndsource = "",
-        loadMode = "stream",
-        volume = 0.65,
-        pitchMin = 0.70,
-        pitchMax = 1.60,
-        pitchExp = 1.0,
-        volExp = 0.8,
-        coastVolume = 0.35,
-        OnThrottle = {
-            sndsource = "", -- Loop for drive-side gear whine
-            loadMode = "stream",
-            volume = 0.65,
-            pitchMin = 0.78,
-            pitchMax = 1.65,
-            pitchExp = 1.0,
-            volExp = 0.8,
-        },
-        OffThrottle = {
-            sndsource = "", -- Loop for coast-side gear whine; may use a different recording/pitch
-            loadMode = "stream",
-            volume = 0.50,
-            pitchMin = 0.65,
-            pitchMax = 1.35,
-            pitchExp = 1.0,
-            volExp = 0.8,
-        },
-        OnClank = { -- Optional one-shot when throttle crosses this value upward
-            enabled = false,
-            sndsource = "",
-            loadMode = "stream",
-            threshold = 0.60,
-            minSpeed = 10,
-            cooldown = 0.35,
-            volume = 0.55,
-            pitchMin = 0.90,
-            pitchMax = 1.05,
-        },
-        OffClank = { -- Optional one-shot when throttle crosses this value downward
-            enabled = false,
-            sndsource = "",
-            loadMode = "stream",
-            threshold = 0.40,
-            minSpeed = 10,
-            cooldown = 0.35,
-            volume = 0.55,
-            pitchMin = 0.90,
-            pitchMax = 1.05,
-        },
+    [MAT_TILE] = {
+        name = "tile",
+        skid = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/tire_asphalt_skid.ogg", pitchMin = 0.85, pitchMax = 1.35, volume = 1.70 },
+        roll = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/roll_pavement_04.ogg", pitchMin = 0.65, pitchMax = 1.45, volume = 1.35 },
     },
-    WebLoadMode            = "stream", -- "stream" (bass.loadURL) or "download" (http.get + file.writeTemp + bass.loadFile); overridable per entry via loadMode
-    BassAnchorMode         = "overhead", -- "overhead" (Fake-2D overhead anchor to reduce BASS 3D speed stutter) or "world" (raw 3D at vehicle)
-    BassMinDist            = 200,        -- Distance where overhead BASS sounds stay at 100% volume
-    BassMaxDist            = 1500,       -- Distance where overhead BASS sounds fade to 0% volume
-    BassAnchorRadius       = 950,        -- Overhead offset from listener (within Starfall setFade min=1000)
-    SuspensionBump = { -- Upward compression limit hit (supports single sndsource or variants = { ... })
-        enabled  = true,
-        loadMode = "stream",
-        variants = {
-            { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/misc/suspsounds/suspension_velocity_2_variation_3.ogg", volume = 2.20, pitchMin = 0.90, pitchMax = 1.10 },
-            { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/misc/suspsounds/suspension_velocity_1_variation_4.ogg", volume = 2.65, pitchMin = 0.92, pitchMax = 1.15 },
-        },
+    [MAT_DIRT] = {
+        name = "dirt",
+        skid = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/skid_gravel_01.ogg", pitchMin = 0.80, pitchMax = 1.25, volume = 0.65 },
+        roll = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/roll_gravel_01b.ogg", pitchMin = 0.65, pitchMax = 1.35, volume = 0.35 },
     },
-    SuspensionDroop = { -- Downward droop limit hit (supports single sndsource or variants = { ... })
-        enabled  = true,
-        loadMode = "stream",
-        variants = {
-            { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/misc/suspsounds/car_susp_creak_03.ogg", volume = 0.75, pitchMin = 0.95, pitchMax = 1.12 },
-            { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/misc/suspsounds/car_susp_creak_04.ogg", volume = 0.65, pitchMin = 0.95, pitchMax = 1.18 },
-        },
+    [MAT_SAND] = {
+        name = "sand",
+        skid = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/skid_sand_low.ogg", pitchMin = 0.75, pitchMax = 1.20, volume = 1.60 },
+        roll = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/roll_sand_low.ogg", pitchMin = 0.65, pitchMax = 1.30, volume = 1.30 },
     },
-    -- Surfaces: skid supports minSkid, maxSkid, volExp, pitchExp, pitchMin, pitchMax, volume, loadMode
-    --           roll supports minSpeed, maxSpeed (km/h), volExp, pitchExp, pitchMin, pitchMax, volume, loadMode
-    Surfaces = {
-        [0] = {
-            name = "default",
-            skid = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/tire_asphalt_lockup.ogg", pitchMin = 0.85, pitchMax = 1.25, volume = 1.70, pitchExp = 15 },
-            roll = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/tyres_asphalt_roll_smooth.ogg", pitchMin = 0.65, pitchMax = 1.45, volume = 0.75 },
-        },
-        [MAT_CONCRETE] = {
-            name = "concrete",
-            skid = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/tire_asphalt_lockup.ogg", pitchMin = 0.85, pitchMax = 1.25, volume = 1.70, pitchExp = 15 },
-            roll = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/tyres_asphalt_roll_smooth.ogg", pitchMin = 0.65, pitchMax = 1.45, volume = 0.75 },
-        },
-        [MAT_TILE] = {
-            name = "tile",
-            skid = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/tire_asphalt_skid.ogg", pitchMin = 0.85, pitchMax = 1.35, volume = 1.70 },
-            roll = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/roll_pavement_04.ogg", pitchMin = 0.65, pitchMax = 1.45, volume = 1.35 },
-        },
-        [MAT_DIRT] = {
-            name = "dirt",
-            skid = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/skid_gravel_01.ogg", pitchMin = 0.80, pitchMax = 1.25, volume = 0.65 },
-            roll = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/roll_gravel_01b.ogg", pitchMin = 0.65, pitchMax = 1.35, volume = 0.35 },
-        },
-        [MAT_SAND] = {
-            name = "sand",
-            skid = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/skid_sand_low.ogg", pitchMin = 0.75, pitchMax = 1.20, volume = 1.60 },
-            roll = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/roll_sand_low.ogg", pitchMin = 0.65, pitchMax = 1.30, volume = 1.30 },
-        },
-        [MAT_GRASS] = {
-            name = "grass",
-            skid = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/tallgrass_impactvehicle_03.ogg", pitchMin = 0.80, pitchMax = 1.25, volume = 0.60 },
-            roll = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/surface_roadnoise_grass_01.ogg", pitchMin = 0.65, pitchMax = 1.35, volume = 1.30 },
-        },
-        [MAT_SNOW] = {
-            name = "snow",
-            skid = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/slid_snow_low_01.ogg", pitchMin = 0.75, pitchMax = 1.20, volume = 1.55 },
-            roll = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/roll_snow_02.ogg", pitchMin = 0.65, pitchMax = 1.30, volume = 1.25 },
-        },
-        [MAT_METAL] = {
-            name = "metal",
-            skid = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/tire_asphalt_lockup.ogg", pitchMin = 0.85, pitchMax = 1.25, volume = 1.70, pitchExp = 15 },
-            roll = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/tyres_asphalt_roll_smooth.ogg", pitchMin = 0.70, pitchMax = 1.35, volume = 0.75 },
-        },
-        [MAT_GRATE] = {
-            name = "grate",
-            skid = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/tire_asphalt_skid.ogg", pitchMin = 0.85, pitchMax = 1.35, volume = 1.70 },
-            roll = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/roll_pavement_04.ogg", pitchMin = 0.70, pitchMax = 1.35, volume = 1.35 },
-        },
-        [MAT_WOOD] = {
-            name = "wood",
-            skid = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/railway_skid_lateral.ogg", pitchMin = 0.85, pitchMax = 1.30, volume = 1.65 },
-            roll = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/roll_rail_02.ogg", pitchMin = 0.70, pitchMax = 1.35, volume = 1.35 },
-        },
-        [MAT_DEFAULT] = {
-            name = "default_gmod",
-            skid = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/tire_asphalt_lockup.ogg", pitchMin = 0.85, pitchMax = 1.25, volume = 1.70, pitchExp = 15 },
-            roll = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/tyres_asphalt_roll_smooth.ogg", pitchMin = 0.65, pitchMax = 1.45, volume = 0.75 },
-        },
+    [MAT_GRASS] = {
+        name = "grass",
+        skid = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/tallgrass_impactvehicle_03.ogg", pitchMin = 0.80, pitchMax = 1.25, volume = 0.60 },
+        roll = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/surface_roadnoise_grass_01.ogg", pitchMin = 0.65, pitchMax = 1.35, volume = 1.30 },
+    },
+    [MAT_SNOW] = {
+        name = "snow",
+        skid = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/slid_snow_low_01.ogg", pitchMin = 0.75, pitchMax = 1.20, volume = 1.55 },
+        roll = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/roll_snow_02.ogg", pitchMin = 0.65, pitchMax = 1.30, volume = 1.25 },
+    },
+    [MAT_METAL] = {
+        name = "metal",
+        skid = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/tire_asphalt_lockup.ogg", pitchMin = 0.85, pitchMax = 1.25, volume = 1.70, pitchExp = 15 },
+        roll = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/tyres_asphalt_roll_smooth.ogg", pitchMin = 0.70, pitchMax = 1.35, volume = 0.75 },
+    },
+    [MAT_GRATE] = {
+        name = "grate",
+        skid = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/tire_asphalt_skid.ogg", pitchMin = 0.85, pitchMax = 1.35, volume = 1.70 },
+        roll = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/roll_pavement_04.ogg", pitchMin = 0.70, pitchMax = 1.35, volume = 1.35 },
+    },
+    [MAT_WOOD] = {
+        name = "wood",
+        skid = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/railway_skid_lateral.ogg", pitchMin = 0.85, pitchMax = 1.30, volume = 1.65 },
+        roll = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/roll_rail_02.ogg", pitchMin = 0.70, pitchMax = 1.35, volume = 1.35 },
+    },
+    [MAT_DEFAULT] = {
+        name = "default_gmod",
+        skid = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/tire_asphalt_lockup.ogg", pitchMin = 0.85, pitchMax = 1.25, volume = 1.70, pitchExp = 15 },
+        roll = { sndsource = "https://github.com/nokillnando/TheCrewSounds/blob/main/useful/brakeslidesskid/tyres_asphalt_roll_smooth.ogg", pitchMin = 0.65, pitchMax = 1.45, volume = 0.75 },
     },
 }
 
 CONFIG.SKID_CFG = {
     enabled                   = true,
-    -- BUFFER & LIFETIME
+    -- Buffer & lifetime
     MaxQuads                  = 180,  -- Max number of quad segments alive at once
     Lifetime                  = 12.0, -- How long skidmarks persist (seconds)
     HologramLimit             = 180,  -- Safety cap to stay below Starfall's hologram limit
 
-    -- RENDERING & APPEARANCE
+    -- Rendering & appearance
     WidthMult                 = 1.0,  -- Width multiplier based on tire width
     FrontWheelWidthMul        = 1.0,  -- Extra width multiplier for front axle
     RearWheelWidthMul         = 1.0,  -- Extra width multiplier for rear axle
@@ -881,49 +1160,47 @@ CONFIG.SKID_CFG = {
     -- Optional axle overrides. Both axles inherit the shared settings below.
     -- Front = { SkidThreshold = 0.20, SkidReleaseThreshold = 0.10, OpacityExp = 0.8 },
     -- Rear = { Texture = "decals/my_tread", SkidColor = Color(32, 32, 32, 180), StrengthMul = 1.2 },
-    -- DETECTION THRESHOLDS
+    -- Detection thresholds
     SkidThreshold             = 0.16, -- Slip amount needed to start skidmarks
     OpacityExp                = 0.75, -- Below 1 darkens intermediate marks; threshold only gates emission
     SkidReleaseThreshold      = 0.08, -- Lower hold threshold to prevent gap flickering
 
-    -- MATERIAL & TEXTURE DOWNLOAD (skidmark_config.txt system)
+    -- Material & texture download (skidmark_config.txt system)
     MaterialConfig = {
-        UseModTexture      = true,    -- true: create shader & apply Texture/URL; false: use Material directly
+        UseModTexture      = true,  -- true: create shader & apply Texture/URL; false: use Material directly
         Shader             = "VertexLitGeneric",
         Texture            = "https://dl.dropbox.com/scl/fi/lwy1gpwmkz7m7bvyaiamd/tirethread.png?rlkey=x50qq67we5tmnao8i0p23upe0&dl=1",
-        FrontTexture       = nil,     -- Optional front-axle override texture/URL
-        RearTexture        = nil,     -- Optional rear-axle override texture/URL
-        Material           = nil,     -- In-game material path when UseModTexture = false
-        TintTexture        = true,    -- false keeps custom texture RGB; true multiplies by SkidColor
-        TextureRotationDeg = 90,      -- Rotate tread texture to match trail direction
-        TextureScaleU      = 1.0,     -- UV transform scale U
-        TextureScaleV      = 1.0,     -- UV transform scale V
-        FlipTextureU       = false,   -- Flip UVs horizontally after rotation
-        FlipTextureV       = false,   -- Flip UVs vertically after rotation
-        AlphaTest          = false,   -- Enable alpha test for textures with hard alpha
-        AlphaTestReference = 0.5,     -- Alpha cutoff when AlphaTest is enabled
+        FrontTexture       = nil,   -- Optional front-axle override texture/URL
+        RearTexture        = nil,   -- Optional rear-axle override texture/URL
+        Material           = nil,   -- In-game material path when UseModTexture = false
+        TintTexture        = true,  -- false keeps custom texture RGB; true multiplies by SkidColor
+        TextureRotationDeg = 90,    -- Rotate tread texture to match trail direction
+        TextureScaleU      = 1.0,   -- UV transform scale U
+        TextureScaleV      = 1.0,   -- UV transform scale V
+        FlipTextureU       = false, -- Flip UVs horizontally after rotation
+        FlipTextureV       = false, -- Flip UVs vertically after rotation
+        AlphaTest          = false, -- Enable alpha test for textures with hard alpha
+        AlphaTestReference = 0.5,   -- Alpha cutoff when AlphaTest is enabled
     },
 
-    -- PER-SURFACE CONFIGURATIONS (keyed by MAT_* enum)
+    -- Per-surface configurations (keyed by MAT_* enum)
     Surfaces = {
-        [0]            = { name = "default",      CreateMarks = true,  SkidColor = Color(20, 20, 20, 170),   SkidWidthMul = 1.0, StrengthMul = 1.0 },
-        [MAT_CONCRETE] = { name = "concrete",     CreateMarks = true,  SkidColor = Color(10, 10, 10, 220),   SkidWidthMul = 1.0, StrengthMul = 1.4 },
-        [MAT_DIRT]     = { name = "dirt",         CreateMarks = true,  SkidColor = Color(55, 40, 28, 165),   SkidWidthMul = 1.0, StrengthMul = 1.0 },
+        [0]            = { name = "default",      CreateMarks = true,  SkidColor = Color(20, 20, 20, 170),  SkidWidthMul = 1.0, StrengthMul = 1.0 },
+        [MAT_CONCRETE] = { name = "concrete",     CreateMarks = true,  SkidColor = Color(10, 10, 10, 220),  SkidWidthMul = 1.0, StrengthMul = 1.4 },
+        [MAT_DIRT]     = { name = "dirt",         CreateMarks = true,  SkidColor = Color(55, 40, 28, 165),  SkidWidthMul = 1.0, StrengthMul = 1.0 },
         [MAT_GRATE]    = { name = "grate",        CreateMarks = false },
-        [MAT_SNOW]     = { name = "snow",         CreateMarks = true,  SkidColor = Color(90, 90, 110, 150),  SkidWidthMul = 1.0, StrengthMul = 1.0 },
-        [MAT_METAL]    = { name = "metal",        CreateMarks = true,  SkidColor = Color(40, 40, 40, 160),   SkidWidthMul = 1.0, StrengthMul = 1.0 },
-        [MAT_SAND]     = { name = "sand",         CreateMarks = true,  SkidColor = Color(110, 90, 55, 150),  SkidWidthMul = 1.0, StrengthMul = 1.0 },
-        [MAT_TILE]     = { name = "tile",         CreateMarks = true,  SkidColor = Color(50, 50, 50, 170),   SkidWidthMul = 1.0, StrengthMul = 1.0 },
-        [MAT_GRASS]    = { name = "grass",        CreateMarks = true,  SkidColor = Color(45, 65, 28, 120),   SkidWidthMul = 1.0, StrengthMul = 1.0 },
-        [MAT_WOOD]     = { name = "wood",         CreateMarks = true,  SkidColor = Color(60, 60, 60, 140),   SkidWidthMul = 1.0, StrengthMul = 1.0 },
-        [MAT_DEFAULT]  = { name = "default_gmod", CreateMarks = true,  SkidColor = Color(20, 20, 20, 170),   SkidWidthMul = 1.0, StrengthMul = 1.0 },
+        [MAT_SNOW]     = { name = "snow",         CreateMarks = true,  SkidColor = Color(90, 90, 110, 150), SkidWidthMul = 1.0, StrengthMul = 1.0 },
+        [MAT_METAL]    = { name = "metal",        CreateMarks = true,  SkidColor = Color(40, 40, 40, 160),  SkidWidthMul = 1.0, StrengthMul = 1.0 },
+        [MAT_SAND]     = { name = "sand",         CreateMarks = true,  SkidColor = Color(110, 90, 55, 150), SkidWidthMul = 1.0, StrengthMul = 1.0 },
+        [MAT_TILE]     = { name = "tile",         CreateMarks = true,  SkidColor = Color(50, 50, 50, 170),  SkidWidthMul = 1.0, StrengthMul = 1.0 },
+        [MAT_GRASS]    = { name = "grass",        CreateMarks = true,  SkidColor = Color(45, 65, 28, 120),  SkidWidthMul = 1.0, StrengthMul = 1.0 },
+        [MAT_WOOD]     = { name = "wood",         CreateMarks = true,  SkidColor = Color(60, 60, 60, 140),  SkidWidthMul = 1.0, StrengthMul = 1.0 },
+        [MAT_DEFAULT]  = { name = "default_gmod", CreateMarks = true,  SkidColor = Color(20, 20, 20, 170),  SkidWidthMul = 1.0, StrengthMul = 1.0 },
     },
 }
 
-CONFIG.TIRE_CFG.EnableParticles = true
-
 CONFIG.EFFECT_CFG = {
-    enabled              = true,
+    enabled              = true, -- Master particle effects switch (tire smoke, dust, dirt, grass, snow)
     emitInterval         = 0.025,
     skidEffectExp        = 0.75, -- Below 1 builds skid particles faster after onset
     smokeThreshold       = 0.14,
@@ -1012,174 +1289,5 @@ CONFIG.EFFECT_CFG = {
         },
     },
 }
-
--- ============================================================================
--- Addons
--- ============================================================================
-
--- Include your module at the top of this file, then list it here in hook order.
--- A module returns function(options, config), which creates a fresh table of hooks.
--- OnInit(ctx) registers server Wire ports and key handlers. OnClientInit(ctx)
--- binds the same key IDs on the client. OnCleanup(ctx) runs in both realms.
--- OnPrePhysics(ctx, dt, controls) and OnPostPhysics(ctx, dt, result) run on the
--- server. dt is seconds. ctx.state, ctx.car and ctx.wheels describe this vehicle.
-CONFIG.ADDON_MODULES = {
-    {
-        file = "simcadebase/addons/lights.txt",
-        enabled = true,
-        options = {
-            SeparateBulbs         = true,      -- true = separate LowBeam & HighBeam bulbs; false = single bulb (HeadlightFOV/Brightness)
-            ExclusiveLowHigh      = false,     -- When SeparateBulbs = true: true turns LowBeam off when HighBeam turns on
-            HoldOffTime           = 0.40,      -- Hold Headlights key (seconds) to turn headlights OFF; tap cycles Low <-> High
-            LowBeamFov            = 65,
-            LowBeamBrightness     = 1,
-            HighBeamFov           = 80,
-            HighBeamBrightness    = 2,
-            WireLColor            = Vector(255, 255, 255),
-            BrakeWireLightColor   = Vector(255, 0, 0),
-            ReverseWireLightColor = Vector(255, 255, 255),
-        },
-    },
-    {
-        file = "simcadebase/addons/backfire_antilag.txt",
-        enabled = false, -- Wire exhaust props to Exhausts (Array). Unwired pops originate at the chip.
-        options = {
-            TriggerMode = 3, -- 1 = lift-off, downshift and anti-lag; 2 = limiter; 3 = both groups
-
-            -- Lift-off and bursts (times in seconds, throttle and burst chances from 0 to 1)
-            MinRPMThreshold = 4000, -- Minimum RPM to trigger overrun backfire
-            OverrunThrottleDrop = 0.4, -- Throttle must drop below this to trigger Overrun backfire
-            OverrunPopChance = 0.35, -- Chance when throttle is released after load
-            OverrunSustainChance = 0.12, -- Chance per second for extra pops while coasting at high RPM
-            OverrunMinLoadTime = 0.25, -- Must be on throttle this long before lift-off can pop
-            OverrunWindow = 0.55, -- Seconds after lift-off where overrun pops are allowed
-            OverrunCooldownMin = 0.06,
-            OverrunCooldownMax = 0.25,
-            OverrunBurstChance = 0.35,
-            OverrunBurstMin = 2,
-            OverrunBurstMax = 4,
-            BurstIntervalMin = 0.04,
-            BurstIntervalMax = 0.12,
-            RPMChancePower = 1.35, -- Higher values make low-RPM pops rarer
-
-            -- Anti-lag pops under residual turbo boost
-            EnableAntiLag = true,
-            AntiLagBoostThreshold = 1.05, -- Boost ratio; 1.0 is atmospheric pressure
-            AntiLagThrottleMax = 0.35,
-            AntiLagMinRPM = 3500,
-            AntiLagPopChance = 0.45, -- Chance per second while off-throttle with boost
-            AntiLagCooldownMin = 0.10,
-            AntiLagCooldownMax = 0.24,
-
-            -- Downshift pops
-            EnableDownshiftPops = true,
-            DownshiftPopChance = 0.65, -- Chance when gear drops under RPM/load
-            DownshiftSustainChance = 0.18, -- Chance per second for follow-up burbles after downshift
-            DownshiftMinRPM = 3200,
-            DownshiftThrottleMax = 0.55,
-            DownshiftWindow = 0.45,
-            DownshiftCooldownMin = 0.05,
-            DownshiftCooldownMax = 0.18,
-            DownshiftBurstChance = 0.45,
-
-            -- Rev limiter
-            RevLimitPopChance = 10, -- Chance per second while on rev limiter
-            RevLimitRPMThreshold = 0.95, -- % of RevLimiter RPM required to start popping (0.95 = 95%)
-            RevLimitThrottle = 0.4, -- Minimum Throttle needed to trigger 2-Step / RevLimit popping
-            -- All sources share a minimum 0.10 s between audible pops.
-            RevLimitCooldownMin = 0.01,
-            RevLimitCooldownMax = 0.05,
-            RevLimitBurstChance = 1,
-
-            -- Sounds
-            SoundVolume = 1,
-            SoundPitchMin = 85,
-            SoundPitchMax = 115, -- 100 is normal pitch
-
-            -- Set UseURLSounds to false to select from InGameSounds.
-            UseURLSounds = true,
-            URLSounds = {
-                -- Add URLs to raw .ogg or .mp3 files here
-                "https://raw.githubusercontent.com/nokillnando/forzaapexsounds/main/misc/burble/burble_oneshot_test1.ogg",
-                "https://raw.githubusercontent.com/nokillnando/forzaapexsounds/main/misc/burble/burble_oneshot_test2.ogg",
-                "https://raw.githubusercontent.com/nokillnando/forzaapexsounds/main/misc/burble/burble_oneshot_test3.ogg"
-            },
-            InGameSounds = {
-                "acf_thecrew/useful/backfire/backfire_drain_10.wav",
-                "acf_thecrew/useful/backfire/backfire_gargle_15.wav",
-                "acf_thecrew/useful/backfire/backfire_splutter_20.wav"
-            },
-
-            -- Each exhaust plays every entry. Choose "effect", "particle", or "custom" (sprite).
-            Effects = {
-                { effecttype = "effect", effectname = "MuzzleEffect", scale = 0.4 },
-                { effecttype = "effect", effectname = "AirboatMuzzleFlash", scale = 0.7 },
-            },
-        },
-    },
-    {
-        file = "simcadebase/addons/brake_temperature.txt",
-        enabled = false, -- Enable to expose BrakeTempFL/FR/RL/RR and BrakeTempMax in Celsius.
-        -- BrakeWheelTemps follows CONFIG.WHEELS order. ExtraBrakeWheels accepts and
-        -- echoes an array of spinning wheel props. ExtraBrakeWheelTemps matches its order.
-        -- Client effects can read ctx.syncedState.BrakeTemperature.WheelTemps and ExtraWheelTemps.
-        options = {
-            AmbientTemp = 20, MaxTemp = 800, -- degrees Celsius
-            HeatRate = 0.35, SpeedHeatScale = 1.0,
-            WheelRPMToSpeed = 0.15, -- km/h per RPM for external wheel props
-            CoolRate = 0.08, SpeedCoolScale = 0.15,
-            StoppedCoolMult = 0.5, -- passive cooling below 2 km/h
-            EnableFade = false, -- Reduce service brake torque linearly between FadeStartTemp and FadeFullTemp
-            FadeStartTemp = 400, FadeFullTemp = 750, -- degrees Celsius
-            MinFadeMult = 0.45, -- Minimum brake torque fraction at full fade
-        },
-    },
-    {
-        file = "simcadebase/addons/seat_indicator.txt",
-        enabled = true, -- LVS-style seat indicator (billboard text + 3D Bezier + ghost glow; no HUD/enterVehicle permission needed)
-        options = {
-            AutoDetectSeats   = true,  -- Auto-find constrained/parented passenger seats on Base (or wire PassengerSeats Array to override)
-            MaxDistance       = 130,   -- Max distance (units) to show seat indicator
-            AimRadius         = 24,    -- Ray-to-seat-center tolerance (units)
-            ThroughWalls      = true,  -- Render through vehicle bodywork ($ignorez)
-            ShowLabel         = true,  -- Floating "[E] Enter / Driver" billboard (uses render.offscreen, no HUD permission)
-            ShowCurve         = true,  -- Animated LVS-style 3D cubic Bezier curve
-            ShowSeatGhost     = true,  -- Pulsing translucent highlight on the targeted seat
-            ShowOccupied      = true,  -- Show "OCCUPIED" indicator on occupied seats
-            CurveSegments          = 24,    -- Fixed holo pool size for the 3D Bezier curve
-            LabelOffsetZ      = 16,    -- Height above seat center for the floating label
-            AllowEnterVehicle      = false,  -- Press [E] while aiming at a seat to enter via enterVehicle (when permitted)
-            RequestEnterPermission = false,  -- Prompt once for player.enterVehicle permission if not yet granted
-            -- SeatLabels     = { "Driver", "Shotgun", "Rear Left", "Rear Right" }, -- Optional custom names by seat order
-        },
-    },
-    {
-        file = "simcadebase/addons/vehicle_radio.txt",
-        enabled = true, -- rRadio-style vehicle radio with lazy-loaded country catalog + seamless Cabin <-> 3D audio
-        options = {
-            CatalogBaseURL       = "https://raw.githubusercontent.com/nokillnando/Starfall/main/simcadebase/addons/radio_catalog",
-            DriverOnly           = true,  -- Only the driver can change stations / volume / power
-            DefaultVolume        = 1.0,   -- Initial radio volume (1.0 = 100%)
-            MaxVolume            = 2.5,   -- Max volume boost (2.5 = 250% for quiet radio streams)
-            VolumeStep           = 0.10,  -- Volume step per RadioVolDown / RadioVolUp press
-            FullVolumeDistance   = 120,   -- 3D audio full-volume radius outside the vehicle (units)
-            MaxHearingDistance   = 950,   -- 3D audio max hearing distance outside the vehicle (units)
-            FalloffExponent      = 1.35,  -- Distance rolloff curve outside the vehicle
-            OcclusionEnabled     = true,  -- Attenuate 3D radio when behind walls/props
-            OcclusionGain        = 0.35,  -- Volume multiplier when occluded
-            SourceOffset         = Vector(0, 0, 20), -- Local offset on Base for 3D audio source
-            CrossfadeTime        = 0.35,  -- Fade duration (seconds) when switching or stopping stations
-            ShowNowPlayingHUD    = true,  -- Compact now-playing bar + 5-bar FFT equalizer in vehicle
-            HUDAutoHideSeconds   = 5.0,   -- Auto-hide HUD bar after N seconds (0 = always visible in vehicle)
-            ShowChipPermHint     = true,  -- Show floating "[E] Chip to Hear Radio" hint above chip for nearby players lacking permission
-            RequestHUDPermission = true,  -- Prompt once for render.hud permission when opening the menu
-            EnableChatCommand    = true,  -- Allow driver to use !radio <url> [name], !radio stop, !radio vol <0-100>
-        },
-    },
-}
-
--- Existing inline hook tables can also be used alongside file modules.
-CONFIG.ADDONS = {}
-
 
 require("simcadebase/simcade_loader.txt")(CONFIG)

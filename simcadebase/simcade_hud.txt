@@ -63,6 +63,14 @@ end
 function SimcadeHUD.initClient(cfg)
     local HUD  = cfg.HUD_CFG or {}
     local TIRE = cfg.TIRE_CFG or {}
+    local DBG  = cfg.DEBUG_CFG or {}
+    local SUSP = cfg.SUSPENSION_CFG or {}
+    local WS   = cfg.WEIGHT_SHIFT_CFG or {}
+    local function pickDbg(vNew, vOld, default)
+        if vNew ~= nil then return vNew end
+        if vOld ~= nil then return vOld end
+        return default
+    end
 
     local wheelDebug = { base = nil, fwdLocal = Vector(1, 0, 0), rightLocal = Vector(0, -1, 0), wheels = {} }
     local wheelBaselines = {}
@@ -296,7 +304,7 @@ function SimcadeHUD.initClient(cfg)
 
     hook.add("drawhud", "SimcadeHUD_Draw", function()
         local hudEnabled = (HUD.enabled ~= false)
-        local debugEnabled = (HUD.debugEnabled ~= nil) and (HUD.debugEnabled == true) or (HUD.debugEnabled == nil and hudEnabled)
+        local debugEnabled = pickDbg(DBG.enabled, HUD.debugEnabled, hudEnabled) == true
         if not hudEnabled and not debugEnabled then return end
         local qMax = quotaMax and quotaMax() or 0
         if qMax > 0 then
@@ -500,9 +508,14 @@ function SimcadeHUD.initClient(cfg)
             end
         end
 
-        local show3D = canSeeDebug and (TIRE.ShowTelemetryHUD ~= false) and ((TIRE.ShowTelemetry3D == true) or (TIRE.ShowTelemetry3D == nil and TIRE.ShowTireDebug == true))
+        local dbgTelemetryHUD = pickDbg(DBG.telemetryHUD, TIRE.ShowTelemetryHUD, true) ~= false
+        local dbgTelemetry3D  = pickDbg(DBG.telemetry3D, TIRE.ShowTelemetry3D, nil)
+        local dbgTireDebug    = pickDbg(DBG.tireDebug, TIRE.ShowTireDebug, false) == true
+        local dbgCamber       = pickDbg(DBG.camberDebug, TIRE.ShowCamberDebug, false) == true
+        local dbgAxle         = pickDbg(DBG.axleDebug, SUSP.showAxleDebug, false) == true
+        local show3D = canSeeDebug and dbgTelemetryHUD and ((dbgTelemetry3D == true) or (dbgTelemetry3D == nil and dbgTireDebug))
         local baseEnt = wheelDebug.base
-        if canSeeDebug and baseEnt and baseEnt:isValid() and cfg.SUSPENSION_CFG and cfg.SUSPENSION_CFG.showAxleDebug then
+        if canSeeDebug and baseEnt and baseEnt:isValid() and dbgAxle then
             local function line(a, b)
                 local p, q = baseEnt:localToWorld(a):toScreen(), baseEnt:localToWorld(b):toScreen()
                 if p.visible and q.visible then render.drawLine(p.x, p.y, q.x, q.y) end
@@ -534,7 +547,7 @@ function SimcadeHUD.initClient(cfg)
             end
         end
         if show3D and baseEnt and baseEnt:isValid() and #wheelDebug.wheels > 0 then
-            local callouts = TIRE.ShowCamberDebug and {} or nil
+            local callouts = dbgCamber and {} or nil
             local cPos = baseEnt:getPos()
             local liveFwd = baseEnt:localToWorldVector(wheelDebug.fwdLocal)
             local liveRight = baseEnt:localToWorldVector(wheelDebug.rightLocal)
@@ -623,15 +636,15 @@ function SimcadeHUD.initClient(cfg)
                     local axleTag = w.isFront and "[FRONT]" or "[REAR]"
                     local wName = (w.name and w.name ~= "") and w.name or ("W" .. i)
                     render.setColor(w.isFront and Color(80, 230, 255) or Color(255, 180, 80))
-                    local label = TIRE.ShowCamberDebug and wName or string.format("%s %s %.0f° | %.1fkN", axleTag, wName, w.slipAngle or 0, w.loadKN or 0)
+                    local label = dbgCamber and wName or string.format("%s %s %.0f° | %.1fkN", axleTag, wName, w.slipAngle or 0, w.loadKN or 0)
                     drawTextAligned(sPos.x, sPos.y + 10 * scale, label, 1, 1)
                 end
             end
             if callouts then drawWheelCallouts(callouts, sw, sh, inThisSeat) end
         end
 
-        local wsCfg = cfg.WEIGHT_SHIFT_CFG
-        local showWS = canSeeDebug and (wsCfg == nil or wsCfg.ShowDebug ~= false) and (TIRE.ShowTelemetryHUD ~= false or (wsCfg and wsCfg.ShowDebug))
+        local dbgWeightShift = pickDbg(DBG.weightShift, WS.ShowDebug, nil)
+        local showWS = canSeeDebug and (dbgWeightShift ~= false) and (dbgTelemetryHUD or (dbgWeightShift == true))
         if showWS and (st or #wheelDebug.wheels > 0) then
             local wx = 40 * scale
             local wy = sh - 454 * scale
@@ -695,7 +708,8 @@ function SimcadeHUD.initClient(cfg)
             drawTextAligned(vx + vw * 0.5, vy + vh + 10 * scale, string.format("%.2fg", vertM), 1, 1)
         end
 
-        local showGraph = canSeeDebug and (TIRE.ShowTelemetryHUD ~= false) and ((TIRE.ShowPacejkaGraph == true) or (TIRE.ShowPacejkaGraph == nil and TIRE.ShowTireDebug == true))
+        local dbgPacejka = pickDbg(DBG.pacejkaGraph, TIRE.ShowPacejkaGraph, nil)
+        local showGraph = canSeeDebug and dbgTelemetryHUD and ((dbgPacejka == true) or (dbgPacejka == nil and dbgTireDebug))
         if showGraph and #wheelDebug.wheels > 0 then
             local activeCompound = (st and st.compound) or TIRE.DefaultCompound or "Sport"
             if specCompound ~= activeCompound then
@@ -798,8 +812,9 @@ function SimcadeHUD.initClient(cfg)
     end)
 
     hook.add("postdrawtranslucentrenderables", "SimcadeHUD_DebugRays", function()
-        local debugEnabled = (HUD.debugEnabled ~= nil) and (HUD.debugEnabled == true) or (HUD.debugEnabled == nil and HUD.enabled ~= false)
-        if not debugEnabled or not TIRE.ShowSuspensionRays or not (render and render.draw3DLine) then return end
+        local debugEnabled = pickDbg(DBG.enabled, HUD.debugEnabled, HUD.enabled ~= false) == true
+        local dbgRays = pickDbg(DBG.suspensionRays, TIRE.ShowSuspensionRays, false) == true
+        if not debugEnabled or not dbgRays or not (render and render.draw3DLine) then return end
         local qMax = quotaMax and quotaMax() or 0
         if qMax > 0 then
             if quotaUsed and (quotaUsed() / qMax) > 0.80 then return end

@@ -4,14 +4,52 @@
 
 SimcadeCore = SimcadeCore or {}
 
+-- Bundled into a single table so Simcade_PhysicsTick stays well under LuaJIT's 60-upvalue limit.
+local U = {
+    abs = math.abs,
+    min = math.min,
+    max = math.max,
+    sqrt = math.sqrt,
+    exp = math.exp,
+    deg = math.deg,
+    rad = math.rad,
+    floor = math.floor,
+    ceil = math.ceil,
+    clamp = math.clamp or function(v, a, b) return v < a and a or (v > b and b or v) end,
+    readPodLight = function(p) return p["Light"] end,
+    sortNetJobs = function(a, b)
+        if a.name == "audio" then return b.name ~= "audio" end
+        if b.name == "audio" then return false end
+        return a.due < b.due
+    end,
+    clearTable = function(t)
+        for k in pairs(t) do t[k] = nil end
+    end,
+    applyFastAntiRoll = function(left, right, barRate)
+        if not left or not right then return end
+        local transfer = (left._subComp - right._subComp) * barRate
+        if left.beamMate == right then
+            transfer = transfer - (left._springForce - right._springForce) * (1 - left.seatNear)
+        end
+        if transfer < -left._springForce then
+            transfer = -left._springForce
+        elseif transfer > right._springForce then
+            transfer = right._springForce
+        end
+        left._springForce = left._springForce + transfer
+        right._springForce = right._springForce - transfer
+    end,
+}
+
 function SimcadeCore.networkInterval(vehicleCfg)
     return 1 / math.max(1, tonumber(vehicleCfg and vehicleCfg.NetworkRate) or 20)
 end
 
 local function writeDirection(v)
-    net.writeInt(math.clamp(math.round(v.x * 127), -127, 127), 8)
-    net.writeInt(math.clamp(math.round(v.y * 127), -127, 127), 8)
-    net.writeInt(math.clamp(math.round(v.z * 127), -127, 127), 8)
+    local fl, cl = U.floor, U.clamp
+    net.writeInt(cl(fl(v.x * 127 + 0.5), -127, 127), 8)
+    net.writeInt(cl(fl(v.y * 127 + 0.5), -127, 127), 8)
+    net.writeInt(cl(fl(v.z * 127 + 0.5), -127, 127), 8)
 end
 
 local IN_TO_M = 0.0254
@@ -36,6 +74,8 @@ function SimcadeCore.init(CONFIG)
     SimcadeTires.applySurfaceProfiles(CONFIG)
     local VEHICLE_CFG    = CONFIG.VEHICLE_CFG or {}
     local ENGINE_CFG     = CONFIG.ENGINE_CFG or {}
+    local BRAKE_CFG      = CONFIG.BRAKE_CFG or {}
+    local DEBUG_CFG      = CONFIG.DEBUG_CFG or {}
     local TIRE_CFG       = CONFIG.TIRE_CFG or {}
     local SUSPENSION_CFG = CONFIG.SUSPENSION_CFG or {}
     local STEERING_CFG   = CONFIG.STEERING_CFG or {}
@@ -45,6 +85,12 @@ function SimcadeCore.init(CONFIG)
     local CONTROLS_CFG   = CONFIG.CONTROLS_CFG or {}
     local CAMERA_CFG     = CONFIG.CAMERA_CFG or {}
     local ACTIVE_DIFF_CFG = CONFIG.ACTIVE_DIFF_CFG or {}
+
+    local function pickVal(vNew, vOld)
+        if vNew ~= nil then return vNew end
+        return vOld
+    end
+    local parkBrakeToggle = pickVal(BRAKE_CFG.ParkingBrakeToggle, ENGINE_CFG.ParkingBrakeToggle) ~= false
 
     local function keyLabel(k, fallback)
         if input and input.getKeyName and k then
@@ -150,7 +196,7 @@ function SimcadeCore.init(CONFIG)
                 net.writeUInt(7, 4)
                 net.writeBool(true)
                 SimcadeCore.sendPacket()
-            elseif ENGINE_CFG.ParkingBrakeToggle ~= false and btn == kParkBrk then
+            elseif parkBrakeToggle and btn == kParkBrk then
                 net.start("Simcade_ClientKeyEvent")
                 net.writeUInt(11, 4)
                 net.writeBool(true)
@@ -264,16 +310,25 @@ function SimcadeCore.init(CONFIG)
     local traceFilter = {}
     local filterSeen = {}
     local traceMinMass = 0
+    local filterCache = { wall = {}, tread = {}, dirty = false, calls = 0 }
     local function traceFilterFn(ent)
+        filterCache.calls = filterCache.calls + 1
         if not ent or filterSeen[ent] then return false end
-        if ent.isPlayer and ent:isPlayer() then return false end
-        if traceMinMass > 0 then
+        local cache = traceMinMass > 0 and filterCache.tread or filterCache.wall
+        local cached = cache[ent]
+        if cached ~= nil then return cached end
+        local allow = true
+        if ent.isPlayer and ent:isPlayer() then
+            allow = false
+        elseif traceMinMass > 0 then
             local phys = ent.getPhysicsObject and ent:getPhysicsObject()
             if isValid(phys) and (not phys.isMoveable or phys:isMoveable()) and phys:getMass() < traceMinMass then
-                return false
+                allow = false
             end
         end
-        return true
+        cache[ent] = allow
+        filterCache.dirty = true
+        return allow
     end
     local physicsCar = nil
     local activeCompound = TIRE_CFG.DefaultCompound or "Sport"
@@ -294,10 +349,39 @@ function SimcadeCore.init(CONFIG)
     local superchargerState = (SimcadeEngine and SimcadeEngine.newSuperchargerState) and SimcadeEngine.newSuperchargerState() or { psi = 0, boost = 1.0 }
     local manifoldState = (SimcadeEngine and SimcadeEngine.newManifoldState) and SimcadeEngine.newManifoldState(ENGINE_CFG) or nil
 
-    local exitHbkDefault = tonumber(ENGINE_CFG.AutoHandbrakeOnExitSpeed)
-    if exitHbkDefault == nil and ENGINE_CFG.AutoHandbrakeOnExitSpeed ~= false then exitHbkDefault = 15 end
+    local exitHbkRaw = pickVal(BRAKE_CFG.AutoHandbrakeOnExitSpeed, ENGINE_CFG.AutoHandbrakeOnExitSpeed)
+    local exitHbkDefault = tonumber(exitHbkRaw)
+    if exitHbkDefault == nil and exitHbkRaw ~= false then exitHbkDefault = 15 end
+    local stoppedPhaseSpeed = pickVal(BRAKE_CFG.StoppedPhaseBrakeSpeed, ENGINE_CFG.StoppedPhaseBrakeSpeed)
     local ctrlState = {
         autoParkHandbrake = (exitHbkDefault ~= nil and exitHbkDefault > 0) and true or false,
+        _exitHbkMaxKmh = exitHbkDefault,
+        _stoppedPhaseBrakeSpeed = stoppedPhaseSpeed,
+        _autoHoldBrakeSpeed = math.max(0.5, tonumber(pickVal(BRAKE_CFG.AutoHoldBrakeSpeed, ENGINE_CFG.AutoHoldBrakeSpeed)) or tonumber(stoppedPhaseSpeed) or 3),
+        _autoReleaseParkingBrake = pickVal(BRAKE_CFG.AutoReleaseParkingBrake, ENGINE_CFG.AutoReleaseParkingBrake) == true,
+        _autoHoldBrake = pickVal(BRAKE_CFG.AutoHoldBrake, ENGINE_CFG.AutoHoldBrake) == true,
+        _reusePollOut = true,
+        _wheelGrounds = {
+            [0] = { p = { [0] = 0, 0, 0 }, n = { [0] = 0, 0, 1 }, v = { [0] = 0, 0, 0 }, s = 0, matType = 67 },
+            [1] = { p = { [0] = 0, 0, 0 }, n = { [0] = 0, 0, 1 }, v = { [0] = 0, 0, 0 }, s = 0, matType = 67 },
+            [2] = { p = { [0] = 0, 0, 0 }, n = { [0] = 0, 0, 1 }, v = { [0] = 0, 0, 0 }, s = 0, matType = 67 },
+            [3] = { p = { [0] = 0, 0, 0 }, n = { [0] = 0, 0, 1 }, v = { [0] = 0, 0, 0 }, s = 0, matType = 67 },
+        },
+        _wheelGroundSet = {},
+        _posM = { [0] = 0, 0, 0 },
+        _RMat = { [0] = 1, 0, 0, 0, 1, 0, 0, 0, 1 },
+        _velM = { [0] = 0, 0, 0 },
+        _angVelRad = { [0] = 0, 0, 0 },
+        _vphysLoadsKN = { [0] = 0, 0, 0, 0 },
+        _stepControls = {},
+        _wireData = {},
+        _wheelEntities = {},
+        _subWheels = {},
+        _groundedByIndex = {},
+        _groundedSuspWheels = {},
+        _cachedLiftLen = 0,
+        _filterCache = filterCache,
+        _prof = { nextPrint = 0, nSusp = 0, nSolver = 0, tWall = 0, tTread = 0, tCurb = 0, tSusp = 0, tSolver = 0, tApply = 0, tHolo = 0, tWire = 0, tNet = 0, cWall = 0, cTread = 0, cCurb = 0, fCalls = 0, samples = 0, total = 0 },
     }
     ctrlState._addonHost = addonHost
     ctrlState._weightShiftCfg = CONFIG.WEIGHT_SHIFT_CFG
@@ -321,8 +405,17 @@ function SimcadeCore.init(CONFIG)
     ctrlState.wheelBaselines, ctrlState.wheelKeyframes = {}, {}
     local prevHadTireFx = false
     local HUD_CFG = CONFIG.HUD_CFG or {}
-    local debugHudMaster = (HUD_CFG.debugEnabled ~= nil) and (HUD_CFG.debugEnabled == true) or (HUD_CFG.debugEnabled == nil and HUD_CFG.enabled ~= false)
-    local debugRaysEnabled = debugHudMaster and (TIRE_CFG.ShowSuspensionRays == true)
+    local dbgMasterRaw = pickVal(DEBUG_CFG.enabled, HUD_CFG.debugEnabled)
+    local debugHudMaster = (dbgMasterRaw ~= nil) and (dbgMasterRaw == true) or (dbgMasterRaw == nil and HUD_CFG.enabled ~= false)
+    local debugRaysEnabled = debugHudMaster and (pickVal(DEBUG_CFG.suspensionRays, TIRE_CFG.ShowSuspensionRays) == true)
+    ctrlState._profileCPU = (pickVal(DEBUG_CFG.profileCPU, VEHICLE_CFG.ProfileCPU) == true)
+    ctrlState._debugAxle = (pickVal(DEBUG_CFG.axleDebug, SUSPENSION_CFG.showAxleDebug) == true)
+    ctrlState._wantsWheelDbg = debugHudMaster and (
+        (pickVal(DEBUG_CFG.tireDebug, TIRE_CFG.ShowTireDebug) == true)
+        or (pickVal(DEBUG_CFG.pacejkaGraph, TIRE_CFG.ShowPacejkaGraph) == true)
+        or (pickVal(DEBUG_CFG.telemetry3D, TIRE_CFG.ShowTelemetry3D) == true)
+        or (pickVal(DEBUG_CFG.weightShift, ctrlState._weightShiftCfg and ctrlState._weightShiftCfg.ShowDebug) == true)
+    )
 
     local function getSimMass(physMass)
         local vm = VEHICLE_CFG.VirtualMassKG
@@ -582,6 +675,7 @@ function SimcadeCore.init(CONFIG)
         end
         refreshContraptionMass(traceFilter)
         refreshPassengerSeats(traceFilter)
+        ctrlState._filterCount = #traceFilter
         if find and find.allPlayers then
             local ok, plys = pcall(find.allPlayers)
             if ok and type(plys) == "table" then
@@ -633,7 +727,7 @@ function SimcadeCore.init(CONFIG)
     end
 
     if timer and timer.create then
-        timer.create("Simcade_ConstraintRefresh", math.max(0.25, TIRE_CFG.ConstraintRefreshInterval or 2.0), 0, startConstraintRefresh)
+        timer.create("Simcade_ConstraintRefresh", math.max(0.25, VEHICLE_CFG.ConstraintRefreshInterval or TIRE_CFG.ConstraintRefreshInterval or 2.0), 0, startConstraintRefresh)
         timer.create("Simcade_SemiDynamicFilterUpdate", 10, 0, updateSemiDynamicFilter)
         timer.simple(1.5, function()
             if isValid(Base) and #camServerState.passengerSeats == 0 then
@@ -700,7 +794,7 @@ function SimcadeCore.init(CONFIG)
         local oldCar = physicsCar
         local newCar = SimcadeVehiclePhysics.newFromConfig(
             VEHICLE_CFG, TIRE_CFG, SUSPENSION_CFG, ENGINE_CFG, STEERING_CFG,
-            runtimeWheels, simMass, activeCompound, AERO_CFG
+            runtimeWheels, simMass, activeCompound, AERO_CFG, BRAKE_CFG, DEBUG_CFG
         )
         if oldCar then
             newCar:carryFrom(oldCar)
@@ -803,7 +897,8 @@ function SimcadeCore.init(CONFIG)
             end
 
             local radiusHolo = nil
-            local useRadiusHolo = pickVis("debugRadiusHolo", false)
+            local useRadiusHolo = pickVis("debugRadiusHolo", nil)
+            if useRadiusHolo == nil then useRadiusHolo = (DEBUG_CFG.wheelRadiusHolo == true) end
             if useRadiusHolo then
                 local rad = cfg.radius or 15
                 local wid = cfg.width or 9
@@ -826,6 +921,9 @@ function SimcadeCore.init(CONFIG)
                 or ((not isFront) and isRightSide and 2)
                 or 3
 
+            local mAngPick = isRightSide and rightAng or leftAng
+            local casterDegVal = alignment.casterDeg or 0
+            local casterRadVal = math.rad(casterDegVal)
             runtimeWheels[idx] = {
                 name          = cfg.name,
                 physicsIndex    = physicsIdx,
@@ -835,8 +933,14 @@ function SimcadeCore.init(CONFIG)
                 localMountPos = localMountPos,
                 isRightSide   = isRightSide,
                 isFront       = isFront,
+                axleSusp      = axleSusp,
                 camberDeg     = camberDeg,
-                casterDeg     = alignment.casterDeg or 0,
+                casterDeg     = casterDegVal,
+                _casterCos    = math.cos(casterRadVal),
+                _casterSin    = math.sin(casterRadVal),
+                _hasModelAng  = mAngPick ~= nil and (mAngPick.p ~= 0 or mAngPick.y ~= 0 or mAngPick.r ~= 0),
+                _hasAngOffset = extraAng ~= nil and (extraAng.p ~= 0 or extraAng.y ~= 0 or extraAng.r ~= 0),
+                _hasVisOffset = visOff ~= nil and (visOff.x ~= 0 or visOff.y ~= 0 or visOff.z ~= 0),
                 legacySteeringCamber = alignment.casterDeg == nil and alignment.steeringCamberDeg or 0,
                 steer         = cfg.steer or (isFront and 1 or 0),
                 drive         = (cfg.drive ~= false),
@@ -856,10 +960,15 @@ function SimcadeCore.init(CONFIG)
                 matType       = 67,
                 speed         = 0,
                 spinDeg       = 0,
-                lastTireRes   = nil,
+                lastTireRes   = {},
+                _subSpec      = {},
             }
         end
 
+        U.clearTable(ctrlState._wheelEntities)
+        for i = 1, #runtimeWheels do
+            ctrlState._wheelEntities[i] = runtimeWheels[i].holo
+        end
         rebuildStaticFilter()
         rebuildPhysicsCar()
         setupAxleAnchor("FrontAxle", 0, 1)
@@ -933,7 +1042,7 @@ function SimcadeCore.init(CONFIG)
                 end
             end
         elseif code == 11 then
-            if ENGINE_CFG.ParkingBrakeToggle ~= false then
+            if parkBrakeToggle then
                 ctrlState.parkingBrake = not ctrlState.parkingBrake
                 sendDriverPrint(drv, ctrlState.parkingBrake and "Parking Brake: ENGAGED" or "Parking Brake: RELEASED")
             end
@@ -1036,7 +1145,7 @@ function SimcadeCore.init(CONFIG)
             sClutch .. "=Clutch",
             sHbk .. "=Handbrake",
         }
-        if ENGINE_CFG.ParkingBrakeToggle ~= false and kParkBrk then
+        if parkBrakeToggle and kParkBrk then
             driveParts[#driveParts + 1] = keyLabel(kParkBrk, "P") .. "=ParkBrake"
         end
         if ENGINE_CFG.JakeBrakeEnabled == true and kJakeBrk then
@@ -1057,8 +1166,9 @@ function SimcadeCore.init(CONFIG)
         if CAMERA_CFG.enabled ~= false and kCam then
             sysParts[#sysParts + 1] = keyLabel(kCam, "V") .. "=Camera"
         end
+        local audioEnabled = (CONFIG.SOUND_CFG == nil or CONFIG.SOUND_CFG.enabled ~= false) and TIRE_CFG.EnableAudio ~= false
         local hornCfg = CONFIG.SOUND_CFG and CONFIG.SOUND_CFG.Horn
-        if kHorn and TIRE_CFG.EnableAudio ~= false and hornCfg and hornCfg.enabled ~= false
+        if kHorn and audioEnabled and hornCfg and hornCfg.enabled ~= false
             and type(hornCfg.sndsource) == "string" and hornCfg.sndsource ~= "" then
             sysParts[#sysParts + 1] = keyLabel(kHorn, "G") .. "=Horn"
         end
@@ -1094,6 +1204,7 @@ function SimcadeCore.init(CONFIG)
         if not isValid(Base) then return end
         local Phys = Base:getPhysicsObject()
         if not isValid(Phys) then return end
+        local abs, min, max, sqrt, clamp, ceil, deg = U.abs, U.min, U.max, U.sqrt, U.clamp, U.ceil, U.deg
 
         local nowTick = timer.curtime()
         local prevThink = ctrlState._lastThinkTime or 0
@@ -1105,7 +1216,7 @@ function SimcadeCore.init(CONFIG)
             if not held then
                 local fdt = math.clamp(tickDt, 0.002, 0.05)
                 local curVel = Phys:getVelocity()
-                if cachedLiftForcePerSec and curVel:dot(cachedLiftForcePerSec) <= 15 * cachedLiftForcePerSec:getLength() then
+                if cachedLiftForcePerSec and curVel:dot(cachedLiftForcePerSec) <= 15 * (ctrlState._cachedLiftLen or cachedLiftForcePerSec:getLength()) then
                     local imp = cachedLiftForcePerSec * fdt
                     Phys:applyForceCenter(imp)
                     skippedLiftApplied = skippedLiftApplied + imp
@@ -1129,6 +1240,19 @@ function SimcadeCore.init(CONFIG)
         end
         local maxCPU = VEHICLE_CFG.MaxCPUPercent or 75
         if cpuLoadPct > 97 then return end
+        local profOn = ctrlState._profileCPU and quotaUsed ~= nil
+        local prof = ctrlState._prof
+        local q0 = profOn and quotaUsed() or 0
+        if profOn then
+            SimcadeSuspension._countTraces = true
+            SimcadeSuspension._traceCount = 0
+            ctrlState._filterCache.calls = 0
+            prof._tWallTick, prof._tTreadTick, prof._tCurbTick = 0, 0, 0
+            prof._cWallTick, prof._cTreadTick, prof._cCurbTick = 0, 0, 0
+            prof._nSuspTick = 0
+        else
+            SimcadeSuspension._countTraces = false
+        end
         local physicsMaxSubsteps = (cpuLoadPct > 88) and 1 or ((dt <= 0.035) and 2 or ((cpuLoadPct > maxCPU) and 2 or 3))
         tickFilterScanner()
 
@@ -1174,8 +1298,7 @@ function SimcadeCore.init(CONFIG)
             end
             lastHudDriver = nil
             rebuildStaticFilter(nil)
-            local exitMaxKmh = tonumber(ENGINE_CFG.AutoHandbrakeOnExitSpeed)
-            if exitMaxKmh == nil and ENGINE_CFG.AutoHandbrakeOnExitSpeed ~= false then exitMaxKmh = 15 end
+            local exitMaxKmh = ctrlState._exitHbkMaxKmh
             if exitMaxKmh and exitMaxKmh > 0 then
                 local exitKmh = math.round(Phys:getVelocity():getLength() * 3600 * 0.0000254)
                 if exitKmh <= exitMaxKmh then
@@ -1191,18 +1314,18 @@ function SimcadeCore.init(CONFIG)
         local rawBrake           = ctrl.rawBrake
         local rawHandbrake       = ctrl.rawHandbrake
         local currentSpeedKmh    = Phys:getVelocity():getLength() * 3600 * 0.0000254
-        local holdMaxSpeed       = math.max(0.5, tonumber(ENGINE_CFG.AutoHoldBrakeSpeed) or tonumber(ENGINE_CFG.StoppedPhaseBrakeSpeed) or 3)
+        local holdMaxSpeed       = ctrlState._autoHoldBrakeSpeed
         local inNeutralOrPark    = physicsCar and ((physicsCar.dt and physicsCar.dt.gear == 1) or (physicsCar.classicAuto and not physicsCar.manualBox and physicsCar.autoRange == 0))
         local canAutoRelease     = (not ctrl.clutchDown) and (not inNeutralOrPark)
         local wantsReverseLaunch = canAutoRelease and physicsCar and not physicsCar.manualBox and not physicsCar.classicAuto
             and rawBrake > 0.05 and currentSpeedKmh <= holdMaxSpeed and not (physicsCar.drv and physicsCar.drv.brakeLatch)
         local hasDrivePedal      = canAutoRelease and (rawThrottle > 0.05 or wantsReverseLaunch or (physicsCar and physicsCar.drv and physicsCar.drv.reversing and rawBrake > 0.05))
         if hasDriver then
-            if ctrlState.parkingBrake and ENGINE_CFG.AutoReleaseParkingBrake == true and hasDrivePedal then
+            if ctrlState.parkingBrake and ctrlState._autoReleaseParkingBrake and hasDrivePedal then
                 ctrlState.parkingBrake = false
                 sendDriverPrint(Driver, "Parking Brake: RELEASED")
             end
-            if ENGINE_CFG.AutoHoldBrake == true then
+            if ctrlState._autoHoldBrake then
                 if hasDrivePedal then
                     ctrlState.autoHoldActive = false
                 elseif currentSpeedKmh <= holdMaxSpeed and rawBrake <= 0.05 then
@@ -1233,7 +1356,7 @@ function SimcadeCore.init(CONFIG)
         end
         local podLight = false
         if hasDriver and isValid(Pod) then
-            local okL, valL = pcall(function() return Pod["Light"] end)
+            local okL, valL = pcall(U.readPodLight, Pod)
             if okL and valL and tonumber(valL) and tonumber(valL) > 0 then podLight = true end
         end
         local ignToggle = hasDriver and ((ctrlState.ignKeyHeld == true) or (ctrl.fKey == 1) or podLight or (wireInputs and wireInputs.Light and wireInputs.Light > 0)) or false
@@ -1310,11 +1433,19 @@ function SimcadeCore.init(CONFIG)
         ctrlState._smoothedVertG = (ctrlState._smoothedVertG or 0) + (math.clamp(rawVertG, -0.85, 1.50) - (ctrlState._smoothedVertG or 0)) * math.clamp(dt * 10, 0, 1)
         if movingGate == 0 then smoothedFwdAccel, smoothedLatAccel, ctrlState._smoothedVertG = 0, 0, 0 end
 
-        -- Raycasts & curb blocking (uses O(1) traceFilterFn instead of marshaling the full entity array per ray)
+        -- Raycasts & curb blocking (uses O(1) traceFilterFn with per-tick entity verdict memoization)
+        local fc = ctrlState._filterCache
+        if fc.dirty then
+            U.clearTable(fc.wall)
+            U.clearTable(fc.tread)
+            fc.dirty = false
+        end
         local groundedCount = 0
         local waterWheelsCount = 0
-        local wheelGrounds = {}
-        local treadMinMass = math.max(35, physMass * 0.15)
+        local wheelGrounds = ctrlState._wheelGrounds
+        local wheelGroundSet = ctrlState._wheelGroundSet
+        wheelGroundSet[0], wheelGroundSet[1], wheelGroundSet[2], wheelGroundSet[3] = nil, nil, nil, nil
+        local treadMinMass = max(35, physMass * 0.15)
 
         local canPointContents = (trace.pointContents ~= nil and CONTENTS ~= nil and CONTENTS.WATER ~= nil and bit ~= nil and bit.band ~= nil)
         local canWaterTrace = (not canPointContents) and (MASK ~= nil and MASK.WATER ~= nil)
@@ -1322,24 +1453,31 @@ function SimcadeCore.init(CONFIG)
         local viewer = hasDriver and Driver or owner()
         local resetWheelDebug = Base ~= ctrlState.debugBase or viewer ~= ctrlState.debugViewer
         local firstDebugWheel = not resetWheelDebug and ctrlState.wheelPage <= #runtimeWheels and ctrlState.wheelPage or 1
-        local debugCount = math.min(4, #runtimeWheels - firstDebugWheel + 1)
-        for index, w in ipairs(runtimeWheels) do
-            local axleSusp = SimcadeSuspension.getAxleCfg(SUSPENSION_CFG, w.isFront)
-            local rideHeight = math.max(8, axleSusp.rideHeight or 24)
-            local airTravel  = math.max(-(rideHeight - 2), axleSusp.airTravel ~= nil and axleSusp.airTravel or 6)
+        local debugCount = min(4, #runtimeWheels - firstDebugWheel + 1)
+        for index = 1, #runtimeWheels do
+            local w = runtimeWheels[index]
+            local axleSusp = w.axleSusp or SimcadeSuspension.getAxleCfg(SUSPENSION_CFG, w.isFront)
+            local rideHeight = max(8, axleSusp.rideHeight or 24)
+            local airTravel  = max(-(rideHeight - 2), axleSusp.airTravel ~= nil and axleSusp.airTravel or 6)
             w.rideHeight, w.airTravel = rideHeight, airTravel
 
             local radius = w.radius
             local extraReach = 0
             if axleSusp.solidAxle then
-                local span = math.clamp(axleSusp.springSpanRatio or 0.75, 0, 1)
+                local span = clamp(axleSusp.springSpanRatio or 0.75, 0, 1)
                 extraReach = (rideHeight + airTravel) * (1 - span) / (1 + span)
             end
             local maxRayDist = rideHeight + airTravel + radius + extraReach
-            local localMountPos = comLocal
-                + resolvedLocalFwd   * w.pos.x
-                + resolvedLocalRight * w.rightOffset
-                + resolvedLocalUp    * w.mountZ
+            local localMountPos = w._cachedLocalMountPos
+            if not localMountPos or w._cachedMountCom ~= comLocal or w._cachedMountZ ~= w.mountZ then
+                localMountPos = comLocal
+                    + resolvedLocalFwd   * w.pos.x
+                    + resolvedLocalRight * w.rightOffset
+                    + resolvedLocalUp    * w.mountZ
+                w._cachedLocalMountPos = localMountPos
+                w._cachedMountCom = comLocal
+                w._cachedMountZ = w.mountZ
+            end
             w.localMountPos = localMountPos
 
             local mountPos = Base:localToWorld(localMountPos) + driverRight * (w.beamInset or 0)
@@ -1348,18 +1486,31 @@ function SimcadeCore.init(CONFIG)
             w.curbAxle = axle
             local wallPoint, wallNormal
             if not isPhysgunHeld then
+                local qw0 = profOn and quotaUsed() or 0
+                local tc0 = profOn and SimcadeSuspension._traceCount or 0
                 traceMinMass = 0
                 wallPoint, wallNormal = SimcadeSuspension.traceWheelWall(w, mountPos, driverUp, axle,
                     Phys, dt, physMass, SUSPENSION_CFG, traceFilterFn)
+                if profOn then
+                    prof._tWallTick = prof._tWallTick + (quotaUsed() - qw0)
+                    prof._cWallTick = prof._cWallTick + (SimcadeSuspension._traceCount - tc0)
+                end
             else
                 w.wallProbeOrigin = nil
                 w.wallDriveContact = nil
+                w._wallAxle = nil
             end
             w.wallContact = wallPoint ~= nil
+            local qt0 = profOn and quotaUsed() or 0
+            local tct0 = profOn and SimcadeSuspension._traceCount or 0
             traceMinMass = treadMinMass
             local tr, hitDist, rays = SimcadeSuspension.traceTread(w, mountPos, driverUp, axle,
                 maxRayDist, traceFilterFn, treadMinMass, SUSPENSION_CFG, debugRaysEnabled and nowTick >= nextWheelDebugNetTime
                     and index >= firstDebugWheel and index < firstDebugWheel + debugCount, wallPoint, wallNormal)
+            if profOn then
+                prof._tTreadTick = prof._tTreadTick + (quotaUsed() - qt0)
+                prof._cTreadTick = prof._cTreadTick + (SimcadeSuspension._traceCount - tct0)
+            end
             if rays then w.debugAxle = Base:worldToLocalVector(axle) end
             w.debugRays = rays
             -- The tire solver measures travel on the mount axis, then adds the wheel radius.
@@ -1369,7 +1520,7 @@ function SimcadeCore.init(CONFIG)
             w.inPlaneForcePos = comWorld + driverFwd * w.pos.x + driverRight * w.rightOffset
 
             local hitNorm = tr and (tr.StartSolid and driverUp or tr.HitNormal) or driverUp
-            local upAlign = math.max(0, hitNorm:dot(driverUp))
+            local upAlign = max(0, hitNorm:dot(driverUp))
             if tr then
                 w.isGrounded = true
                 w.upAlign, w.hitNormal = upAlign, hitNorm
@@ -1391,9 +1542,9 @@ function SimcadeCore.init(CONFIG)
                     end
                 end
                 w.inWater = inWater
-                local bumpLim = math.max(4, axleSusp.bumpLimit or rideHeight)
+                local bumpLim = max(4, axleSusp.bumpLimit or rideHeight)
                 local maxComp = tr.StartSolid and bumpLim or (bumpLim + radius * 0.5)
-                w.compIn = math.clamp((rideHeight + radius) - hitDist, -airTravel - extraReach, maxComp)
+                w.compIn = clamp((rideHeight + radius) - hitDist, -airTravel - extraReach, maxComp)
                 w.surfId = SimcadeVehiclePhysics.mapSurface(w.matType)
             else
                 w.isGrounded = false
@@ -1406,7 +1557,6 @@ function SimcadeCore.init(CONFIG)
                 w.surfId = 0
             end
             physicsCar.wheels[w.physicsIndex].travelCamberDeg = SimcadeSuspension.travelCamber(axleSusp, w.compIn, rideHeight, airTravel)
-
         end
 
         for leftIndex = 0, 3, 3 do
@@ -1419,14 +1569,29 @@ function SimcadeCore.init(CONFIG)
             physicsCar.wheels[rightIndex].beamRollDeg = roll
         end
 
-        for _, w in ipairs(runtimeWheels) do
+        local curbStationary = velWorld:getLengthSqr() < 0.0025 and Phys:getAngleVelocity():getLengthSqr() < 0.0001
+        for i = 1, #runtimeWheels do
+            local w = runtimeWheels[i]
             if w.isGrounded then
                 groundedCount = groundedCount + 1
                 if w.inWater then waterWheelsCount = waterWheelsCount + 1 end
                 w.supportVel = SimcadeSuspension.supportVelocity(w, dt)
                 if not isPhysgunHeld and not w.wallContact then
-                    traceMinMass = treadMinMass
-                    SimcadeSuspension.applyCurbBlock(Phys, w, driverUp, w.curbAxle, dt, physMass, numWheels, gravity, SUSPENSION_CFG, traceFilterFn)
+                    if curbStationary and not w.support and not w.curbNormal then
+                        w.curbRoadSupport = nil
+                        w.curbRoadPoint = w.contactPos
+                        w.curbRoadNormal = w.hitNormal
+                        w.curbNormal, w.curbJolted = nil, nil
+                    else
+                        local qc0 = profOn and quotaUsed() or 0
+                        local tcc0 = profOn and SimcadeSuspension._traceCount or 0
+                        traceMinMass = treadMinMass
+                        SimcadeSuspension.applyCurbBlock(Phys, w, driverUp, w.curbAxle, dt, physMass, numWheels, gravity, SUSPENSION_CFG, traceFilterFn)
+                        if profOn then
+                            prof._tCurbTick = prof._tCurbTick + (quotaUsed() - qc0)
+                            prof._cCurbTick = prof._cCurbTick + (SimcadeSuspension._traceCount - tcc0)
+                        end
+                    end
                 else
                     w.curbNormal, w.curbRoadPoint = nil, nil
                 end
@@ -1438,51 +1603,59 @@ function SimcadeCore.init(CONFIG)
             local gp = w.solverGround or (w.mountPos - driverUp * 4000)
             local gn = w.isGrounded and w.hitNormal or driverUp
             local gv = w.supportVel
-            wheelGrounds[w.physicsIndex] = {
-                p = { [0] = gp.x * IN_TO_M, gp.y * IN_TO_M, gp.z * IN_TO_M },
-                n = { [0] = gn.x, gn.y, gn.z },
-                v = gv and { [0] = gv.x * IN_TO_M, gv.y * IN_TO_M, gv.z * IN_TO_M } or { [0] = 0, 0, 0 },
-                s = w.surfId or 0, matType = w.matType,
-            }
+            local slot = wheelGrounds[w.physicsIndex]
+            slot.p[0], slot.p[1], slot.p[2] = gp.x * IN_TO_M, gp.y * IN_TO_M, gp.z * IN_TO_M
+            slot.n[0], slot.n[1], slot.n[2] = gn.x, gn.y, gn.z
+            if gv then
+                slot.v[0], slot.v[1], slot.v[2] = gv.x * IN_TO_M, gv.y * IN_TO_M, gv.z * IN_TO_M
+            else
+                slot.v[0], slot.v[1], slot.v[2] = 0, 0, 0
+            end
+            slot.s = w.surfId or 0
+            slot.matType = w.matType
+            wheelGroundSet[w.physicsIndex] = true
         end
 
         for k = 0, 3 do
-            if not wheelGrounds[k] then
+            if not wheelGroundSet[k] then
                 local farBelow = comWorld - driverUp * 4000
-                wheelGrounds[k] = {
-                    p = { [0] = farBelow.x * IN_TO_M, farBelow.y * IN_TO_M, farBelow.z * IN_TO_M },
-                    n = { [0] = driverUp.x, driverUp.y, driverUp.z },
-                    s = 0,
-                }
+                local slot = wheelGrounds[k]
+                slot.p[0], slot.p[1], slot.p[2] = farBelow.x * IN_TO_M, farBelow.y * IN_TO_M, farBelow.z * IN_TO_M
+                slot.n[0], slot.n[1], slot.n[2] = driverUp.x, driverUp.y, driverUp.z
+                slot.v[0], slot.v[1], slot.v[2] = 0, 0, 0
+                slot.s = 0
+                slot.matType = nil
             end
         end
 
         -- Step physics solver (unoccupied does NOT disable car/grip: hold = false)
-        local pos_m = { [0] = comWorld.x * IN_TO_M, comWorld.y * IN_TO_M, comWorld.z * IN_TO_M }
-        local R_mat = {
-            [0] = driverFwd.x,  [1] = driverFwd.y,  [2] = driverFwd.z,
-            [3] = driverLeft.x, [4] = driverLeft.y, [5] = driverLeft.z,
-            [6] = driverUp.x,   [7] = driverUp.y,   [8] = driverUp.z,
-        }
-        local vel_m = { [0] = velWorld.x * IN_TO_M, velWorld.y * IN_TO_M, velWorld.z * IN_TO_M }
+        local pos_m = ctrlState._posM
+        pos_m[0], pos_m[1], pos_m[2] = comWorld.x * IN_TO_M, comWorld.y * IN_TO_M, comWorld.z * IN_TO_M
+        local R_mat = ctrlState._RMat
+        R_mat[0], R_mat[1], R_mat[2] = driverFwd.x,  driverFwd.y,  driverFwd.z
+        R_mat[3], R_mat[4], R_mat[5] = driverLeft.x, driverLeft.y, driverLeft.z
+        R_mat[6], R_mat[7], R_mat[8] = driverUp.x,   driverUp.y,   driverUp.z
+        local vel_m = ctrlState._velM
+        vel_m[0], vel_m[1], vel_m[2] = velWorld.x * IN_TO_M, velWorld.y * IN_TO_M, velWorld.z * IN_TO_M
         local angVelLocal    = Phys:getAngleVelocity()
         local angVelWorldRad = Base:localToWorldVector(angVelLocal) * (math.pi / 180)
-        local angVel_rad     = { [0] = angVelWorldRad.x, angVelWorldRad.y, angVelWorldRad.z }
+        local angVel_rad     = ctrlState._angVelRad
+        angVel_rad[0], angVel_rad[1], angVel_rad[2] = angVelWorldRad.x, angVelWorldRad.y, angVelWorldRad.z
 
-        local frontBias   = math.clamp(VEHICLE_CFG.frontWeightBias or 0.50, 0.30, 0.70)
-        local cgScale         = math.clamp((SUSPENSION_CFG.centerOfMassHeight or 14) / 14, 0.2, 3.0)
-        local vphysLoadsKN = {}
+        local frontBias   = clamp(VEHICLE_CFG.frontWeightBias or 0.50, 0.30, 0.70)
+        local cgScale     = clamp((SUSPENSION_CFG.centerOfMassHeight or 14) / 14, 0.2, 3.0)
+        local vphysLoadsKN = ctrlState._vphysLoadsKN
+        vphysLoadsKN[0], vphysLoadsKN[1], vphysLoadsKN[2], vphysLoadsKN[3] = 0, 0, 0, 0
         local clutchPedal = clutchDown and 0 or 1
         local aHost = ctrlState._addonHost
         if aHost then
             local actx = aHost.ctx
             actx.base = Base; actx.pod = Pod; actx.phys = Phys; actx.car = physicsCar
             actx.wheels = runtimeWheels; actx.driver = Driver
-            actx.state = {
-                dt = dt, kmh = kmh, mph = mph, throttle = rawThrottle, brake = rawBrake,
-                handbrake = rawHandbrake, clutch = clutchPedal, steer = steerInput,
-                groundedCount = groundedCount, reversing = (physicsCar.drv and physicsCar.drv.reversing) or false,
-            }
+            local st = actx.state
+            st.dt = dt; st.kmh = kmh; st.mph = mph; st.throttle = rawThrottle; st.brake = rawBrake
+            st.handbrake = rawHandbrake; st.clutch = clutchPedal; st.steer = steerInput
+            st.groundedCount = groundedCount; st.reversing = (physicsCar.drv and physicsCar.drv.reversing) or false
             aHost.runHook("OnPrePhysics", dt, ctrl)
         end
         local turboActive = ENGINE_CFG.Turbo == true
@@ -1557,7 +1730,8 @@ function SimcadeCore.init(CONFIG)
         end
         -- Suspension forces (using simMass for virtual weight scaling)
         local avgCornerWeight = (simMass / numWheels) * gravity
-        local groundedSuspWheels = {}
+        local groundedSuspWheels = ctrlState._groundedSuspWheels
+        for i = #groundedSuspWheels, 1, -1 do groundedSuspWheels[i] = nil end
         local rawCornerLiftSum = Vector(0, 0, 0)
         local avgGroundNorm = Vector(0, 0, 0)
         local avgUpAlign = 0
@@ -1565,16 +1739,17 @@ function SimcadeCore.init(CONFIG)
         local suspBumpInt, suspDroopInt = 0, 0
         local ssCfg = SUSPENSION_CFG.SuspensionSounds or {}
         if ssCfg.enabled ~= false then
-            local nowSuspSnd = timer.curtime()
+            local nowSuspSnd = nowTick
             local minBumpV   = ssCfg.minBumpVel    or SUSPENSION_CFG.minBumpSoundVel  or 75
-            local maxBumpV   = math.max(minBumpV + 10, ssCfg.maxBumpVel  or SUSPENSION_CFG.maxBumpSoundVel  or 260)
+            local maxBumpV   = max(minBumpV + 10, ssCfg.maxBumpVel  or SUSPENSION_CFG.maxBumpSoundVel  or 260)
             local minDroopV  = ssCfg.minDroopVel   or SUSPENSION_CFG.minDroopSoundVel or 95
-            local maxDroopV  = math.max(minDroopV + 10, ssCfg.maxDroopVel or SUSPENSION_CFG.maxDroopSoundVel or 280)
+            local maxDroopV  = max(minDroopV + 10, ssCfg.maxDroopVel or SUSPENSION_CFG.maxDroopSoundVel or 280)
             local bumpCD     = ssCfg.bumpCooldown  or 0.25
             local droopCD    = ssCfg.droopCooldown or 0.25
-            for _, w in ipairs(runtimeWheels) do
-                local axleSusp = SimcadeSuspension.getAxleCfg(SUSPENSION_CFG, w.isFront)
-                local bumpLim = math.max(4, axleSusp.bumpLimit or w.rideHeight or 24)
+            for i = 1, #runtimeWheels do
+                local w = runtimeWheels[i]
+                local axleSusp = w.axleSusp or SimcadeSuspension.getAxleCfg(SUSPENSION_CFG, w.isFront)
+                local bumpLim = max(4, axleSusp.bumpLimit or w.rideHeight or 24)
                 local airLim  = (w.airTravel ~= nil) and w.airTravel or 6
                 local prevC   = w.prevCompIn or 0
                 local curC    = w.compIn or 0
@@ -1587,21 +1762,21 @@ function SimcadeCore.init(CONFIG)
                         local dC = curC - prevC
                         local compVel = w.wasGrounded and (dC / dt) or (-cornerVelUp)
                         local hitBumpstop = curC >= bumpTrig and prevC < bumpTrig and compVel >= minBumpV
-                        local hardStrike  = w.wasGrounded and curC >= (bumpLim * 0.55) and dC >= 1.2 and compVel >= math.max(minBumpV * 1.4, minBumpV + 30)
+                        local hardStrike  = w.wasGrounded and curC >= (bumpLim * 0.55) and dC >= 1.2 and compVel >= max(minBumpV * 1.4, minBumpV + 30)
                         if hitBumpstop or hardStrike then
                             if not w._lastBumpSnd or (nowSuspSnd - w._lastBumpSnd) > bumpCD then
                                 w._lastBumpSnd = nowSuspSnd
-                                local inten = math.clamp((compVel - minBumpV) / (maxBumpV - minBumpV), 0.15, 1.0)
+                                local inten = clamp((compVel - minBumpV) / (maxBumpV - minBumpV), 0.15, 1.0)
                                 if inten > suspBumpInt then suspBumpInt = inten end
                             end
                         end
                     end
                     local droopTrig = -airLim + 0.5
-                    local extVel = math.max((prevC - curC) / dt, cornerVelUp)
+                    local extVel = max((prevC - curC) / dt, cornerVelUp)
                     if curC <= droopTrig and prevC > droopTrig and extVel >= minDroopV then
                         if not w._lastDroopSnd or (nowSuspSnd - w._lastDroopSnd) > droopCD then
                             w._lastDroopSnd = nowSuspSnd
-                            local inten = math.clamp((extVel - minDroopV) / (maxDroopV - minDroopV), 0.15, 1.0)
+                            local inten = clamp((extVel - minDroopV) / (maxDroopV - minDroopV), 0.15, 1.0)
                             if inten > suspDroopInt then suspDroopInt = inten end
                         end
                     end
@@ -1616,8 +1791,12 @@ function SimcadeCore.init(CONFIG)
         local staticX, staticY = 0, 0
         local suspParams = ctrlState._suspParams or {}
         ctrlState._suspParams = suspParams
-        local subWheels, groundedByIndex = {}, {}
-        for _, w in ipairs(runtimeWheels) do
+        local subWheels = ctrlState._subWheels
+        for i = #subWheels, 1, -1 do subWheels[i] = nil end
+        local groundedByIndex = ctrlState._groundedByIndex
+        groundedByIndex[0], groundedByIndex[1], groundedByIndex[2], groundedByIndex[3] = nil, nil, nil, nil
+        for i = 1, #runtimeWheels do
+            local w = runtimeWheels[i]
             local share = (w.isFront and frontBias or (1 - frontBias)) * 0.5
             staticX = staticX + share * w.pos.x
             staticY = staticY + share * w.rightOffset
@@ -1629,11 +1808,11 @@ function SimcadeCore.init(CONFIG)
                 w._ly       = rel:dot(driverRight)
                 w._liftDir = w.hitNormal
                 w._liftUp = w._liftDir:dot(driverUp)
-                w._axleSusp = SimcadeSuspension.getAxleCfg(SUSPENSION_CFG, w.isFront)
+                w._axleSusp = w.axleSusp or SimcadeSuspension.getAxleCfg(SUSPENSION_CFG, w.isFront)
                 local axle = w._axleSusp
-                local deflection = w.rideHeight * math.clamp(axle.restCompression or 0.45, 0.15, 0.85)
+                local deflection = w.rideHeight * clamp(axle.restCompression or 0.45, 0.15, 0.85)
                 local stiffness = axle.springStiffnessMult or axle.springStiffness or 1
-                maxSpringFrequency = math.max(maxSpringFrequency, math.sqrt(math.max(0, stiffness) * gravity / deflection))
+                maxSpringFrequency = max(maxSpringFrequency, sqrt(max(0, stiffness) * gravity / deflection))
                 local c0 = w.compIn or 0
                 local patchVelocity = velWorld + angVelWorldRad:cross(w.contactPos - comWorld)
                 if w.supportVel then
@@ -1643,8 +1822,8 @@ function SimcadeCore.init(CONFIG)
                 -- instantly. Only motion into the current surface drives the damper.
                 w._rate0 = -patchVelocity:dot(w.hitNormal) / w.upAlign
                 w._subComp  = c0
-                w._subMaxC  = math.max(w.rideHeight or 24, (w._axleSusp and w._axleSusp.bumpLimit) or 24) + 2
-                w._subMinC  = math.min(c0, -(w.airTravel or 6))
+                w._subMaxC  = max(w.rideHeight or 24, (w._axleSusp and w._axleSusp.bumpLimit) or 24) + 2
+                w._subMinC  = min(c0, -(w.airTravel or 6))
                 w._subImp   = 0
                 groundedByIndex[w.physicsIndex] = w
                 subWheels[#subWheels + 1] = w
@@ -1653,12 +1832,13 @@ function SimcadeCore.init(CONFIG)
 
         -- A roll couple needs support on both sides of an axle. Once the inside
         -- wheel lifts, its suspension cannot keep pushing the chassis over.
-        for _, w in ipairs(runtimeWheels) do
+        for i = 1, #runtimeWheels do
+            local w = runtimeWheels[i]
             local opposite = w.physicsIndex % 2 == 0 and w.physicsIndex + 1 or w.physicsIndex - 1
             w._rollSide = w.isGrounded and groundedByIndex[opposite] and (w.isRightSide and 1 or -1) or 0
         end
 
-        local canTransferRoll = not isPhysgunHeld and (absVx > 1.5 or math.abs(signedLatSpeed) > 1.5)
+        local canTransferRoll = not isPhysgunHeld and (absVx > 1.5 or abs(signedLatSpeed) > 1.5)
             and ((groundedByIndex[0] and groundedByIndex[1]) or (groundedByIndex[2] and groundedByIndex[3]))
         if not canTransferRoll then
             ctrlState.rollLoadG, ctrlState.corneringG = 0, 0
@@ -1670,11 +1850,12 @@ function SimcadeCore.init(CONFIG)
                 ctrlState.corneringG or 0, accelBlend, SUSPENSION_CFG.rollRecoveryMult or 1)
         end
         local rollMult = SUSPENSION_CFG.rollTransferMult or 1
-        local maxRB = SUSPENSION_CFG.maxRollBias or (0.55 * math.max(1, math.abs(rollMult)))
-        local rollBias = math.clamp(ctrlState.rollLoadG * 0.180 * rollMult * cgScale, -maxRB, maxRB)
+        local maxRB = SUSPENSION_CFG.maxRollBias or (0.55 * max(1, abs(rollMult)))
+        local rollBias = clamp(ctrlState.rollLoadG * 0.180 * rollMult * cgScale, -maxRB, maxRB)
         if SUSPENSION_CFG.invertRollTransfer then rollBias = -rollBias end
 
-        if #subWheels > 0 then
+        local nSub = #subWheels
+        if nSub > 0 then
             local iRoll, iPitch
             local inert = Phys.getInertia and Phys:getInertia() or nil
             if inert then
@@ -1689,29 +1870,30 @@ function SimcadeCore.init(CONFIG)
             local cHeaveSum, cRollSum, cPitchSum = 0, 0, 0
             local cornerMassSub = simMass / numWheels
             local isTruckSub = simMass >= 2600
-            for _, w in ipairs(subWheels) do
-                maxLy = math.max(maxLy, math.abs(w._ly))
-                maxLx = math.max(maxLx, math.abs(w._lx))
+            for i = 1, nSub do
+                local w = subWheels[i]
+                maxLy = max(maxLy, abs(w._ly))
+                maxLx = max(maxLx, abs(w._lx))
                 local axle = w._axleSusp
-                local deflection = math.max(1, w.rideHeight * math.clamp(axle.restCompression or 0.45, 0.15, 0.85))
-                local stiffness = math.max(0, axle.springStiffnessMult or axle.springStiffness or 1)
-                local helper = math.max(0, axle.helperSpringMult or (isTruckSub and 8 or 0))
-                local helperStart = math.clamp(axle.helperStartCompression or 0, deflection / w.rideHeight, 1) * w.rideHeight
-                local travel = math.max(1, (axle.bumpLimit or w.rideHeight) - helperStart)
-                local overload = math.clamp((w._subComp - helperStart) / travel, 0, 1)
+                local deflection = max(1, w.rideHeight * clamp(axle.restCompression or 0.45, 0.15, 0.85))
+                local stiffness = max(0, axle.springStiffnessMult or axle.springStiffness or 1)
+                local helper = max(0, axle.helperSpringMult or (isTruckSub and 8 or 0))
+                local helperStart = clamp(axle.helperStartCompression or 0, deflection / w.rideHeight, 1) * w.rideHeight
+                local travel = max(1, (axle.bumpLimit or w.rideHeight) - helperStart)
+                local overload = clamp((w._subComp - helperStart) / travel, 0, 1)
                 local kWheel = cornerMassSub * gravity * (stiffness / deflection + 2 * helper * overload / travel)
                 local bumpDampM = axle.bumpDamping or (isTruckSub and 0.85 or 1.0)
                 local rebDampM  = axle.reboundDamping or (isTruckSub and 1.35 or 1.25)
                 local bumpRat   = axle.bumpDampingRatio or axle.dampingRatio or 0.72
                 local rebRat    = axle.reboundDampingRatio or (bumpRat * 1.25)
-                local bumpLimSub = math.max(4, axle.bumpLimit or w.rideHeight)
-                local cWheel    = 2.0 * math.sqrt(math.max(1, kWheel * cornerMassSub)) * math.max(bumpRat * bumpDampM, rebRat * rebDampM)
+                local bumpLimSub = max(4, axle.bumpLimit or w.rideHeight)
+                local cWheel    = 2.0 * sqrt(max(1, kWheel * cornerMassSub)) * max(bumpRat * bumpDampM, rebRat * rebDampM)
                 if w._subComp > bumpLimSub * 0.85 then
                     local wsSub = w.isFront and (frontBias * 2) or ((1.0 - frontBias) * 2)
-                    cWheel = cWheel + (cornerMassSub * wsSub) / math.max(0.005, dt)
+                    cWheel = cWheel + (cornerMassSub * wsSub) / max(0.005, dt)
                 end
-                maxSpringFrequency = math.max(maxSpringFrequency, math.sqrt(kWheel / cornerMassSub))
-                kRollSum  = kRollSum  + kWheel * (1 + 1.4 * math.clamp(axle.antiRollStiffness or 0, 0, 1.2)) * (w._ly * w._ly)
+                maxSpringFrequency = max(maxSpringFrequency, sqrt(kWheel / cornerMassSub))
+                kRollSum  = kRollSum  + kWheel * (1 + 1.4 * clamp(axle.antiRollStiffness or 0, 0, 1.2)) * (w._ly * w._ly)
                 kPitchSum = kPitchSum + kWheel * (w._lx * w._lx)
                 cHeaveSum = cHeaveSum + cWheel
                 cRollSum  = cRollSum  + cWheel * (w._ly * w._ly)
@@ -1720,86 +1902,183 @@ function SimcadeCore.init(CONFIG)
             -- Geometric estimate fallback; keep a low floor so small Base props still use their true inertia.
             local geoRoll  = physMass * maxLy * maxLy * 0.4
             local geoPitch = physMass * maxLx * maxLx * 0.4
-            iRoll  = (iRoll and iRoll > 0) and math.clamp(iRoll, geoRoll * 0.05, geoRoll * 2.0) or geoRoll
-            iPitch = (iPitch and iPitch > 0) and math.clamp(iPitch, geoPitch * 0.05, geoPitch * 2.0) or geoPitch
+            iRoll  = (iRoll and iRoll > 0) and clamp(iRoll, geoRoll * 0.05, geoRoll * 2.0) or geoRoll
+            iPitch = (iPitch and iPitch > 0) and clamp(iPitch, geoPitch * 0.05, geoPitch * 2.0) or geoPitch
             -- Convert physical inertia to the same scale as the simulated spring forces.
-            iRoll  = math.max(1, iRoll / supportScale)
-            iPitch = math.max(1, iPitch / supportScale)
-            maxSpringFrequency = math.max(maxSpringFrequency, math.sqrt(kRollSum / iRoll), math.sqrt(kPitchSum / iPitch))
+            iRoll  = max(1, iRoll / supportScale)
+            iPitch = max(1, iPitch / supportScale)
+            maxSpringFrequency = max(maxSpringFrequency, sqrt(kRollSum / iRoll), sqrt(kPitchSum / iPitch))
             -- Account for modal damping eigenvalues (c/I) as well as spring frequency so explicit substeps
             -- stay strictly inside the stability boundary even at 33-tick half-rate (dt ~ 0.06s) on low-inertia Base props.
-            local maxDampRate = math.max(cHeaveSum / simMass, cRollSum / iRoll, cPitchSum / iPitch)
-            local nSuspSub = math.clamp(math.ceil(dt * math.max(66, 8 * maxSpringFrequency, 1.35 * maxDampRate)), 1, 96)
+            local maxDampRate = max(cHeaveSum / simMass, cRollSum / iRoll, cPitchSum / iPitch)
+            local nSuspSub = clamp(ceil(dt * max(66, 8 * maxSpringFrequency, 1.35 * maxDampRate)), 1, 96)
+            if profOn then prof._nSuspTick = nSuspSub; prof._qs0 = quotaUsed() end
             local hSub = dt / nSuspSub
-            local gFracSub    = #subWheels / numWheels
+            local gFracSub    = nSub / numWheels
             local avgCWSub    = (simMass / numWheels) * gravity
             local transferTr  = 0
-            if math.abs(rollBias) > 0.0001 then
-                for _, w in ipairs(subWheels) do
+            if abs(rollBias) > 0.0001 then
+                for i = 1, nSub do
+                    local w = subWheels[i]
                     transferTr = transferTr + (w._rollSide * rollBias * avgCWSub * gFracSub) * w._ly
                 end
             end
 
             local gUp = gravity * driverUp.z
-            local loadLeveling = #subWheels >= 3 and
+            local loadLeveling = nSub >= 3 and
                 ((SimcadeSuspension.getAxleCfg(SUSPENSION_CFG, false).levelCapacityKG or 0) > 0
                 or (SimcadeSuspension.getAxleCfg(SUSPENSION_CFG, true).levelCapacityKG or 0) > 0)
+            local useFastSusp = SimcadeSuspension.evalWheelForceFast ~= nil
+                and SimcadeSuspension.computeWheelForce == SimcadeSuspension._defaultComputeWheelForce
+            local evalFast = SimcadeSuspension.evalWheelForceFast
+            local beamFast = SimcadeSuspension.beamSeatForceFast
+            local wFL, wFR, wRL, wRR = groundedByIndex[0], groundedByIndex[1], groundedByIndex[3], groundedByIndex[2]
+            local frontBarRate, rearBarRate = 0, 0
+            if useFastSusp then
+                for i = 1, nSub do
+                    local w = subWheels[i]
+                    local ws = w.isFront and (frontBias * 2) or ((1.0 - frontBias) * 2)
+                    w._subSpec = SimcadeSuspension.prepareSubstepSpec(w._subSpec, w.rideHeight, simMass, numWheels, dt, w._axleSusp, ws)
+                    if loadLeveling then
+                        w._staticSpring = evalFast(w._subSpec, w.compIn, 0, 0)
+                    end
+                end
+                if wFL and wFR then
+                    frontBarRate = 0.70 * clamp(wFL._axleSusp.antiRollStiffness or 0, 0, 1.2) * min(wFL._subSpec.kSpring, wFR._subSpec.kSpring)
+                end
+                if wRL and wRR then
+                    rearBarRate = 0.70 * clamp(wRL._axleSusp.antiRollStiffness or 0, 0, 1.2) * min(wRL._subSpec.kSpring, wRR._subSpec.kSpring)
+                end
+            else
+                suspParams.virtualMassKG = simMass
+                suspParams.physMassKG    = supportMass
+                suspParams.numWheels     = numWheels
+                suspParams.dt            = hSub
+                suspParams.arrestDt      = dt
+            end
+
+            local invSimMass = 1.0 / simMass
+            local invIRoll = 1.0 / iRoll
+            local invIPitch = 1.0 / iPitch
             local dvz, dwr, dwp = 0, 0, 0
             for s = 1, nSuspSub do
                 local Fz, TrSpring, TpSpring = 0, 0, 0
-                for _, w in ipairs(subWheels) do
-                    local dCorner = dvz + dwr * w._ly + dwp * w._lx
-                    local rate = w._rate0 - dCorner
-                    suspParams.compIn        = w._subComp
-                    suspParams.compressionRate = rate
-                    suspParams.chassisVelZ   = w._cvz0 + dCorner
-                    suspParams.rideHeight    = w.rideHeight or 24
-                    suspParams.virtualMassKG = simMass
-                    suspParams.physMassKG    = supportMass
-                    suspParams.numWheels     = numWheels
-                    suspParams.dt            = hSub
-                    suspParams.arrestDt      = dt
-                    suspParams.axleSusp      = w._axleSusp
-                    suspParams.weightShare   = w.isFront and (frontBias * 2) or ((1.0 - frontBias) * 2)
-                    local _, force, rateK
-                    if w.beamMate then
-                        force, rateK = SimcadeSuspension.beamSeatForce(w, suspParams, rate, dvz, dwr, dwp)
-                    else
-                        _, force, rateK = SimcadeSuspension.computeWheelForce(suspParams)
+                if useFastSusp then
+                    for i = 1, nSub do
+                        local w = subWheels[i]
+                        local dCorner = dvz + dwr * w._ly + dwp * w._lx
+                        local rate = w._rate0 - dCorner
+                        local spec = w._subSpec
+                        if w.beamMate then
+                            local force, rateK = beamFast(w, spec, rate, w._cvz0 + dCorner, dvz, dwr, dwp)
+                            w._springForce, w._springRate = force, rateK
+                        else
+                            local compIn = w._subComp
+                            local bumpLimit = spec.bumpLimit
+                            local springComp = compIn < bumpLimit and compIn or bumpLimit
+                            local velComp = rate < -450 and -450 or (rate > 450 and 450 or rate)
+                            local effVel = velComp > 60 and (60 + (velComp - 60) * 0.20) or velComp
+                            if effVel > 140 then effVel = 140 end
+                            local helperPeak = spec.helperPeak
+                            local helperForce = 0
+                            local dampK
+                            if helperPeak > 0 then
+                                local overload = (springComp > spec.helperStart) and ((springComp - spec.helperStart) * spec.invHelperTrav) or 0
+                                helperForce = helperPeak * overload * overload
+                                local tangentRate = spec.kSpring + 2 * helperPeak * overload * spec.invHelperTrav
+                                local km = tangentRate * spec.cornerMassV
+                                dampK = 2.0 * sqrt(km > 1 and km or 1) * (velComp >= 0 and spec.bumpDampFac or spec.rebDampFac)
+                            else
+                                dampK = velComp >= 0 and spec.bumpDampBase or spec.rebDampBase
+                            end
+                            local sf = springComp * spec.kSpring + helperForce + effVel * dampK
+                            local bumpStart = spec.bumpStart
+                            if compIn > bumpStart and velComp >= 0 then
+                                local over = (compIn - bumpStart) * spec.invBumpSpan
+                                if over > 1.5 then over = 1.5 end
+                                sf = sf + spec.bumpStopCoeff * (over * over)
+                            end
+                            local maxForce = (velComp <= 0 and spec.maxForceReb or spec.maxForceBump) + helperForce
+                            if sf < 0 then sf = 0 elseif sf > maxForce then sf = maxForce end
+                            local cvz = w._cvz0 + dCorner
+                            if compIn > bumpStart and cvz < -5 then
+                                local arrestFrac = (compIn - bumpStart) * spec.invArrestSpan
+                                if arrestFrac < 0.35 then arrestFrac = 0.35 elseif arrestFrac > 1.0 then arrestFrac = 1.0 end
+                                local arrestForce = (-cvz) * spec.arrestScale
+                                if arrestForce > spec.arrestCap then arrestForce = spec.arrestCap end
+                                sf = sf + arrestForce * arrestFrac
+                            end
+                            w._springForce, w._springRate = sf, spec.kSpring
+                        end
                     end
-                    w._springForce, w._springRate = force, rateK
-                    if loadLeveling and s == 1 then
-                        -- Estimate the static corner load for the heave and pitch predictors.
-                        suspParams.compIn = w.compIn
-                        suspParams.compressionRate, suspParams.chassisVelZ = 0, 0
-                        local _, staticForce = SimcadeSuspension.computeWheelForce(suspParams)
-                        w._staticSpring = staticForce
+                    if wFL and wFR then
+                        local flF, frF = wFL._springForce, wFR._springForce
+                        local transfer = (wFL._subComp - wFR._subComp) * frontBarRate
+                        if wFL.beamMate == wFR then transfer = transfer - (flF - frF) * (1 - wFL.seatNear) end
+                        if transfer < -flF then transfer = -flF elseif transfer > frF then transfer = frF end
+                        wFL._springForce, wFR._springForce = flF + transfer, frF - transfer
                     end
+                    if wRL and wRR then
+                        local rlF, rrF = wRL._springForce, wRR._springForce
+                        local transfer = (wRL._subComp - wRR._subComp) * rearBarRate
+                        if wRL.beamMate == wRR then transfer = transfer - (rlF - rrF) * (1 - wRL.seatNear) end
+                        if transfer < -rlF then transfer = -rlF elseif transfer > rrF then transfer = rrF end
+                        wRL._springForce, wRR._springForce = rlF + transfer, rrF - transfer
+                    end
+                else
+                    for i = 1, nSub do
+                        local w = subWheels[i]
+                        local dCorner = dvz + dwr * w._ly + dwp * w._lx
+                        local rate = w._rate0 - dCorner
+                        suspParams.compIn          = w._subComp
+                        suspParams.compressionRate = rate
+                        suspParams.chassisVelZ     = w._cvz0 + dCorner
+                        suspParams.rideHeight      = w.rideHeight or 24
+                        suspParams.axleSusp        = w._axleSusp
+                        suspParams.weightShare     = w.isFront and (frontBias * 2) or ((1.0 - frontBias) * 2)
+                        local _, force, rateK
+                        if w.beamMate then
+                            force, rateK = SimcadeSuspension.beamSeatForce(w, suspParams, rate, dvz, dwr, dwp)
+                        else
+                            _, force, rateK = SimcadeSuspension.computeWheelForce(suspParams)
+                        end
+                        w._springForce, w._springRate = force, rateK
+                        if loadLeveling and s == 1 then
+                            suspParams.compIn = w.compIn
+                            suspParams.compressionRate, suspParams.chassisVelZ = 0, 0
+                            local _, staticForce = SimcadeSuspension.computeWheelForce(suspParams)
+                            w._staticSpring = staticForce
+                        end
+                    end
+                    SimcadeSuspension.applyAntiRoll(wFL, wFR)
+                    SimcadeSuspension.applyAntiRoll(wRL, wRR)
                 end
-                SimcadeSuspension.applyAntiRoll(groundedByIndex[0], groundedByIndex[1])
-                SimcadeSuspension.applyAntiRoll(groundedByIndex[3], groundedByIndex[2])
-                for _, w in ipairs(subWheels) do
+                for i = 1, nSub do
+                    local w = subWheels[i]
                     local f = w._springForce
                     w._subImp = w._subImp + f * hSub
                     local fe = (f - (loadLeveling and w._staticSpring or 0)) * w._liftUp
                     Fz = Fz + fe
-                    -- The applied offset impulses subtract the static load shares.
-                    -- Axle leveling estimates heave and pitch load. The passive
-                    -- roll predictor must retain the left/right restoring moment.
                     TrSpring = TrSpring + f * w._liftUp * (w._ly - staticY)
                     TpSpring = TpSpring + fe * (w._lx - staticX)
                 end
                 if nSuspSub > 1 then
                     local Tr = TrSpring + transferTr
-                    dvz = dvz + (Fz / simMass - (loadLeveling and 0 or gUp)) * hSub
-                    dwr = dwr + (Tr / iRoll) * hSub
-                    dwp = dwp + (TpSpring / iPitch) * hSub
-                    for _, w in ipairs(subWheels) do
+                    dvz = dvz + (Fz * invSimMass - (loadLeveling and 0 or gUp)) * hSub
+                    dwr = dwr + (Tr * invIRoll) * hSub
+                    dwp = dwp + (TpSpring * invIPitch) * hSub
+                    for i = 1, nSub do
+                        local w = subWheels[i]
                         local rate = w._rate0 - (dvz + dwr * w._ly + dwp * w._lx)
-                        w._subComp = math.clamp(w._subComp + rate * hSub, w._subMinC, w._subMaxC)
+                        local nc = w._subComp + rate * hSub
+                        if nc < w._subMinC then nc = w._subMinC elseif nc > w._subMaxC then nc = w._subMaxC end
+                        w._subComp = nc
                     end
                 end
             end
+            if profOn then prof._tSuspTick = quotaUsed() - (prof._qs0 or q0) end
+        elseif profOn then
+            prof._tSuspTick = 0
         end
 
         local levelImpulse = 0
@@ -1855,27 +2134,29 @@ function SimcadeCore.init(CONFIG)
             for i = 0, 3 do vphysLoadsKN[i] = vphysLoadsKN[i] * supportScale / driveScale end
         end
         local useContactYaw = groundedCount > 0 and (supportMass > physMass or payloadKG > 0)
-        local physicsStep = physicsCar:stepVPhysics(dt, pos_m, R_mat, vel_m, angVel_rad, wheelGrounds, {
-            useContactYaw   = useContactYaw,
-            steer           = steerInput,
-            gas             = ignRes.running and rawThrottle or 0,
-            reverseGas      = ignRes.running and (ctrl.rawReverseThrottle or rawBrake) or 0,
-            forwardBrake    = (ctrl.wKey == 1) and 1 or rawThrottle,
-            brake           = rawBrake,
-            handbrake       = rawHandbrake,
-            hold            = false,
-            clutchPedal     = clutchPedal,
-            vphysLoadsKN    = vphysLoadsKN,
-            aeroCfg         = AERO_CFG,
-            weightShiftCfg  = ctrlState._weightShiftCfg,
-            fwdAccelG       = smoothedFwdAccel,
-            latAccelG       = smoothedLatAccel,
-            vertAccelG      = ctrlState._smoothedVertG or 0,
-            ignitionRunning = ignRes.running,
-            cranking        = ignRes.cranking,
-            crankRPM        = ignRes.crankRPM,
-            maxSubsteps     = physicsMaxSubsteps,
-        })
+        local stepControls = ctrlState._stepControls
+        stepControls.useContactYaw   = useContactYaw
+        stepControls.steer           = steerInput
+        stepControls.gas             = ignRes.running and rawThrottle or 0
+        stepControls.reverseGas      = ignRes.running and (ctrl.rawReverseThrottle or rawBrake) or 0
+        stepControls.forwardBrake    = (ctrl.wKey == 1) and 1 or rawThrottle
+        stepControls.brake           = rawBrake
+        stepControls.handbrake       = rawHandbrake
+        stepControls.hold            = false
+        stepControls.clutchPedal     = clutchPedal
+        stepControls.vphysLoadsKN    = vphysLoadsKN
+        stepControls.aeroCfg         = AERO_CFG
+        stepControls.weightShiftCfg  = ctrlState._weightShiftCfg
+        stepControls.fwdAccelG       = smoothedFwdAccel
+        stepControls.latAccelG       = smoothedLatAccel
+        stepControls.vertAccelG      = ctrlState._smoothedVertG or 0
+        stepControls.ignitionRunning = ignRes.running
+        stepControls.cranking        = ignRes.cranking
+        stepControls.crankRPM        = ignRes.crankRPM
+        stepControls.maxSubsteps     = physicsMaxSubsteps
+        if profOn then prof._qSol0 = quotaUsed() end
+        local physicsStep = physicsCar:stepVPhysics(dt, pos_m, R_mat, vel_m, angVel_rad, wheelGrounds, stepControls)
+        if profOn then prof._tSolTick = quotaUsed() - prof._qSol0; prof._qApp0 = quotaUsed() end
 
         if physicsStep.engineStalled and ignState.running then
             SimcadeEngine.stallIgnition(ignState)
@@ -1888,191 +2169,245 @@ function SimcadeCore.init(CONFIG)
         end
 
         local totalAppliedForce = 0
-        local slopeGravFix = Vector(0, 0, 0)
+        local slopeGravFix
         if not isPhysgunHeld then
-            if #groundedSuspWheels > 0 then
-            -- Source Engine gravity (600 in/s^2 = 15.24 m/s^2) is 1.55x Earth gravity (9.81 m/s^2),
-            -- while tire loads are calibrated to 9.81 m/s^2. Trim only the excess tangential
-            -- downhill gravity on grounded slopes so hills, curbs, and handbrakes match real 1g grip.
-            local excessGravFrac = math.max(0, 1 - (9.81 * M_TO_IN) / gravity)
-            if excessGravFrac > 0.001 then
-                local rawFix = Vector(0, 0, 0)
-                for _, w in ipairs(groundedSuspWheels) do
-                    local n = w.hitNormal
-                    if n and n.z > 0.55 and (1 - n.z * n.z) > 1e-6 then
-                        local l = w.suspImpulseVec * supportScale
-                        local hx, hy = -l.x, -l.y
-                        local hz = -(hx * n.x + hy * n.y) / n.z
-                        rawFix = rawFix + Vector(hx, hy, hz) * excessGravFrac
+            local centerImpulse
+            local nGndSusp = #groundedSuspWheels
+            if nGndSusp > 0 then
+                -- Source Engine gravity (600 in/s^2 = 15.24 m/s^2) is 1.55x Earth gravity (9.81 m/s^2),
+                -- while tire loads are calibrated to 9.81 m/s^2. Trim only the excess tangential
+                -- downhill gravity on grounded slopes so hills, curbs, and handbrakes match real 1g grip.
+                local excessGravFrac = max(0, 1 - (9.81 * M_TO_IN) / gravity)
+                if excessGravFrac > 0.001 then
+                    local rfx, rfy, rfz = 0, 0, 0
+                    local hasSlopeFix = false
+                    for i = 1, nGndSusp do
+                        local w = groundedSuspWheels[i]
+                        local n = w.hitNormal
+                        if n and n.z > 0.55 and (1 - n.z * n.z) > 1e-6 then
+                            local l = w.suspImpulseVec
+                            local hx, hy = -l.x * supportScale, -l.y * supportScale
+                            local hz = -(hx * n.x + hy * n.y) / n.z
+                            rfx = rfx + hx * excessGravFrac
+                            rfy = rfy + hy * excessGravFrac
+                            rfz = rfz + hz * excessGravFrac
+                            hasSlopeFix = true
+                        end
+                    end
+                    if hasSlopeFix then
+                        local maxFix = supportMass * (gravity - 9.81 * M_TO_IN) * dt * (nGndSusp / numWheels)
+                        local fixLenSq = rfx * rfx + rfy * rfy + rfz * rfz
+                        if fixLenSq > maxFix * maxFix and fixLenSq > 1e-12 then
+                            local sc = maxFix / sqrt(fixLenSq)
+                            rfx, rfy, rfz = rfx * sc, rfy * sc, rfz * sc
+                        end
+                        slopeGravFix = Vector(rfx, rfy, rfz)
                     end
                 end
-                local maxFix = supportMass * (gravity - 9.81 * M_TO_IN) * dt * (#groundedSuspWheels / numWheels)
-                local fixLen = rawFix:getLength()
-                if fixLen > maxFix and fixLen > 1e-6 then
-                    rawFix = rawFix * (maxFix / fixLen)
+                centerImpulse = slopeGravFix and (rawCornerLiftSum * supportScale + slopeGravFix - skippedLiftApplied)
+                    or (rawCornerLiftSum * supportScale - skippedLiftApplied)
+                if skippedLiftApplied.x ~= 0 or skippedLiftApplied.y ~= 0 or skippedLiftApplied.z ~= 0 then
+                    skippedLiftApplied = Vector(0, 0, 0)
                 end
-                slopeGravFix = rawFix
-            end
-            Phys:applyForceCenter(rawCornerLiftSum * supportScale + slopeGravFix - skippedLiftApplied)
-            skippedLiftApplied = Vector(0, 0, 0)
 
-            local maxDeltaImp = avgCornerWeight * dt * 6.0 + levelImpulse
-            -- Apply differential suspension moments strictly along chassis-up (pitch & roll).
-            -- Horizontal slope reactions are already applied at COM via rawCornerLiftSum and balanced
-            -- by staticGripImpulse; offsetting horizontal corner differences against Base's VPhysics
-            -- yaw inertia would inject a large spurious yaw couple whenever one wheel sits on a ramp.
-            local sumLiftUp = rawCornerLiftSum:dot(driverUp)
-            local maxOffset = maxDeltaImp
-            for _, w in ipairs(runtimeWheels) do
-                local share = (w.isFront and frontBias or (1 - frontBias)) * 0.5
-                maxOffset = math.max(maxOffset, math.abs(w.suspImpulseVec:dot(driverUp) - sumLiftUp * share))
-            end
-            local offsetScale = maxDeltaImp / maxOffset
-            for _, w in ipairs(runtimeWheels) do
-                local staticShare = w.isFront and (frontBias * 0.5) or ((1.0 - frontBias) * 0.5)
-                local deltaUp = w.suspImpulseVec:dot(driverUp) - (sumLiftUp * staticShare)
-                if math.abs(deltaUp) > 0.03 then
-                    Phys:applyForceOffset(driverUp * (deltaUp * offsetScale * supportScale), w.inPlaneForcePos)
+                local maxDeltaImp = avgCornerWeight * dt * 6.0 + levelImpulse
+                -- Apply differential suspension moments strictly along chassis-up (pitch & roll),
+                -- combined with pitch/roll load transfer at the exact same w.inPlaneForcePos point.
+                local sumLiftUp = rawCornerLiftSum:dot(driverUp)
+                local maxOffset = maxDeltaImp
+                for i = 1, #runtimeWheels do
+                    local w = runtimeWheels[i]
+                    local share = (w.isFront and frontBias or (1 - frontBias)) * 0.5
+                    local su = w.suspImpulseVec:dot(driverUp)
+                    w._suspUp = su
+                    local du = abs(su - sumLiftUp * share)
+                    if du > maxOffset then maxOffset = du end
+                end
+                local offsetScale = maxDeltaImp / maxOffset
+
+                local pitchInv  = (SUSPENSION_CFG.invertPitchTransfer == true) and -1 or 1
+                local slowingDown = smoothedFwdAccel * signedFwdSpeed < 0
+                local pitchKey = slowingDown and "pitchTransferBrakeMult" or "pitchTransferAccelMult"
+                local pitchMult = SUSPENSION_CFG[pitchKey] or SUSPENSION_CFG.pitchTransferMult or 1.0
+                local maxPB     = SUSPENSION_CFG.maxPitchBias or (0.22 * max(1.0, abs(pitchMult)))
+                local pitchBias = clamp(smoothedFwdAccel * 0.038 * pitchMult * cgScale, -maxPB, maxPB) * pitchInv
+                local hasTransfer = (abs(pitchBias) > 0.0001 or abs(rollBias) > 0.0001)
+                local transferScale = hasTransfer and (avgCornerWeight * dt * (nGndSusp / numWheels)) or 0
+                for i = 1, #runtimeWheels do
+                    local w = runtimeWheels[i]
+                    local staticShare = w.isFront and (frontBias * 0.5) or ((1.0 - frontBias) * 0.5)
+                    local deltaUp = w._suspUp - (sumLiftUp * staticShare)
+                    local combImp = (abs(deltaUp) > 0.03) and (deltaUp * offsetScale) or 0
+                    if hasTransfer then
+                        local frontSign = w.isFront and 1 or -1
+                        combImp = combImp + (frontSign * pitchBias + w._rollSide * rollBias) * transferScale
+                    end
+                    if abs(combImp) > 1e-6 then
+                        Phys:applyForceOffset(driverUp * (combImp * supportScale), w.inPlaneForcePos)
+                    end
                 end
             end
 
-            local pitchInv  = (SUSPENSION_CFG.invertPitchTransfer == true) and -1 or 1
-            local slowingDown = smoothedFwdAccel * signedFwdSpeed < 0
-            local pitchKey = slowingDown and "pitchTransferBrakeMult" or "pitchTransferAccelMult"
-            local pitchMult = SUSPENSION_CFG[pitchKey] or SUSPENSION_CFG.pitchTransferMult or 1.0
-            local maxPB     = SUSPENSION_CFG.maxPitchBias or (0.22 * math.max(1.0, math.abs(pitchMult)))
-            local pitchBias = math.clamp(smoothedFwdAccel * 0.038 * pitchMult * cgScale, -maxPB, maxPB) * pitchInv
-            if math.abs(pitchBias) > 0.0001 or math.abs(rollBias) > 0.0001 then
-                local gFrac = #groundedSuspWheels / numWheels
-                for _, w in ipairs(runtimeWheels) do
-                    local frontSign = w.isFront and 1 or -1
-                    local transferImp = (frontSign * pitchBias + w._rollSide * rollBias) * avgCornerWeight * dt * gFrac
-                    Phys:applyForceOffset(driverUp * (transferImp * supportScale), w.inPlaneForcePos)
-                end
-            end
-        end
-
-        -- Convert simulated acceleration to an impulse on the supported chassis.
-            local gripTiltScale = (#groundedSuspWheels > 0) and math.clamp((avgUpAlign - 0.55) / 0.23, 0, 1) or 0
+            -- Convert simulated acceleration to an impulse on the supported chassis.
+            local gripTiltScale = (nGndSusp > 0) and clamp((avgUpAlign - 0.55) / 0.23, 0, 1) or 0
             if canTransferRoll then
                 -- Only the road-tangent lateral part of the tire impulse
                 -- contributes. Longitudinal force is handled by pitch transfer.
                 local rightDotNormal = driverRight:dot(avgGroundNorm)
                 local lateralScale = gripTiltScale * (1 - rightDotNormal * rightDotNormal)
-                ctrlState.corneringG = math.clamp(-physicsStep.dv_left_m * M_TO_IN * lateralScale / (dt * gravity), -2, 2)
+                ctrlState.corneringG = clamp(-physicsStep.dv_left_m * M_TO_IN * lateralScale / (dt * gravity), -2, 2)
             end
             local totalGripImpulse = (driverFwd * (physicsStep.dv_fwd_m * M_TO_IN * driveMass)
                 + driverLeft * (physicsStep.dv_left_m * M_TO_IN * driveMass)) * gripTiltScale
-            if #groundedSuspWheels > 0 and avgGroundNorm:getLengthSqr() > 0.01 then
+            if nGndSusp > 0 and avgGroundNorm:getLengthSqr() > 0.01 then
                 totalGripImpulse = totalGripImpulse - avgGroundNorm * totalGripImpulse:dot(avgGroundNorm)
             end
-            if totalGripImpulse:getLengthSqr() > 0.001 then
-                Phys:applyForceCenter(totalGripImpulse)
+            local gripLenSq = totalGripImpulse:getLengthSqr()
+            if gripLenSq > 0.001 then
+                centerImpulse = centerImpulse and (centerImpulse + totalGripImpulse) or totalGripImpulse
             end
-            totalAppliedForce = totalGripImpulse:getLength()
-            if #groundedSuspWheels > 0 and dt > 0 then
-                local liftPerSec = (rawCornerLiftSum * supportScale + slopeGravFix) / dt
-                local gFrac = #groundedSuspWheels / numWheels
+            totalAppliedForce = sqrt(gripLenSq)
+            if nGndSusp > 0 and dt > 0 then
+                local liftPerSec = slopeGravFix and ((rawCornerLiftSum * supportScale + slopeGravFix) / dt)
+                    or ((rawCornerLiftSum * supportScale) / dt)
+                local gFrac = nGndSusp / numWheels
                 local maxCachedLift = supportMass * gravity * 1.15
                 local liftLen = liftPerSec:getLength()
                 local clampedLift = (liftLen > maxCachedLift) and (liftPerSec * (maxCachedLift / liftLen)) or liftPerSec
                 if cachedLiftForcePerSec then
-                    local blend = math.clamp(dt * 3.0, 0, 1)
+                    local blend = clamp(dt * 3.0, 0, 1)
                     cachedLiftForcePerSec = cachedLiftForcePerSec + (clampedLift - cachedLiftForcePerSec) * blend
+                    ctrlState._cachedLiftLen = cachedLiftForcePerSec:getLength()
                 else
-                    local staticSupport = supportMass * gravity * gFrac * math.max(0, avgGroundNorm.z)
-                    cachedLiftForcePerSec = avgGroundNorm * math.min(staticSupport, liftLen)
+                    local staticSupport = supportMass * gravity * gFrac * max(0, avgGroundNorm.z)
+                    local initLen = min(staticSupport, liftLen)
+                    cachedLiftForcePerSec = avgGroundNorm * initLen
+                    ctrlState._cachedLiftLen = initLen
                 end
             else
                 cachedLiftForcePerSec = nil
+                ctrlState._cachedLiftLen = 0
                 skippedLiftApplied = Vector(0, 0, 0)
                 cachedRestForcePerSec = nil
                 skippedRestApplied = Vector(0, 0, 0)
             end
 
             -- Angular damping + yaw delta
+            local expFn = U.exp
             local angDrag = VEHICLE_CFG.angularDrag or Vector(3.6, 3.8, 3.4)
-            local rollPitchMult = (#groundedSuspWheels >= 3) and 0.55 or 0.15
+            local rollPitchMult = (nGndSusp >= 3) and 0.55 or 0.15
             local rollRate = angVelLocal:dot(resolvedLocalFwd)
-            local rollDamping = resolvedLocalFwd * (-rollRate * (1 - math.exp(-angDrag.x * rollPitchMult * dt)))
-            local dampPitch = -angVelLocal:dot(resolvedLocalRight) * (1.0 - math.exp(-(angDrag.y * rollPitchMult) * dt))
+            local rollDamping = resolvedLocalFwd * (-rollRate * (1 - expFn(-angDrag.x * rollPitchMult * dt)))
+            local dampPitch = -angVelLocal:dot(resolvedLocalRight) * (1.0 - expFn(-(angDrag.y * rollPitchMult) * dt))
             local deltaAngVel = rollDamping + resolvedLocalRight * dampPitch
 
-            if #groundedSuspWheels >= 3 and math.abs(steerInput) < 0.05 and rawHandbrake < 0.1 and (physicsStep.speed_ms or 0) * 3.6 > 8 then
+            if nGndSusp >= 3 and abs(steerInput) < 0.05 and rawHandbrake < 0.1 and (physicsStep.speed_ms or 0) * 3.6 > 8 then
                 local yawStabRate = (STEERING_CFG.yawStabilityAssist or 0.38) * 4.5
-                deltaAngVel.z = deltaAngVel.z - angVelLocal.z * (1.0 - math.exp(-yawStabRate * dt))
+                deltaAngVel.z = deltaAngVel.z - angVelLocal.z * (1.0 - expFn(-yawStabRate * dt))
             end
 
             local inPark = physicsCar.classicAuto and not physicsCar.manualBox and physicsCar.autoRange == 0
             local drivetrainOpen = inPark or clutchDown or (physicsCar.dt and physicsCar.dt.gear == 1) or rawHandbrake > 0.5
             local canHold = groundedCount >= 2 and (drivetrainOpen or (rawThrottle < 0.05 and (physicsCar.drv.thr or 0) < 0.05))
-            local supportedLoad, brakedLoad = 0, 0
-            for _, w in ipairs(groundedSuspWheels) do
-                w.holdBrake = math.max(physicsCar.drv.brk or 0, w.isFront and 0 or rawHandbrake)
-                -- A small front holding force helps a parked car when the
-                -- steered tires point partly down a bank. Fade it out as the
-                -- car starts moving relative to the surface under this wheel.
-                if w.isFront and rawHandbrake > 0 and rawThrottle < 0.05 then
-                    local relative = velWorld - w.supportVel + angVelWorldRad:cross(w.contactPos - comWorld)
-                    local tangent = relative - w.hitNormal * relative:dot(w.hitNormal)
-                    local assist = 0.12 * rawHandbrake * math.max(0, 1 - tangent:getLengthSqr() / (20 * 20))
-                    w.holdBrake = math.max(w.holdBrake, assist)
+            local restYawImpulse = 0
+            local yawOrigin = useContactYaw and Base:localToWorld(massCenterLocal)
+                or (comWorld + driverFwd * ((physicsCar.comShiftX_m or 0) * M_TO_IN))
+            if canHold then
+                local supportedLoad, brakedLoad = 0, 0
+                for i = 1, nGndSusp do
+                    local w = groundedSuspWheels[i]
+                    local hb = max(physicsCar.drv.brk or 0, w.isFront and 0 or rawHandbrake)
+                    if w.isFront and rawHandbrake > 0 and rawThrottle < 0.05 then
+                        local relative = velWorld - w.supportVel + angVelWorldRad:cross(w.contactPos - comWorld)
+                        local tangent = relative - w.hitNormal * relative:dot(w.hitNormal)
+                        local assist = 0.12 * rawHandbrake * max(0, 1 - tangent:getLengthSqr() * 0.0025)
+                        if assist > hb then hb = assist end
+                    end
+                    w.holdBrake = hb
+                    supportedLoad = supportedLoad + w.normalLoad
+                    brakedLoad = brakedLoad + w.normalLoad * hb
                 end
-                supportedLoad = supportedLoad + w.normalLoad
-                brakedLoad = brakedLoad + w.normalLoad * w.holdBrake
-            end
-            local restImpulse, restYawImpulse, staticHoldImpulse = Vector(), 0, Vector()
-            local parkingHold = brakedLoad > 0 and canHold
-            local yawOrigin = comWorld + driverFwd * ((physicsCar.comShiftX_m or 0) * M_TO_IN)
-            local yawInverseInertia
-            if useContactYaw then
-                yawOrigin = Base:localToWorld(massCenterLocal)
-                local inertia = Phys:getInertia()
-                local up = resolvedLocalUp
-                if inertia and inertia.x > 0 and inertia.y > 0 and inertia.z > 0 then
-                    yawInverseInertia = up.x^2 / inertia.x + up.y^2 / inertia.y + up.z^2 / inertia.z
-                end
-            end
-            local chassisStaticHoriz = Vector(-(rawCornerLiftSum.x * supportScale + slopeGravFix.x), -(rawCornerLiftSum.y * supportScale + slopeGravFix.y), 0)
-            for _, w in ipairs(runtimeWheels) do
-                local massShare = grossPhysical * w.normalLoad / math.max(0.001, supportedLoad)
-                local brakeShare = grossPhysical * w.normalLoad * (w.holdBrake or 0) / math.max(0.001, brakedLoad)
-                local motionMass = parkingHold and supportMass or physMass
-                local impulse, point, staticHold = SimcadeSuspension.staticGripImpulse(w, physicsCar.wheels[w.physicsIndex],
-                    canHold, w.holdBrake or 0, driverFwd, driverLeft, useContactYaw and yawOrigin or comWorld, velWorld, angVelWorldRad,
-                    massShare, brakeShare, driveScale, gravity, dt, Base, supportScale,
-                    useContactYaw and motionMass / grossPhysical or 1, yawInverseInertia and motionMass * yawInverseInertia or 0,
-                    parkingHold, chassisStaticHoriz, grossPhysical)
-                if impulse then
-                    restImpulse = restImpulse + impulse
-                    -- Exclude the COM-balanced staticHold from restYawImpulse so cross-loaded wheels
-                    -- on a ramp do not spin the car; keep full motion/anchor yaw damping.
-                    local yawPart = staticHold and (impulse - staticHold) or impulse
-                    restYawImpulse = restYawImpulse + (point - yawOrigin):cross(yawPart):dot(driverUp) * IN_TO_M
-                    if staticHold then
-                        staticHoldImpulse = staticHoldImpulse + staticHold
+                local restImpulse, staticHoldImpulse = Vector(), Vector()
+                local parkingHold = brakedLoad > 0
+                local yawInverseInertia
+                if useContactYaw then
+                    local inertia = Phys:getInertia()
+                    local up = resolvedLocalUp
+                    if inertia and inertia.x > 0 and inertia.y > 0 and inertia.z > 0 then
+                        yawInverseInertia = up.x * up.x / inertia.x + up.y * up.y / inertia.y + up.z * up.z / inertia.z
                     end
                 end
-            end
-            -- Static grip replaces the settled part of the dynamic contact impulse.
-            local restScale = 1000 * M_TO_IN * driveScale
-            local hasStaticHold = staticHoldImpulse:getLengthSqr() > 1e-8
-            if restImpulse:getLengthSqr() > 0 then
-                local fullRestImp = restImpulse * restScale
-                Phys:applyForceCenter(hasStaticHold and (fullRestImp - skippedRestApplied) or fullRestImp)
-            end
-            skippedRestApplied = Vector(0, 0, 0)
-            if hasStaticHold and #groundedSuspWheels > 0 and dt > 0 then
-                cachedRestForcePerSec = (staticHoldImpulse * restScale) / dt
+                local sxFix = slopeGravFix and slopeGravFix.x or 0
+                local syFix = slopeGravFix and slopeGravFix.y or 0
+                local chassisStaticHoriz = Vector(-(rawCornerLiftSum.x * supportScale + sxFix), -(rawCornerLiftSum.y * supportScale + syFix), 0)
+                local invSuppLoad = 1 / max(0.001, supportedLoad)
+                local invBrkLoad = 1 / max(0.001, brakedLoad)
+                local motionMass = parkingHold and supportMass or physMass
+                local mRatio = useContactYaw and (motionMass / grossPhysical) or 1
+                local yFactor = yawInverseInertia and (motionMass * yawInverseInertia) or 0
+                local comRef = useContactYaw and yawOrigin or comWorld
+                for i = 1, #runtimeWheels do
+                    local w = runtimeWheels[i]
+                    local massShare = grossPhysical * w.normalLoad * invSuppLoad
+                    local brakeShare = grossPhysical * w.normalLoad * (w.holdBrake or 0) * invBrkLoad
+                    local impulse, point, staticHold = SimcadeSuspension.staticGripImpulse(w, physicsCar.wheels[w.physicsIndex],
+                        true, w.holdBrake or 0, driverFwd, driverLeft, comRef, velWorld, angVelWorldRad,
+                        massShare, brakeShare, driveScale, gravity, dt, Base, supportScale,
+                        mRatio, yFactor, parkingHold, chassisStaticHoriz, grossPhysical)
+                    if impulse then
+                        restImpulse = restImpulse + impulse
+                        local yawPart = staticHold and (impulse - staticHold) or impulse
+                        restYawImpulse = restYawImpulse + (point - yawOrigin):cross(yawPart):dot(driverUp) * IN_TO_M
+                        if staticHold then
+                            staticHoldImpulse = staticHoldImpulse + staticHold
+                        end
+                    end
+                end
+                -- Static grip replaces the settled part of the dynamic contact impulse.
+                local restScale = 1000 * M_TO_IN * driveScale
+                local hasStaticHold = staticHoldImpulse:getLengthSqr() > 1e-8
+                if restImpulse:getLengthSqr() > 0 then
+                    local fullRestImp = restImpulse * restScale
+                    local addRest = hasStaticHold and (fullRestImp - skippedRestApplied) or fullRestImp
+                    centerImpulse = centerImpulse and (centerImpulse + addRest) or addRest
+                end
+                if skippedRestApplied.x ~= 0 or skippedRestApplied.y ~= 0 or skippedRestApplied.z ~= 0 then
+                    skippedRestApplied = Vector(0, 0, 0)
+                end
+                if hasStaticHold and nGndSusp > 0 and dt > 0 then
+                    cachedRestForcePerSec = (staticHoldImpulse * restScale) / dt
+                else
+                    cachedRestForcePerSec = nil
+                end
             else
+                for i = 1, #runtimeWheels do
+                    runtimeWheels[i].restAnchor = nil
+                end
                 cachedRestForcePerSec = nil
+                if skippedRestApplied.x ~= 0 or skippedRestApplied.y ~= 0 or skippedRestApplied.z ~= 0 then
+                    skippedRestApplied = Vector(0, 0, 0)
+                end
+            end
+            local waterLvl = (Base.getWaterLevel and Base:getWaterLevel()) or (Base.waterLevel and Base:waterLevel()) or 0
+            local wheelWaterFrac = waterWheelsCount / numWheels
+            if (waterLvl > 0 or wheelWaterFrac > 0) and AERO_CFG.WaterDragEnabled ~= false then
+                local wlFrac = max(waterLvl > 0 and clamp(0.25 + (waterLvl / 3.0) * 0.75, 0.25, 1.0) or 0, wheelWaterFrac * 0.45)
+                local wMult  = AERO_CFG.WaterDragMultiplier or 1.0
+                local spdMS  = velWorld:getLength() * IN_TO_M
+                local dragRate = (2.8 + spdMS * 0.25) * wlFrac * wMult
+                local dampFrac = 1.0 - expFn(-dragRate * dt)
+                local waterImp = -velWorld * (physMass * clamp(dampFrac, 0, 0.55))
+                centerImpulse = centerImpulse and (centerImpulse + waterImp) or waterImp
+            end
+            if centerImpulse then
+                Phys:applyForceCenter(centerImpulse)
             end
             local inverseInertia = physicsCar.mode344 ~= 0 and physicsCar.Iinv2 or physicsCar.Iinv
             if useContactYaw then
                 -- The linear impulse was applied at the Base mass center. Restore
                 -- the contact moment about that same point using the same scale.
                 local yawImpulse = (physicsStep.tireYawImpulse * gripTiltScale + restYawImpulse) * 1000 * driveScale
-                yawImpulse = yawImpulse + (comWorld - yawOrigin):cross(totalGripImpulse):dot(driverUp) * IN_TO_M^2
+                yawImpulse = yawImpulse + (comWorld - yawOrigin):cross(totalGripImpulse):dot(driverUp) * (IN_TO_M * IN_TO_M)
                 local spanM = physicsCar.c[69]
                 local lateralImpulse = driverLeft * (yawImpulse * M_TO_IN / spanM)
                 local arm = driverFwd * (0.5 * spanM * M_TO_IN)
@@ -2080,25 +2415,27 @@ function SimcadeCore.init(CONFIG)
                 Phys:applyForceOffset(-lateralImpulse, comWorld - arm)
             else
                 local yawDelta = physicsStep.dw_yaw_rad + restYawImpulse * inverseInertia[2]
-                deltaAngVel = deltaAngVel + resolvedLocalUp * math.deg(yawDelta)
+                deltaAngVel = deltaAngVel + resolvedLocalUp * deg(yawDelta)
             end
             Phys:addAngleVelocity(deltaAngVel)
 
             -- The sweep handled incoming velocity before the tire step. Resolve
             -- this tick's new drive into the face as well, even at zero speed.
             local remainingGrip = totalGripImpulse
-            for _, w in ipairs(runtimeWheels) do
+            for i = 1, #runtimeWheels do
+                local w = runtimeWheels[i]
                 local wall = w.wallDriveContact
                 if wall and not wall.resolved then
                     local inward = -remainingGrip:dot(wall.normal) - supportMass * wall.spareSpeed
                     if inward > 0 then
                         local contactPoint = wall.point
                         local count = 1
-                        for _, other in ipairs(runtimeWheels) do
+                        for j = 1, #runtimeWheels do
+                            local other = runtimeWheels[j]
                             local otherWall = other.wallDriveContact
                             if other ~= w and otherWall and otherWall.body == wall.body
                                 and otherWall.normal:dot(wall.normal) > 0.99
-                                and math.abs(otherWall.spareSpeed - wall.spareSpeed) < 0.1 then
+                                and abs(otherWall.spareSpeed - wall.spareSpeed) < 0.1 then
                                 contactPoint = contactPoint + otherWall.point
                                 count = count + 1
                                 otherWall.resolved = true
@@ -2106,7 +2443,7 @@ function SimcadeCore.init(CONFIG)
                         end
                         contactPoint = contactPoint / count
                         local body = wall.body
-                        if isValid(body) then inward = inward / (1 + supportMass / math.max(1, body:getMass())) end
+                        if isValid(body) then inward = inward / (1 + supportMass / max(1, body:getMass())) end
                         local reaction = wall.normal * inward
                         Phys:applyForceOffset(reaction, contactPoint)
                         if isValid(body) then body:applyForceOffset(-reaction, contactPoint) end
@@ -2114,133 +2451,151 @@ function SimcadeCore.init(CONFIG)
                     end
                 end
             end
-
-            local waterLvl = (Base.getWaterLevel and Base:getWaterLevel()) or (Base.waterLevel and Base:waterLevel()) or 0
-            local wheelWaterFrac = waterWheelsCount / numWheels
-            if (waterLvl > 0 or wheelWaterFrac > 0) and AERO_CFG.WaterDragEnabled ~= false then
-                local wlFrac = math.max(waterLvl > 0 and math.clamp(0.25 + (waterLvl / 3.0) * 0.75, 0.25, 1.0) or 0, wheelWaterFrac * 0.45)
-                local wMult  = AERO_CFG.WaterDragMultiplier or 1.0
-                local spdMS  = velWorld:getLength() * IN_TO_M
-                local dragRate = (2.8 + spdMS * 0.25) * wlFrac * wMult
-                local dampFrac = 1.0 - math.exp(-dragRate * dt)
-                Phys:applyForceCenter(-velWorld * (physMass * math.clamp(dampFrac, 0, 0.55)))
-            end
         else
             cachedLiftForcePerSec = nil
             cachedRestForcePerSec = nil
             skippedRestApplied = Vector(0, 0, 0)
         end
+        if profOn then prof._tAppTick = quotaUsed() - (prof._qApp0 or q0); prof._qHol0 = quotaUsed() end
 
         -- Update wheel holos & telemetry
         local maxSlipAngle, maxLongSlipRatio, maxSkidVal = 0, 0, 0
         local anySlipping, anyABSActive = false, false
-        for _, w in ipairs(runtimeWheels) do
+        local localDriverAng = ctrlState._localDriverAng
+        if not localDriverAng or ctrlState._localDriverFwd ~= resolvedLocalFwd then
+            if resolvedLocalFwd.x > 0.9999 and resolvedLocalUp.z > 0.9999 then
+                localDriverAng = Angle(0, 0, 0)
+            else
+                localDriverAng = Base:worldToLocalAngles(driverAng)
+            end
+            ctrlState._localDriverAng = localDriverAng
+            ctrlState._localDriverFwd = resolvedLocalFwd
+        end
+        local localLeft = -resolvedLocalRight
+        for i = 1, #runtimeWheels do
+            local w = runtimeWheels[i]
             local W = physicsCar.wheels[w.physicsIndex]
-            local axleSusp = SimcadeSuspension.getAxleCfg(SUSPENSION_CFG, w.isFront)
-            local restComp = math.clamp(axleSusp.restCompression or 0.45, 0.10, 0.75)
+            local axleSusp = w.axleSusp or SimcadeSuspension.getAxleCfg(SUSPENSION_CFG, w.isFront)
+            local restComp = clamp(axleSusp.restCompression or 0.45, 0.10, 0.75)
             local rideHeight = w.rideHeight or 24
-            local airTravel = w.airTravel or 6
-            local wheelSteerDeg = (W and W.i == 0 and math.deg(physicsStep.a0 or 0))
-                or (W and W.i == 1 and math.deg(physicsStep.a1 or 0)) or 0
+            local wheelSteerDeg = (W and W.i == 0 and deg(physicsStep.a0 or 0))
+                or (W and W.i == 1 and deg(physicsStep.a1 or 0)) or 0
             local beamRoll = (W and W.beamRollDeg) or 0
             local camberDeg = (W and W.hubCamberDeg) or 0
             local compIn = w.compIn or (restComp * rideHeight)
-            local hubOffsetUp = math.min(compIn - rideHeight, -2)
-            local hubLocal = w.localMountPos + resolvedLocalUp * hubOffsetUp + resolvedLocalRight * (w.beamInset or 0)
-            w.hubLocal = hubLocal
-            local hubPos = Base:localToWorld(hubLocal)
+            local hubOffsetUp = min(compIn - rideHeight, -2)
+            local beamInset = w.beamInset or 0
+            local hubLocal = w.hubLocal
+            local posChanged = (not w._holoInit)
+                or abs(hubOffsetUp - (w._lastHubUp or -999)) > 0.005
+                or abs(beamInset - (w._lastHubInset or -999)) > 0.005
+                or w._lastHubMount ~= w.localMountPos
+            if posChanged or not hubLocal then
+                hubLocal = w.localMountPos + resolvedLocalUp * hubOffsetUp + resolvedLocalRight * beamInset
+                w.hubLocal = hubLocal
+                w._lastHubUp = hubOffsetUp
+                w._lastHubInset = beamInset
+                w._lastHubMount = w.localMountPos
+            end
 
             if W then
-                w.spinDeg = ((w.spinDeg or 0) + math.deg((W.w or 0) * dt)) % 360
+                w.spinDeg = ((w.spinDeg or 0) + deg((W.w or 0) * dt)) % 360
             end
             local hasHolo = isValid(w.holo)
             local hasRadHolo = isValid(w.radiusHolo)
             if hasHolo or hasRadHolo then
-                local wSpin = W and math.abs(W.w or 0) or 0
-                local needsHoloUpdate = (not w._holoInit)
-                    or velWorld:getLengthSqr() > 0.25
+                local wSpin = W and abs(W.w or 0) or 0
+                local angChanged = (not w._holoInit)
                     or wSpin > 0.05
-                    or math.abs(compIn - (w._lastHoloComp or -999)) > 0.02
-                    or math.abs(wheelSteerDeg - (w._lastHoloSteer or -999)) > 0.05
-                    or math.abs(camberDeg - (w._lastHoloCamber or -999)) > 0.02
-                    or math.abs(beamRoll - (w._lastBeamRoll or 0)) > 0.02
-                    or angVelLocal:getLengthSqr() > 0.05
-                    or not w._lastHoloHub or (hubPos - w._lastHoloHub):getLengthSqr() > 0.0025
-                    or not w._lastHoloFwd or driverFwd:dot(w._lastHoloFwd) < 0.99999
-                    or not w._lastHoloUp or driverUp:dot(w._lastHoloUp) < 0.99999
-                if needsHoloUpdate then
+                    or abs(wheelSteerDeg - (w._lastHoloSteer or -999)) > 0.05
+                    or abs(camberDeg - (w._lastHoloCamber or -999)) > 0.02
+                    or abs(beamRoll - (w._lastBeamRoll or 0)) > 0.02
+                if posChanged or angChanged then
                     w._holoInit = true
-                    w._lastHoloComp = compIn
-                    w._lastHoloSteer = wheelSteerDeg
-                    w._lastHoloCamber = camberDeg
-                    w._lastBeamRoll = beamRoll
-                    w._lastHoloHub = hubPos
-                    w._lastHoloFwd = driverFwd
-                    w._lastHoloUp = driverUp
-                    local wheelAng = Angle(driverAng.p, driverAng.y, driverAng.r)
-                    local axle = W and W.axleX and (driverFwd * W.axleX + driverLeft * W.axleY + driverUp * W.axleZ) or driverLeft
-                    if camberDeg ~= 0 then
-                        wheelAng = wheelAng:rotateAroundAxis(driverFwd, camberDeg)
+                    if posChanged and hasHolo and not w._hasVisOffset then
+                        w.holo:setLocalPos(hubLocal)
                     end
-                    if wheelSteerDeg ~= 0 then
-                        -- Positive caster tips the upper steering pivot toward the rear.
-                        local casterRad = math.rad(w.casterDeg)
-                        local pivot = driverUp * math.cos(casterRad) - driverFwd * math.sin(casterRad)
-                        wheelAng = wheelAng:rotateAroundAxis(pivot, wheelSteerDeg)
+                    if posChanged and hasRadHolo then
+                        w.radiusHolo:setLocalPos(hubLocal)
                     end
-                    if beamRoll ~= 0 then
-                        wheelAng = wheelAng:rotateAroundAxis(driverFwd, beamRoll)
-                    end
-                    if hasHolo then
-                        local mAng = w.isRightSide and w.rightModelAng or w.leftModelAng
-                        local holoAng = orientWheelModel(orientWheelModel(wheelAng, mAng), w.angOffset)
-                        if (w.spinDeg or 0) ~= 0 then
-                            holoAng = holoAng:rotateAroundAxis(axle, w.spinDeg)
+                    if angChanged or (posChanged and hasHolo and w._hasVisOffset) then
+                        w._lastHoloSteer = wheelSteerDeg
+                        w._lastHoloCamber = camberDeg
+                        w._lastBeamRoll = beamRoll
+                        local wheelAng = Angle(localDriverAng.p, localDriverAng.y, localDriverAng.r)
+                        if camberDeg ~= 0 then
+                            wheelAng = wheelAng:rotateAroundAxis(resolvedLocalFwd, camberDeg)
                         end
-                        local holoPos = hubPos
-                        if w.visualOffset and (w.visualOffset.x ~= 0 or w.visualOffset.y ~= 0 or w.visualOffset.z ~= 0) then
-                            holoPos = hubPos
-                                + holoAng:getForward() * w.visualOffset.x
-                                - holoAng:getRight() * w.visualOffset.y
-                                + holoAng:getUp() * w.visualOffset.z
+                        if wheelSteerDeg ~= 0 then
+                            local pivot = resolvedLocalUp * (w._casterCos or 1) - resolvedLocalFwd * (w._casterSin or 0)
+                            wheelAng = wheelAng:rotateAroundAxis(pivot, wheelSteerDeg)
                         end
-                        w.holo:setPos(holoPos)
-                        w.holo:setAngles(holoAng)
-                    end
-                    if hasRadHolo then
-                        local cylAng = wheelAng:rotateAroundAxis(wheelAng:getForward(), 90)
-                        w.radiusHolo:setPos(hubPos)
-                        w.radiusHolo:setAngles(cylAng)
+                        if beamRoll ~= 0 then
+                            wheelAng = wheelAng:rotateAroundAxis(resolvedLocalFwd, beamRoll)
+                        end
+                        if hasHolo then
+                            local holoAng = wheelAng
+                            if w._hasModelAng then
+                                holoAng = orientWheelModel(holoAng, w.isRightSide and w.rightModelAng or w.leftModelAng)
+                            end
+                            if w._hasAngOffset then
+                                holoAng = orientWheelModel(holoAng, w.angOffset)
+                            end
+                            if (w.spinDeg or 0) ~= 0 then
+                                local localAxle = (W and W.axleX)
+                                    and (resolvedLocalFwd * W.axleX + localLeft * W.axleY + resolvedLocalUp * W.axleZ)
+                                    or localLeft
+                                holoAng = holoAng:rotateAroundAxis(localAxle, w.spinDeg)
+                            end
+                            if w._hasVisOffset then
+                                local vo = w.visualOffset
+                                local holoLocalPos = hubLocal
+                                    + holoAng:getForward() * vo.x
+                                    - holoAng:getRight() * vo.y
+                                    + holoAng:getUp() * vo.z
+                                w.holo:setLocalPos(holoLocalPos)
+                            end
+                            w.holo:setLocalAngles(holoAng)
+                        end
+                        if hasRadHolo then
+                            local cylAng = wheelAng:rotateAroundAxis(wheelAng:getForward(), 90)
+                            w.radiusHolo:setLocalAngles(cylAng)
+                        end
                     end
                 end
             end
 
-            local b = W and W.basis or nil
-            local vFwdW = (W and b) and (W.vel[0]*b[0] + W.vel[1]*b[1] + W.vel[2]*b[2]) or 0
-            local vLatW = (W and b) and (W.vel[0]*b[3] + W.vel[1]*b[4] + W.vel[2]*b[5]) or 0
-            local sAngle = (W and W.slipAngleRad) or ((W and math.abs(vFwdW) > 0.4) and math.atan2(vLatW, math.abs(vFwdW)) or 0)
-            local sRatio = (W and W.slipRatio) or (W and math.clamp((W.slip or 0) / math.max(2, math.abs(vFwdW) + 2), -1, 1) or 0)
-            local skidVal = (w.isGrounded and W) and math.clamp(W.skidIntensity or 0, 0, 1.5) or 0
+            local sAngle = W and W.slipAngleRad or 0
+            local sRatio = W and W.slipRatio or 0
+            local skidVal = (w.isGrounded and W) and clamp(W.skidIntensity or 0, 0, 1.5) or 0
             local usage   = W and (W.usage or 0) or 0
             local sliding = W and ((W.sliding or 0) ~= 0 or (W.locked or 0) ~= 0) or false
 
             if w.isGrounded then
-                if math.abs(sAngle) > math.abs(maxSlipAngle) then maxSlipAngle = sAngle end
-                if math.abs(sRatio) > math.abs(maxLongSlipRatio) then maxLongSlipRatio = sRatio end
+                if abs(sAngle) > abs(maxSlipAngle) then maxSlipAngle = sAngle end
+                if abs(sRatio) > abs(maxLongSlipRatio) then maxLongSlipRatio = sRatio end
                 if skidVal > maxSkidVal then maxSkidVal = skidVal end
                 if sliding or usage > 0.85 or skidVal > 0.15 then anySlipping = true end
                 if W and (W.absActiveTick or W.absActive) then anyABSActive = true end
             end
 
-            w.compFraction = math.clamp(compIn / math.max(1, rideHeight), 0, 1)
-            local peakLat   = math.max(0.05, (W and W.peakLatKN) or (W and W.load) or 1)
-            local peakLong  = math.max(0.05, (W and W.peakLongKN) or (W and W.load) or 1)
-            local latRatio  = W and (math.abs(W.Fy or 0) / peakLat) or 0
-            local longRatio = W and (math.abs(W.Fx or 0) / peakLong) or 0
-            w.lastTireRes = {
-                skid = skidVal, slipAngle = sAngle, slipRatio = sRatio,
-                latRatio = latRatio, longRatio = longRatio, usage = usage, hubLocal = hubLocal,
-            }
+            w.compFraction = clamp(compIn / max(1, rideHeight), 0, 1)
+            local peakLat   = max(0.05, (W and W.peakLatKN) or (W and W.load) or 1)
+            local peakLong  = max(0.05, (W and W.peakLongKN) or (W and W.load) or 1)
+            local latRatio  = W and (abs(W.Fy or 0) / peakLat) or 0
+            local longRatio = W and (abs(W.Fx or 0) / peakLong) or 0
+            local trOut = w.lastTireRes
+            if not trOut then
+                trOut = {}
+                w.lastTireRes = trOut
+            end
+            trOut.skid = skidVal
+            trOut.slipAngle = sAngle
+            trOut.slipRatio = sRatio
+            trOut.latRatio = latRatio
+            trOut.longRatio = longRatio
+            trOut.usage = usage
+            trOut.hubLocal = hubLocal
         end
 
         for port, anchor in pairs(axleAnchors) do
@@ -2253,6 +2608,7 @@ function SimcadeCore.init(CONFIG)
                 anchor:setLocalAngles(Angle(angle.p, angle.y, left.beamRollDeg))
             end
         end
+        if profOn then prof._tHolTick = quotaUsed() - (prof._qHol0 or q0); prof._qWir0 = quotaUsed() end
 
         local isDiesel = SimcadeEngine and SimcadeEngine.isDiesel and SimcadeEngine.isDiesel(ENGINE_CFG)
         local liveBoostPSI = (combinedBoostRatio - 1.0) * inductionAirPressure
@@ -2262,22 +2618,28 @@ function SimcadeCore.init(CONFIG)
         local bovTrigger = turboActive and not isDiesel and (prevThrottle > 0.45 and physicsStep.throttle < 0.20 and prevBoostPSI > bovThreshold)
         prevGearName, prevThrottle, prevBoostPSI = physicsStep.gearName, physicsStep.throttle, turboPSI
 
-        local masterClutch = physicsCar.clutchEngageTime > 0 and physicsStep.clutch or SimcadeGearbox.computeMasterClutch({
-            gear                  = physicsCar.dt.gear,
-            state                 = physicsCar.dt.state,
-            clutchPedal           = clutchPedal,
-            handbrake             = rawHandbrake,
-            brake                 = rawBrake,
-            throttle              = rawThrottle,
-            speedKmh              = kmh,
-            stoppedPhaseBrakeSpeed = ENGINE_CFG.StoppedPhaseBrakeSpeed,
-            rpm                   = physicsStep.rpm or 0,
-            redlineRPM            = ENGINE_CFG.redlineRPM,
-            isManual              = physicsCar.manualBox,
-            useClutchLerpInManual = ENGINE_CFG.UseClutchLerpInManual,
-            clutchLerp            = ENGINE_CFG.ClutchLerp,
-            clutchLerpReverse     = ENGINE_CFG.ClutchLerpReverse,
-        })
+        local masterClutch
+        if physicsCar.clutchEngageTime > 0 then
+            masterClutch = physicsStep.clutch
+        else
+            local ca = ctrlState._clutchArgs
+            if not ca then ca = {}; ctrlState._clutchArgs = ca end
+            ca.gear                  = physicsCar.dt.gear
+            ca.state                 = physicsCar.dt.state
+            ca.clutchPedal           = clutchPedal
+            ca.handbrake             = rawHandbrake
+            ca.brake                 = rawBrake
+            ca.throttle              = rawThrottle
+            ca.speedKmh              = kmh
+            ca.stoppedPhaseBrakeSpeed = ctrlState._stoppedPhaseBrakeSpeed
+            ca.rpm                   = physicsStep.rpm or 0
+            ca.redlineRPM            = ENGINE_CFG.redlineRPM
+            ca.isManual              = physicsCar.manualBox
+            ca.useClutchLerpInManual = ENGINE_CFG.UseClutchLerpInManual
+            ca.clutchLerp            = ENGINE_CFG.ClutchLerp
+            ca.clutchLerpReverse     = ENGINE_CFG.ClutchLerpReverse
+            masterClutch = SimcadeGearbox.computeMasterClutch(ca)
+        end
         local displayRPM = ignRes.running and (physicsStep.rpm or 0)
             or (ignRes.cranking and (ENGINE_CFG.PhysicalStarter ~= true) and (ignRes.crankRPM or 0) or (physicsStep.flywheel_rpm or 0))
         local anyDrifting = (kmh > 10 and math.abs(maxSlipAngle) > math.rad(12) and anySlipping)
@@ -2302,48 +2664,45 @@ function SimcadeCore.init(CONFIG)
         end
 
         if SimcadeWire and SimcadeWire.writeOutputs then
-            local wheelEntities = {}
-            for i, w in ipairs(runtimeWheels) do
-                wheelEntities[i] = w.holo
-            end
-            SimcadeWire.writeOutputs({
-                kmh = kmh, mph = mph,
-                steerInput = steerInput, steerDeg = physicsCar.drv.u16Deg,
-                frontLeftSteerRad = physicsStep.a0, frontRightSteerRad = physicsStep.a1,
-                solverWheels = physicsCar.wheels,
-                throttle = physicsStep.throttle or 0, brake = physicsStep.brake or 0,
-                handbrake = rawHandbrake,
-                rpm = displayRPM, flywheelRPM = physicsStep.flywheel_rpm or displayRPM,
-                gearNumber = (physicsCar.dt.gear or 2) - 1,
-                gearName = physicsStep.gearName, clutch = masterClutch,
-                torqueNm = ignRes.running and (physicsStep.torqueNm or 0) or 0,
-                maxTorque = physicsCar.maxTorqueNm or ENGINE_CFG.PeakTorqueNm or 260,
-                engineLoad = ignRes.running and (physicsStep.engineLoad or 0) or 0,
-                boostPSI = liveBoostPSI,
-                slipAngleDeg = math.deg(maxSlipAngle),
-                longSlipPct = maxLongSlipRatio * 100,
-                isDrifting = anyDrifting, isSlipping = anySlipping,
-                activeCompound = activeCompound,
-                appliedForce = totalAppliedForce,
-                frontDiffLocked = physicsStep.frontDiffLocked,
-                rearDiffLocked = physicsStep.rearDiffLocked,
-                allDiffLocked = physicsStep.allDiffLocked,
-                frontActiveLockPct = physicsStep.frontActiveLockPct,
-                rearActiveLockPct = physicsStep.rearActiveLockPct,
-                absActive = anyABSActive,
-                jakeBrakeStage = physicsStep.jakeBrakeStage or 0,
-                jakeBrakeActive = physicsStep.jakeBrakeActive == true,
-                flLoad = (runtimeWheels[1] and runtimeWheels[1].normalLoad or 0) / dt,
-                frLoad = (runtimeWheels[2] and runtimeWheels[2].normalLoad or 0) / dt,
-                rlLoad = (runtimeWheels[3] and runtimeWheels[3].normalLoad or 0) / dt,
-                rrLoad = (runtimeWheels[4] and runtimeWheels[4].normalLoad or 0) / dt,
-                groundedCount = groundedCount,
-                totalMass = simMass,
-                ignitionMode = ignRes.mode,
-                engineRunning = ignRes.running,
-                wheelEntities = wheelEntities,
-            })
+            local wd = ctrlState._wireData
+            wd.kmh = kmh; wd.mph = mph
+            wd.steerInput = steerInput; wd.steerDeg = physicsCar.drv.u16Deg
+            wd.frontLeftSteerRad = physicsStep.a0; wd.frontRightSteerRad = physicsStep.a1
+            wd.solverWheels = physicsCar.wheels
+            wd.throttle = physicsStep.throttle or 0; wd.brake = physicsStep.brake or 0
+            wd.handbrake = rawHandbrake
+            wd.rpm = displayRPM; wd.flywheelRPM = physicsStep.flywheel_rpm or displayRPM
+            wd.gearNumber = (physicsCar.dt.gear or 2) - 1
+            wd.gearName = physicsStep.gearName; wd.clutch = masterClutch
+            wd.torqueNm = ignRes.running and (physicsStep.torqueNm or 0) or 0
+            wd.maxTorque = physicsCar.maxTorqueNm or ENGINE_CFG.PeakTorqueNm or 260
+            wd.engineLoad = ignRes.running and (physicsStep.engineLoad or 0) or 0
+            wd.boostPSI = liveBoostPSI
+            wd.slipAngleDeg = deg(maxSlipAngle)
+            wd.longSlipPct = maxLongSlipRatio * 100
+            wd.isDrifting = anyDrifting; wd.isSlipping = anySlipping
+            wd.activeCompound = activeCompound
+            wd.appliedForce = totalAppliedForce
+            wd.frontDiffLocked = physicsStep.frontDiffLocked
+            wd.rearDiffLocked = physicsStep.rearDiffLocked
+            wd.allDiffLocked = physicsStep.allDiffLocked
+            wd.frontActiveLockPct = physicsStep.frontActiveLockPct
+            wd.rearActiveLockPct = physicsStep.rearActiveLockPct
+            wd.absActive = anyABSActive
+            wd.jakeBrakeStage = physicsStep.jakeBrakeStage or 0
+            wd.jakeBrakeActive = physicsStep.jakeBrakeActive == true
+            wd.flLoad = (runtimeWheels[1] and runtimeWheels[1].normalLoad or 0) / dt
+            wd.frLoad = (runtimeWheels[2] and runtimeWheels[2].normalLoad or 0) / dt
+            wd.rlLoad = (runtimeWheels[3] and runtimeWheels[3].normalLoad or 0) / dt
+            wd.rrLoad = (runtimeWheels[4] and runtimeWheels[4].normalLoad or 0) / dt
+            wd.groundedCount = groundedCount
+            wd.totalMass = simMass
+            wd.ignitionMode = ignRes.mode
+            wd.engineRunning = ignRes.running
+            wd.wheelEntities = ctrlState._wheelEntities
+            SimcadeWire.writeOutputs(wd)
         end
+        if profOn then prof._tWirTick = quotaUsed() - (prof._qWir0 or q0); prof._qNet0 = quotaUsed() end
 
         -- Pace each stream by its measured packet cost under the shared byte budget.
         local bytesPerSecond = math.max(0, tonumber(VEHICLE_CFG.NetworkBudgetBytesPerSecond) or 4300)
@@ -2482,22 +2841,23 @@ function SimcadeCore.init(CONFIG)
                         end
                     end
                 end
+                local fl = U.floor
                 net.start("Simcade_AudioSync")
                 net.writeEntity(Base)
-                net.writeUInt(math.clamp(math.round(displayRPM), 0, 65535), 16)
-                net.writeUInt(math.clamp(math.round(physicsCar.c[125] or ENGINE_CFG.redlineRPM or 8000), 1000, 65535), 16)
-                net.writeUInt(math.clamp(math.round((physicsStep.throttle or 0) * 255), 0, 255), 8)
-                net.writeInt(math.clamp(math.round(liveBoostPSI * 10), -32000, 32000), 16)
-                net.writeUInt(math.clamp(math.round(maxSkidVal * 170), 0, 255), 8)
-                net.writeUInt(math.clamp(math.round(kmh), 0, 65535), 16)
+                net.writeUInt(clamp(fl(displayRPM + 0.5), 0, 65535), 16)
+                net.writeUInt(clamp(fl((physicsCar.c[125] or ENGINE_CFG.redlineRPM or 8000) + 0.5), 1000, 65535), 16)
+                net.writeUInt(clamp(fl((physicsStep.throttle or 0) * 255 + 0.5), 0, 255), 8)
+                net.writeInt(clamp(fl(liveBoostPSI * 10 + 0.5), -32000, 32000), 16)
+                net.writeUInt(clamp(fl(maxSkidVal * 170 + 0.5), 0, 255), 8)
+                net.writeUInt(clamp(fl(kmh + 0.5), 0, 65535), 16)
                 net.writeBool(ignRes.cranking and true or false)
                 net.writeBool(ignRes.running and true or false)
                 net.writeBool(pGear)
                 net.writeString(physicsStep.gearName)
                 net.writeBool(pBov)
-                net.writeUInt(math.clamp(math.floor(pBump * 15 + 0.5), 0, 15), 4)
-                net.writeUInt(math.clamp(math.floor(pDroop * 15 + 0.5), 0, 15), 4)
-                net.writeUInt(math.clamp(dominantMatType, 0, 255), 8)
+                net.writeUInt(clamp(fl(pBump * 15 + 0.5), 0, 15), 4)
+                net.writeUInt(clamp(fl(pDroop * 15 + 0.5), 0, 15), 4)
+                net.writeUInt(clamp(dominantMatType, 0, 255), 8)
                 local hasEngSoundEnt = isValid(ctrlState.engineSoundEnt)
                 net.writeBool(hasEngSoundEnt)
                 if hasEngSoundEnt then net.writeEntity(ctrlState.engineSoundEnt) end
@@ -2561,18 +2921,19 @@ function SimcadeCore.init(CONFIG)
                 writeDirection(driverUp)
                 net.writeUInt(first, 32)
                 net.writeUInt(sendCount, 4)
+                local fl = U.floor
                 for i = first, first + sendCount - 1 do
                     local w = runtimeWheels[i]
                     local W = physicsCar.wheels[w.physicsIndex]
                     local trRes = w.lastTireRes or {}
-                    local rimSpeedUPS = math.abs((W and W.w or 0) * (w.radius or 13))
+                    local rimSpeedUPS = abs((W and W.w or 0) * (w.radius or 13))
                     net.writeVector(w.contactPos or Vector())
                     writeDirection(w.hitNormal or driverUp)
-                    net.writeUInt(math.clamp(math.round((trRes.skid or 0) * 170), 0, 255), 8)
-                    net.writeUInt(math.clamp(w.isGrounded and (w.matType or 67) or 0, 0, 255), 8)
-                    net.writeUInt(math.clamp(math.round(rimSpeedUPS), 0, 65535), 16)
+                    net.writeUInt(clamp(fl((trRes.skid or 0) * 170 + 0.5), 0, 255), 8)
+                    net.writeUInt(clamp(w.isGrounded and (w.matType or 67) or 0, 0, 255), 8)
+                    net.writeUInt(clamp(fl(rimSpeedUPS + 0.5), 0, 65535), 16)
                     net.writeBool(w.isGrounded and true or false)
-                    net.writeUInt(math.clamp(math.round(w.width or 9), 1, 255), 8)
+                    net.writeUInt(clamp(fl((w.width or 9) + 0.5), 1, 255), 8)
                     net.writeBool(w.isFront == false)
                 end
                 if not sendTelemetry(nil, true) then return false end
@@ -2583,8 +2944,7 @@ function SimcadeCore.init(CONFIG)
             end)
         end
 
-        local wantsWheelDbg = debugHudMaster and (TIRE_CFG.ShowTireDebug == true or TIRE_CFG.ShowPacejkaGraph == true or TIRE_CFG.ShowTelemetry3D == true or (ctrlState._weightShiftCfg and ctrlState._weightShiftCfg.ShowDebug == true))
-        if #hudTargets > 0 and debugHudMaster and (wantsWheelDbg or SUSPENSION_CFG.showAxleDebug or debugRaysEnabled) and now >= nextWheelDebugNetTime then
+        if #hudTargets > 0 and debugHudMaster and (ctrlState._wantsWheelDbg or ctrlState._debugAxle or debugRaysEnabled) and now >= nextWheelDebugNetTime then
             queue("wheel", 0.08, nextWheelDebugNetTime, function()
                 local first, sendCount = firstDebugWheel, debugCount
                 local full = resetWheelDebug or now >= (ctrlState.wheelKeyframes[first] or 0)
@@ -2624,7 +2984,7 @@ function SimcadeCore.init(CONFIG)
                     local axleLocal = W and W.axleX and (resolvedLocalFwd * W.axleX - resolvedLocalRight * W.axleY + resolvedLocalUp * W.axleZ) or -resolvedLocalRight
                     io.direction(axleLocal)
                     io.direction(Base:worldToLocalVector(w.hitNormal or driverUp))
-                    local showSeat = SUSPENSION_CFG.showAxleDebug and w.beamMate ~= nil
+                    local showSeat = ctrlState._debugAxle and w.beamMate ~= nil
                     io.bool(showSeat == true)
                     if showSeat then
                         io.point(w.localMountPos * w.seatNear + w.beamMate.localMountPos * (1 - w.seatNear))
@@ -2653,11 +3013,7 @@ function SimcadeCore.init(CONFIG)
             end)
         end
 
-        table.sort(jobs, function(a, b)
-            if a.name == "audio" then return b.name ~= "audio" end
-            if b.name == "audio" then return false end
-            return a.due < b.due
-        end)
+        table.sort(jobs, U.sortNetJobs)
         for _, job in ipairs(jobs) do
             if net.canSend and not net.canSend() then break end
             stream = job
@@ -2666,6 +3022,46 @@ function SimcadeCore.init(CONFIG)
             local reserve = job.name ~= "audio" and (ctrlState.packetCosts.audio or 64) or 0
             local estimate = ctrlState.packetCosts[job.name] or 0
             if estimate + reserve <= math.min(ctrlState.netCredit, beforeWrite) then job.send() end
+        end
+        if profOn then
+            local qEnd = quotaUsed()
+            prof.samples = prof.samples + 1
+            prof.total = prof.total + (qEnd - q0)
+            prof.tWall = prof.tWall + prof._tWallTick
+            prof.tTread = prof.tTread + prof._tTreadTick
+            prof.tCurb = prof.tCurb + prof._tCurbTick
+            prof.tSusp = prof.tSusp + (prof._tSuspTick or 0)
+            prof.tSolver = prof.tSolver + (prof._tSolTick or 0)
+            prof.tApply = prof.tApply + (prof._tAppTick or 0)
+            prof.tHolo = prof.tHolo + (prof._tHolTick or 0)
+            prof.tWire = prof.tWire + (prof._tWirTick or 0)
+            prof.tNet = prof.tNet + (qEnd - (prof._qNet0 or qEnd))
+            prof.cWall = prof.cWall + prof._cWallTick
+            prof.cTread = prof.cTread + prof._cTreadTick
+            prof.cCurb = prof.cCurb + prof._cCurbTick
+            prof.nSusp = prof.nSusp + prof._nSuspTick
+            prof.fCalls = prof.fCalls + ctrlState._filterCache.calls
+            if nowTick >= prof.nextPrint and prof.samples > 0 then
+                local s = prof.samples
+                local us = 1000000 / s
+                local qAvg = quotaAverage and math.round(quotaAverage() * 1000000) or 0
+                pcall(print, string.format(
+                    "[Simcade Prof] tick=%dus (sfAvg=%dus) | wall=%d(%d) tread=%d(%d) curb=%d(%d) susp=%d(n=%d) sol=%d app=%d holo=%d wire=%d net=%d | fCalls=%d fEnts=%d uz=%.4f",
+                    math.round(prof.total * us), qAvg,
+                    math.round(prof.tWall * us), math.round(prof.cWall / s),
+                    math.round(prof.tTread * us), math.round(prof.cTread / s),
+                    math.round(prof.tCurb * us), math.round(prof.cCurb / s),
+                    math.round(prof.tSusp * us), math.round(prof.nSusp / s),
+                    math.round(prof.tSolver * us), math.round(prof.tApply * us),
+                    math.round(prof.tHolo * us), math.round(prof.tWire * us),
+                    math.round(prof.tNet * us), math.round(prof.fCalls / s),
+                    ctrlState._filterCount or 0, driverUp.z
+                ))
+                prof.nextPrint = nowTick + 1.5
+                prof.samples, prof.total = 0, 0
+                prof.tWall, prof.tTread, prof.tCurb, prof.tSusp, prof.tSolver, prof.tApply, prof.tHolo, prof.tWire, prof.tNet = 0, 0, 0, 0, 0, 0, 0, 0, 0
+                prof.cWall, prof.cTread, prof.cCurb, prof.nSusp, prof.fCalls = 0, 0, 0, 0, 0
+            end
         end
     end)
 

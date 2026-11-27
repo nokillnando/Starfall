@@ -1,0 +1,808 @@
+--@name Simcade Engine Module
+--@shared
+
+SimcadeEngine = SimcadeEngine or {}
+
+local max = math.max
+local min = math.min
+local exp = math.exp
+local clamp = math.clamp or function(v, a, b) return v < a and a or (v > b and b or v) end
+
+SimcadeEngine.STD_ATM_PSI    = 14.696
+SimcadeEngine.LEGACY_REF_PSI = 18.4
+
+local dieselStrCache = { diesel = true, Diesel = true, DIESEL = true, gasoline = false, Gasoline = false, GASOLINE = false }
+function SimcadeEngine.isDiesel(cfg)
+    if not cfg then return false end
+    if cfg.DieselMode == true then return true end
+    local et = cfg.EngineType
+    if et == nil then return false end
+    local cached = dieselStrCache[et]
+    if cached ~= nil then return cached end
+    local res = string.lower(tostring(et)) == "diesel"
+    if type(et) == "string" then dieselStrCache[et] = res end
+    return res
+end
+
+function SimcadeEngine.resolveAirPressure(cfg, specificKey)
+    if not cfg then return SimcadeEngine.LEGACY_REF_PSI end
+    if specificKey then
+        local v = cfg[specificKey]
+        if v ~= nil then
+            local specific = type(v) == "number" and v or tonumber(v)
+            if specific and specific > 0 then return specific > 1 and specific or 1 end
+        end
+    end
+    local sv = cfg.Induction_ReferencePSI or cfg.Induction_AirPressure
+    if sv ~= nil then
+        local shared = type(sv) == "number" and sv or tonumber(sv)
+        if shared and shared > 0 then return shared > 1 and shared or 1 end
+    end
+    if cfg.UsePhysicalAtmosphere == true then
+        return SimcadeEngine.STD_ATM_PSI
+    end
+    return SimcadeEngine.LEGACY_REF_PSI
+end
+
+local function measurePiecewisePeaks(points)
+    local peakTorqueNm = points[1].torqueNm
+    local peakTorqueRPM = points[1].rpm
+    local peakHP = 0
+    local peakPowerRPM = points[1].rpm
+    for i = 1, #points do
+        local point = points[i]
+        if point.torqueNm > peakTorqueNm then
+            peakTorqueNm = point.torqueNm
+            peakTorqueRPM = point.rpm
+        end
+        local pointHP = point.torqueNm * point.rpm / 7127.0
+        if pointHP > peakHP then
+            peakHP = pointHP
+            peakPowerRPM = point.rpm
+        end
+        if i < #points then
+            local nextPoint = points[i + 1]
+            local spanRPM = nextPoint.rpm - point.rpm
+            if spanRPM > 0 then
+                local slope = (nextPoint.torqueNm - point.torqueNm) / spanRPM
+                if slope < 0 then
+                    local intercept = point.torqueNm - slope * point.rpm
+                    local peakRPM = -intercept / (2 * slope)
+                    if peakRPM > point.rpm and peakRPM < nextPoint.rpm then
+                        local peakAtRPM = intercept + slope * peakRPM
+                        local segmentHP = peakAtRPM * peakRPM / 7127.0
+                        if segmentHP > peakHP then
+                            peakHP = segmentHP
+                            peakPowerRPM = peakRPM
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return peakTorqueNm, peakTorqueRPM, peakHP, peakPowerRPM
+end
+
+local function normalizeTorqueCurve(curve, idleRPM, limiterRPM)
+    if curve == nil then return nil end
+    if type(curve) ~= "table" or #curve < 2 or #curve > 32 then
+        error("ENGINE_CFG.TorqueCurve must contain 2 to 32 { rpm = number, torqueNm = number } points")
+    end
+
+    local points = {}
+    local previousRPM = -math.huge
+    for i = 1, #curve do
+        local point = curve[i]
+        local rpm = type(point) == "table" and point.rpm or nil
+        local torqueNm = type(point) == "table" and point.torqueNm or nil
+        if type(rpm) ~= "number" or rpm ~= rpm or math.abs(rpm) == math.huge
+            or type(torqueNm) ~= "number" or torqueNm ~= torqueNm or math.abs(torqueNm) == math.huge
+            or rpm < idleRPM or rpm > limiterRPM or rpm <= previousRPM or torqueNm < 0 then
+            error("ENGINE_CFG.TorqueCurve RPMs must increase within the idleRPM-to-limiterRPM range; torqueNm must be finite and non-negative")
+        end
+        points[i] = { rpm = rpm, torqueNm = torqueNm }
+        previousRPM = rpm
+    end
+    return points
+end
+
+local function sampleTorqueCurve(points, rpm)
+    if rpm <= points[1].rpm then return points[1].torqueNm end
+    for i = 2, #points do
+        local previous, current = points[i - 1], points[i]
+        if rpm <= current.rpm then
+            local fraction = (rpm - previous.rpm) / (current.rpm - previous.rpm)
+            return previous.torqueNm + (current.torqueNm - previous.torqueNm) * fraction
+        end
+    end
+    return points[#points].torqueNm
+end
+
+local function normalizeSharpness(value, name)
+    if value == nil then return 1.0 end
+    local sharpness = tonumber(value)
+    if not sharpness or sharpness ~= sharpness or math.abs(sharpness) == math.huge then
+        error("ENGINE_CFG." .. name .. " must be a finite number")
+    end
+    return math.max(0.25, sharpness)
+end
+
+-- Computes the full-boost torque multiplier for the rated boost pressure (used when SpecsIncludeBoost = true)
+-- and for the active configured max boost pressure (used for clutch headroom and max torque telemetry).
+-- Returns: ratedBoostMult, activeMaxBoostMult
+function SimcadeEngine.computeBoostMultipliers(cfg)
+    cfg = cfg or {}
+    local turboActive = (cfg.Turbo == true)
+    local scActive = (cfg.Supercharger == true)
+    local ratedMult = 1.0
+    local activeMult = 1.0
+
+    if turboActive then
+        local airPress = SimcadeEngine.resolveAirPressure(cfg, "Turbo_AirPressure")
+        local psiMax = math.max(0, tonumber(cfg.Turbo_PSIMax or cfg.BoostPSI) or 12)
+        local wastegate = tonumber(cfg.Turbo_WastegatePSI)
+        local activePsi = wastegate and math.clamp(wastegate, 0, psiMax) or psiMax
+        local ratedPsiCfg = tonumber(cfg.Turbo_RatedPSI)
+        local ratedPsi = (ratedPsiCfg ~= nil) and math.max(0, ratedPsiCfg) or activePsi
+        local gain = math.max(0, tonumber(cfg.Turbo_TorqueGain) or 1.0)
+
+        activeMult = activeMult * (1.0 + (activePsi / airPress) * gain)
+        ratedMult = ratedMult * (1.0 + (ratedPsi / airPress) * gain)
+    end
+
+    if scActive then
+        local airPress = SimcadeEngine.resolveAirPressure(cfg, "Supercharger_AirPressure")
+        local activePsi = math.max(0, tonumber(cfg.Supercharger_MaxPSI) or 8)
+        local ratedPsiCfg = tonumber(cfg.Supercharger_RatedPSI)
+        local ratedPsi = (ratedPsiCfg ~= nil) and math.max(0, ratedPsiCfg) or activePsi
+        local gain = math.max(0, tonumber(cfg.Supercharger_TorqueGain) or 1.0)
+
+        local activeScMult = 1.0 + (activePsi / airPress) * gain
+        local ratedScMult = 1.0 + (ratedPsi / airPress) * gain
+        if cfg.Supercharger_PhysicalLoss ~= true then
+            local driveLoss = math.clamp(tonumber(cfg.Supercharger_DriveLoss) or 0.08, 0, 0.75)
+            local activeFrac = (activePsi > 0) and 1.0 or 0.0
+            local ratedFrac = (activePsi > 0) and math.clamp(ratedPsi / activePsi, 0, 1) or ((ratedPsi > 0) and 1.0 or 0.0)
+            activeScMult = activeScMult * (1.0 - driveLoss * activeFrac)
+            ratedScMult = ratedScMult * (1.0 - driveLoss * ratedFrac)
+        end
+
+        activeMult = activeMult * math.max(0.05, activeScMult)
+        ratedMult = ratedMult * math.max(0.05, ratedScMult)
+    end
+
+    return math.max(0.05, ratedMult), math.max(0.05, activeMult)
+end
+
+-- Synthesize a 9-point torque curve (c[128..136]) and 3-point engine-brake curve (c[146..148])
+-- from DisplacementLiters, PeakHP, PeakTorqueNm, Cylinders, peakTorqueRPM, peakPowerRPM,
+-- redlineRPM, limiterRPM, idleRPM, and Powerband. TorqueCurve, when provided, overrides the
+-- generated shape with exact piecewise-linear RPM/torque points.
+-- When SpecsIncludeBoost = true and Turbo/Supercharger is enabled, the synthesized off-boost base
+-- curve is divided by the rated boost multiplier so full stock boost hits the configured peaks.
+function SimcadeEngine.synthesizeSpec(cfg)
+    cfg = cfg or {}
+    local isDiesel    = SimcadeEngine.isDiesel(cfg)
+    local liters      = math.max(0.05, tonumber(cfg.DisplacementLiters) or 2.0)
+    local cylinders   = math.max(1, math.floor(tonumber(cfg.Cylinders) or 4))
+    local idleRPM     = math.max(isDiesel and 350 or 400, tonumber(cfg.idleRPM) or (isDiesel and 700 or 1000))
+    local minSpan     = isDiesel and 800 or 1500
+    local redlineRPM  = math.max(idleRPM + minSpan, tonumber(cfg.redlineRPM) or (isDiesel and 3500 or 8000))
+    local warnings    = {}
+    local rawLimiter  = tonumber(cfg.limiterRPM)
+    local limiterRPM  = math.max(redlineRPM, rawLimiter or (redlineRPM + (isDiesel and 150 or 250)))
+    if rawLimiter and rawLimiter < redlineRPM then
+        warnings[#warnings + 1] = string.format(
+            "limiterRPM (%.0f) is below redlineRPM (%.0f); clamped to %.0f",
+            rawLimiter, redlineRPM, limiterRPM
+        )
+    end
+    local customCurve = normalizeTorqueCurve(cfg.TorqueCurve, idleRPM, limiterRPM)
+
+    -- Peak torque & peak HP (with backward-compatible fallback to baseTorque * TorqueMultiplier)
+    local peakTorqueNm = tonumber(cfg.PeakTorqueNm)
+    if not peakTorqueNm then
+        peakTorqueNm = (tonumber(cfg.baseTorque) or 160) * (tonumber(cfg.TorqueMultiplier) or 1.25)
+    end
+    local tqMargin = isDiesel and 200 or 400
+    local pwrGap   = isDiesel and 200 or 300
+    local peakTorqueRPM = math.clamp(tonumber(cfg.peakTorqueRPM) or (idleRPM + (redlineRPM - idleRPM) * (isDiesel and 0.35 or 0.48)), idleRPM + tqMargin, math.max(idleRPM + tqMargin, redlineRPM - tqMargin))
+    local peakPowerRPM  = math.clamp(tonumber(cfg.peakPowerRPM)  or (idleRPM + (redlineRPM - idleRPM) * 0.80), math.min(redlineRPM, peakTorqueRPM + pwrGap), redlineRPM)
+
+    -- Compute PeakHP from PeakTorqueNm if omitted, or refine high-RPM torque to hit PeakHP at peakPowerRPM
+    -- Power(HP) = Torque(Nm) * RPM / 7127
+    local peakHP = tonumber(cfg.PeakHP)
+    if not peakHP or peakHP <= 0 then
+        peakHP = (peakTorqueNm * 0.88 * peakPowerRPM) / 7127.0
+    end
+    local requestedPeakHP = peakHP
+    local requestedPeakPowerRPM = peakPowerRPM
+    local constrainPeakHP = (cfg.ConstrainGeneratedPeakHP == true)
+
+    if customCurve then
+        peakTorqueNm, peakTorqueRPM, peakHP, peakPowerRPM = measurePiecewisePeaks(customCurve)
+        requestedPeakHP = peakHP
+        requestedPeakPowerRPM = peakPowerRPM
+    end
+    local rawTorqueAtPeakPowerNm = (peakHP * 7127.0) / math.max(500, peakPowerRPM)
+    local torqueAtPeakPowerNm = math.clamp(rawTorqueAtPeakPowerNm, peakTorqueNm * 0.35, peakTorqueNm * 1.05)
+    if not customCurve then
+        local hpAtPeakTorque = (peakTorqueNm * peakTorqueRPM) / 7127.0
+        if hpAtPeakTorque > requestedPeakHP * 1.02 then
+            warnings[#warnings + 1] = string.format(
+                "PeakTorqueNm (%.0f Nm @ %.0f RPM = %.1f HP) exceeds requested PeakHP (%.1f HP)",
+                peakTorqueNm, peakTorqueRPM, hpAtPeakTorque, requestedPeakHP
+            )
+        elseif math.abs(torqueAtPeakPowerNm - rawTorqueAtPeakPowerNm) > 0.5 then
+            warnings[#warnings + 1] = string.format(
+                "Requested PeakHP (%.1f HP @ %.0f RPM needs %.1f Nm) conflicts with PeakTorqueNm (%.0f Nm); target torque clamped to %.1f Nm",
+                requestedPeakHP, peakPowerRPM, rawTorqueAtPeakPowerNm, peakTorqueNm, torqueAtPeakPowerNm
+            )
+        end
+    end
+
+    -- Powerband shaping:
+    --   PowerbandStartRPM .. PowerbandEndRPM define the effective RPM range where the engine is "on cam".
+    --   Also supports Powerband = { startRPM = ..., endRPM = ... } or scalar Powerband (0..1 fullness).
+    local pbStartRPM, pbEndRPM, pbLowFloor, pbTopFloor, pbRiseSharpness, pbDropSharpness
+    if not customCurve then
+        local pb = type(cfg.Powerband) == "table" and cfg.Powerband or {}
+        local pbScalar = (type(cfg.Powerband) == "number") and math.clamp(cfg.Powerband, 0.0, 1.0) or nil
+        local rawPbEnd = tonumber(pb.endRPM or cfg.PowerbandEndRPM)
+        pbStartRPM = math.clamp(tonumber(pb.startRPM or cfg.PowerbandStartRPM) or (idleRPM + (peakTorqueRPM - idleRPM) * 0.45), idleRPM + 200, peakTorqueRPM)
+        pbEndRPM   = math.clamp(rawPbEnd or math.min(redlineRPM, peakPowerRPM + (redlineRPM - peakPowerRPM) * 0.65), peakPowerRPM, limiterRPM)
+        if rawPbEnd and rawPbEnd < peakPowerRPM then
+            warnings[#warnings + 1] = string.format(
+                "PowerbandEndRPM (%.0f) is below peakPowerRPM (%.0f); clamped to %.0f",
+                rawPbEnd, peakPowerRPM, pbEndRPM
+            )
+        end
+        pbLowFloor = math.clamp(tonumber(pb.lowEndScale) or (pbScalar and (0.52 + 0.30 * pbScalar) or 0.60), 0.35, 0.92)
+        pbTopFloor = math.clamp(tonumber(pb.topEndScale) or (pbScalar and (0.62 + 0.28 * pbScalar) or 0.78), 0.40, 1.00)
+        pbRiseSharpness = normalizeSharpness(cfg.PowerbandRiseSharpness, "PowerbandRiseSharpness")
+        pbDropSharpness = normalizeSharpness(cfg.PowerbandDropSharpness, "PowerbandDropSharpness")
+    end
+
+    -- Keep nine compatibility samples in c and use a denser runtime curve for the shaped taper.
+    local span = math.max(500, limiterRPM - idleRPM)
+    local torqueCurveKNm = {}
+    local function generatedTorqueNm(rpm)
+        local tqNm
+        if rpm < pbStartRPM then
+            -- Below powerband: smooth build from idle floor up to ~86% of peak torque at PowerbandStartRPM
+            local u = math.clamp((rpm - idleRPM) / math.max(200, pbStartRPM - idleRPM), 0, 1)
+            local riseProgress = u <= 0 and 0 or u ^ (1.0 / pbRiseSharpness)
+            local s = riseProgress * riseProgress * (3 - 2 * riseProgress)
+            local startScale = math.max(pbLowFloor + 0.12, 0.84)
+            tqNm = peakTorqueNm * (pbLowFloor + (startScale - pbLowFloor) * s)
+        elseif rpm <= peakTorqueRPM then
+            -- Entering powerband: climbs from startScale to 100% PeakTorqueNm
+            local u = math.clamp((rpm - pbStartRPM) / math.max(200, peakTorqueRPM - pbStartRPM), 0, 1)
+            local riseProgress = u <= 0 and 0 or u ^ (1.0 / pbRiseSharpness)
+            local s = riseProgress * riseProgress * (3 - 2 * riseProgress)
+            local startScale = math.max(pbLowFloor + 0.12, 0.84)
+            tqNm = peakTorqueNm * (startScale + (1.0 - startScale) * s)
+        elseif rpm <= peakPowerRPM then
+            -- Mid-to-upper powerband: transitions from PeakTorqueNm to torqueAtPeakPowerNm (= PeakHP * 7127 / peakPowerRPM)
+            local u = math.clamp((rpm - peakTorqueRPM) / math.max(200, peakPowerRPM - peakTorqueRPM), 0, 1)
+            local s = u * u * (3 - 2 * u)
+            tqNm = peakTorqueNm + (torqueAtPeakPowerNm - peakTorqueNm) * s
+        elseif rpm <= pbEndRPM then
+            -- Upper powerband: sustains power cleanly up to PowerbandEndRPM
+            local u = math.clamp((rpm - peakPowerRPM) / math.max(150, pbEndRPM - peakPowerRPM), 0, 1)
+            local endTarget = torqueAtPeakPowerNm * math.max(0.88, pbTopFloor)
+            tqNm = torqueAtPeakPowerNm + (endTarget - torqueAtPeakPowerNm) * (u * 0.65)
+        else
+            -- Above powerband (towards redline/limiter): shape how quickly torque falls.
+            local u = math.clamp((rpm - pbEndRPM) / math.max(150, limiterRPM - pbEndRPM), 0, 1)
+            local endTarget = torqueAtPeakPowerNm * math.max(0.88, pbTopFloor)
+            local limTarget = torqueAtPeakPowerNm * pbTopFloor * 0.85
+            local dropStart = torqueAtPeakPowerNm
+            if pbEndRPM > peakPowerRPM then
+                dropStart = torqueAtPeakPowerNm + (endTarget - torqueAtPeakPowerNm) * 0.65
+            end
+            local dropProgress = u <= 0 and 0 or u ^ (1.0 / pbDropSharpness)
+            tqNm = dropStart + (limTarget - dropStart) * dropProgress
+        end
+        if constrainPeakHP then
+            local envelopeNm = (requestedPeakHP * 7127.0) / math.max(500, rpm)
+            if tqNm > envelopeNm then tqNm = envelopeNm end
+        end
+        return math.max(0.5, tqNm)
+    end
+
+    local specsIncludeBoost = (cfg.SpecsIncludeBoost == true)
+    local ratedBoostMult, activeMaxBoostMult = SimcadeEngine.computeBoostMultipliers(cfg)
+    local curveDivisor = specsIncludeBoost and ratedBoostMult or 1.0
+
+    for i = 0, 8 do
+        local rpm = idleRPM + (span * (i / 8))
+        local tqNm = customCurve and sampleTorqueCurve(customCurve, rpm) or generatedTorqueNm(rpm)
+        torqueCurveKNm[i] = (tqNm / curveDivisor) * 0.001
+    end
+
+    local runtimeTorqueCurve
+    local actualPeakTorqueNm, actualPeakTorqueRPM = peakTorqueNm, peakTorqueRPM
+    local actualPeakHP, actualPeakPowerRPM = peakHP, peakPowerRPM
+    if customCurve then
+        runtimeTorqueCurve = { n = #customCurve, points = {} }
+        for i = 1, #customCurve do
+            runtimeTorqueCurve.points[i] = {
+                rpm = customCurve[i].rpm,
+                value = (customCurve[i].torqueNm / curveDivisor) * 0.001,
+            }
+        end
+    else
+        local runtimePointCount = 33
+        runtimeTorqueCurve = {
+            n = runtimePointCount,
+            lo = idleRPM,
+            k = (runtimePointCount - 1) / span,
+            v = {},
+        }
+        local sampledPoints = {}
+        for i = 0, runtimePointCount - 1 do
+            local rpm = idleRPM + span * (i / (runtimePointCount - 1))
+            local tqNm = generatedTorqueNm(rpm)
+            runtimeTorqueCurve.v[i] = (tqNm / curveDivisor) * 0.001
+            sampledPoints[i + 1] = { rpm = rpm, torqueNm = tqNm }
+        end
+        actualPeakTorqueNm, actualPeakTorqueRPM, actualPeakHP, actualPeakPowerRPM = measurePiecewisePeaks(sampledPoints)
+        local hpDelta = math.abs(actualPeakHP - requestedPeakHP)
+        local rpmDelta = math.abs(actualPeakPowerRPM - requestedPeakPowerRPM)
+        if hpDelta > math.max(3.0, requestedPeakHP * 0.03) or rpmDelta > 250 then
+            warnings[#warnings + 1] = string.format(
+                "Generated curve peaks at %.1f HP @ %.0f RPM (requested %.1f HP @ %.0f RPM)",
+                actualPeakHP, actualPeakPowerRPM, requestedPeakHP, requestedPeakPowerRPM
+            )
+        end
+    end
+
+    local basePeakTorqueNm = actualPeakTorqueNm / curveDivisor
+    local basePeakHP = actualPeakHP / curveDivisor
+    local reportedPeakTorqueNm = specsIncludeBoost and (basePeakTorqueNm * activeMaxBoostMult) or actualPeakTorqueNm
+    local reportedPeakHP = specsIncludeBoost and (basePeakHP * activeMaxBoostMult) or actualPeakHP
+
+    -- Auto-derive flywheel inertia and engine braking from displacement & cylinders unless overridden
+    local autoInertia = math.clamp(0.06 + liters * 0.035 + (cylinders - 4) * 0.008, 0.03, 0.45)
+    local cfgInertia = tonumber(cfg.flywheelInertia)
+    local flywheelInertia = (cfgInertia and cfgInertia > 0) and cfgInertia or autoInertia
+    local autoEngBrake = math.clamp(35 + liters * 24 + cylinders * 4, 40, 260)
+    if basePeakTorqueNm < 80 then
+        autoEngBrake = math.min(autoEngBrake, math.clamp(basePeakTorqueNm * 0.35, 2, 40))
+    end
+    local engineBrakeTorque = tonumber(cfg.engineBrakeTorque) or autoEngBrake
+
+    return {
+        idleRPM               = idleRPM,
+        peakTorqueRPM         = actualPeakTorqueRPM,
+        peakPowerRPM          = actualPeakPowerRPM,
+        requestedPeakPowerRPM = requestedPeakPowerRPM,
+        redlineRPM            = redlineRPM,
+        limiterRPM            = limiterRPM,
+        peakTorqueNm          = reportedPeakTorqueNm,
+        peakHP                = reportedPeakHP,
+        basePeakTorqueNm      = basePeakTorqueNm,
+        basePeakHP            = basePeakHP,
+        specsIncludeBoost     = specsIncludeBoost,
+        ratedBoostMult        = ratedBoostMult,
+        activeMaxBoostMult    = activeMaxBoostMult,
+        requestedPeakHP       = requestedPeakHP,
+        actualPeakTorqueNm    = reportedPeakTorqueNm,
+        actualPeakTorqueRPM   = actualPeakTorqueRPM,
+        actualPeakHP          = reportedPeakHP,
+        actualPeakPowerRPM    = actualPeakPowerRPM,
+        warnings              = warnings,
+        flywheelInertia       = flywheelInertia,
+        engineBrakeTorque     = engineBrakeTorque,
+        torqueCurveKNm        = torqueCurveKNm,
+        torqueCurve           = runtimeTorqueCurve,
+        brakeCurveKNm         = {
+            [0] = (engineBrakeTorque * 0.42) * 0.001,
+            [1] = (engineBrakeTorque * 0.78) * 0.001,
+            [2] = (engineBrakeTorque * 1.15) * 0.001,
+        },
+    }
+end
+
+-- Sim-Engine 4-State Ignition Machine:
+--   0 = Off (electronics off, engine dead)
+--   1 = Ignition On (electronics on; if running -> engine stays running)
+--   2 = Cranking (starter motor active; catches after crankDuration)
+--   3 = Catch / Running transition -> settles to state 1 with running = true
+function SimcadeEngine.newIgnitionState(cfg)
+    cfg = cfg or {}
+    local autoStart = (cfg.StartRunning ~= false) and (cfg.AutoStartOnEnter ~= false)
+    local idleRPM = math.max(400, tonumber(cfg.idleRPM) or 1000)
+    local catchRPM = math.clamp(tonumber(cfg.StarterCatchRPM) or 260, 120, math.max(200, idleRPM * 0.75))
+    local stallRPM = math.clamp(tonumber(cfg.StallRPM) or math.min(450, idleRPM * 0.55), 150, math.max(200, idleRPM - 150))
+    local defaultBumpRPM = math.max(catchRPM + 80, stallRPM + 150, idleRPM * 0.55)
+    return {
+        state             = autoStart and 1 or 0,
+        running           = autoStart,
+        lastKey           = false,
+        crankTimer        = 0,
+        crankDuration     = math.max(0.15, tonumber(cfg.StarterCrankTime or cfg.crankTime) or 0.45),
+        crankRPM          = math.max(150, tonumber(cfg.StarterRPM or cfg.crankRPM) or 320),
+        physicalStarter   = (cfg.PhysicalStarter == true),
+        catchRPM          = catchRPM,
+        catchDuration     = math.clamp(tonumber(cfg.StarterCatchTime) or 0.25, 0.05, 3.0),
+        bumpStartEnabled  = (cfg.BumpStartEnabled ~= false),
+        bumpStartRPM      = math.clamp(tonumber(cfg.BumpStartRPM) or defaultBumpRPM, 200, math.max(350, idleRPM * 0.95)),
+        bumpStartDuration = math.clamp(tonumber(cfg.BumpStartTime) or 0.22, 0.05, 2.0),
+        bumpTimer         = 0,
+        bumpCooldown      = 0,
+        lastStartCause    = nil,
+        autoStart         = autoStart,
+    }
+end
+
+local function checkBumpStart(ign, stepDt, rpmNow)
+    if ign.bumpStartEnabled ~= false and ign.state == 1 and not ign.running and (ign.bumpCooldown or 0) <= 0 then
+        if rpmNow >= (ign.bumpStartRPM or 550) then
+            ign.bumpTimer = (ign.bumpTimer or 0) + stepDt
+            if ign.bumpTimer >= (ign.bumpStartDuration or 0.22) then
+                ign.running = true
+                ign.state = 3
+                ign.bumpTimer = 0
+                ign.lastStartCause = "bump"
+            end
+        else
+            ign.bumpTimer = max(0, (ign.bumpTimer or 0) - stepDt * 0.5)
+        end
+    else
+        ign.bumpTimer = 0
+    end
+end
+
+function SimcadeEngine.stepIgnition(ign, keyDown, dt, hasDriver, liveRPM)
+    if not ign then return { mode = 0, running = false, cranking = false, crankRPM = 0 } end
+    local stepDt = clamp(type(dt) == "number" and dt or (tonumber(dt) or 0.015), 0, 0.1)
+    local rpmNow = max(0, type(liveRPM) == "number" and liveRPM or (tonumber(liveRPM) or 0))
+    if (ign.bumpCooldown or 0) > 0 then
+        ign.bumpCooldown = max(0, ign.bumpCooldown - stepDt)
+    end
+
+    local res = ign._stepRes
+    if not res then
+        res = {}
+        ign._stepRes = res
+    end
+
+    if hasDriver == false then
+        ign.lastKey = false
+        ign.crankTimer = 0
+        if ign.state == 2 then ign.state = 1 end
+        checkBumpStart(ign, stepDt, rpmNow)
+        if ign.state == 3 and ign.running then ign.state = 1 end
+        res.mode = ign.state
+        res.running = ign.running
+        res.cranking = false
+        res.crankRPM = 0
+        return res
+    end
+
+    local pressed = (keyDown == true or keyDown == 1)
+    if pressed and not ign.lastKey then
+        if ign.state == 0 then
+            ign.state = 1
+        elseif ign.state == 1 then
+            if ign.running then
+                ign.running = false
+                ign.state = 0
+                ign.bumpTimer = 0
+            else
+                ign.state = 2
+                ign.crankTimer = 0
+            end
+        elseif ign.state == 2 then
+            ign.state = 1
+            ign.crankTimer = 0
+        end
+    end
+
+    if ign.state == 2 then
+        ign.bumpTimer = 0
+        if pressed then
+            if ign.physicalStarter then
+                if rpmNow >= ign.catchRPM then
+                    ign.crankTimer = ign.crankTimer + stepDt
+                    if ign.crankTimer >= ign.catchDuration then
+                        ign.running = true
+                        ign.state = 3
+                        ign.lastStartCause = "starter"
+                    end
+                else
+                    ign.crankTimer = max(0, ign.crankTimer - stepDt * 0.5)
+                end
+            else
+                ign.crankTimer = ign.crankTimer + stepDt
+                if ign.crankTimer >= ign.crankDuration then
+                    ign.running = true
+                    ign.state = 3
+                    ign.lastStartCause = "starter"
+                end
+            end
+        else
+            ign.state = 1
+            ign.crankTimer = 0
+        end
+    elseif ign.state == 1 then
+        checkBumpStart(ign, stepDt, rpmNow)
+    elseif ign.state == 3 then
+        if ign.running then
+            ign.state = 1
+        end
+    end
+
+    ign.lastKey = pressed
+    local outCrankRPM = 0
+    if ign.state == 2 then
+        outCrankRPM = ign.physicalStarter and max(2, rpmNow) or ign.crankRPM
+    end
+    res.mode = ign.state
+    res.running = ign.running
+    res.cranking = (ign.state == 2)
+    res.crankRPM = outCrankRPM
+    return res
+end
+
+function SimcadeEngine.stallIgnition(ign)
+    if not ign then return end
+    ign.running = false
+    ign.crankTimer = 0
+    ign.bumpTimer = 0
+    ign.bumpCooldown = 0.75
+    if ign.state ~= 0 then
+        ign.state = 1 -- Keep ignition ON so holding the ignition key immediately re-cranks or rolling in gear can bump-start
+    end
+end
+
+-- Sim-Engine In-Depth Turbo Spool & Boost Simulation
+function SimcadeEngine.newTurboState()
+    return { rpm = 0, psi = 0, boost = 1.0 }
+end
+
+function SimcadeEngine.stepTurbo(turboState, cfg, rpm, throttle, dt)
+    if not (cfg and cfg.Turbo) then
+        turboState.rpm, turboState.psi, turboState.boost = 0, 0, 1.0
+        return turboState
+    end
+    local maxRPM    = max(1000, cfg.Turbo_MaxRPM or 9000)
+    local psiMax    = max(0, cfg.Turbo_PSIMax or cfg.BoostPSI or 12)
+    local startRPM  = max(0, cfg.Turbo_StartRPM or 2000)
+    local wastegate = cfg.Turbo_WastegatePSI or psiMax
+    local airPress  = SimcadeEngine.resolveAirPressure(cfg, "Turbo_AirPressure")
+    local maxFlow   = max(100, cfg.Turbo_MaxFlow or 9000)
+    local flowScale = max(0, cfg.Turbo_FlowScale or 100)
+    local dragScale = max(0, cfg.Turbo_DragScale or 0.01)
+    local inertia   = max(0.005, cfg.Turbo_Inertia or 0.035)
+    local expVal    = clamp(cfg.Turbo_Exp or 1.0, 0.1, 3.0)
+    local coastFlow = clamp(cfg.Turbo_CoastFlow or 0.08, 0, 1)
+    local loadExp   = clamp(cfg.Turbo_LoadExp or 1.0, 0.1, 3.0)
+    local stepDt    = clamp(dt or 0.015, 0, 0.1)
+    local targetPsi = clamp(wastegate, 0, psiMax)
+
+    local tRPM   = turboState.rpm or 0
+    local psi    = targetPsi * (tRPM / maxRPM)
+    local boost  = (psi + airPress) / airPress
+    local engineRPM = max(0, rpm or 0)
+    local thr    = clamp(throttle or 0, 0, 1)
+    local thrLoad = (thr > 0) and (loadExp == 1.0 and thr or (thr ^ loadExp)) or 0
+    local flow   = (max(0, engineRPM - startRPM) * boost / maxFlow) * thrLoad
+    local dragThrottle = (engineRPM > startRPM) and thrLoad or 0
+    -- Off-throttle coastFlow softens spin-down drag across lift-off/shifts without ever generating
+    -- positive boost at closed throttle. Exponential drag integration keeps bleed-off tickrate-independent.
+    local coastDragScale = (1.0 - dragThrottle) * (1.0 - coastFlow * 0.75)
+    local dragRate = (maxFlow * dragScale / maxRPM) * coastDragScale / inertia
+    local drive    = (flowScale * (flow > 0 and (expVal == 1.0 and flow or (flow ^ expVal)) or 0)) / inertia
+    local nextRPM
+    if dragRate > 1e-6 then
+        local eq = drive / dragRate
+        nextRPM = eq + (tRPM - eq) * exp(-dragRate * stepDt)
+    else
+        nextRPM = tRPM + drive * stepDt
+    end
+
+    turboState.rpm   = clamp(nextRPM, 0, maxRPM)
+    turboState.psi   = targetPsi * (turboState.rpm / maxRPM)
+    turboState.boost = (turboState.psi + airPress) / airPress
+    return turboState
+end
+
+function SimcadeEngine.newSuperchargerState()
+    return { psi = 0, boost = 1.0 }
+end
+
+function SimcadeEngine.stepSupercharger(superchargerState, cfg, rpm, throttle)
+    if not (cfg and cfg.Supercharger) then
+        superchargerState.psi, superchargerState.boost = 0, 1.0
+        return superchargerState
+    end
+
+    local superchargerType = string.lower(tostring(cfg.Supercharger_Type or "centrifugal"))
+    local typeExp = (superchargerType == "roots" and 0.65)
+        or ((superchargerType == "twin_screw" or superchargerType == "twin-screw") and 0.8)
+        or 2.0
+    local maxPSI = math.max(0, tonumber(cfg.Supercharger_MaxPSI) or 8)
+    local airPressure = SimcadeEngine.resolveAirPressure(cfg, "Supercharger_AirPressure")
+    local ratedRPM = math.max(1000, tonumber(cfg.Supercharger_RatedRPM) or 6500)
+    local pressureExp = math.clamp(tonumber(cfg.Supercharger_PressureExp) or typeExp, 0.1, 3.0)
+    local engineRPM = math.max(0, tonumber(rpm) or 0)
+    local speedRatio = math.clamp(engineRPM / ratedRPM, 0, 1)
+    local throttleLoad = math.clamp(tonumber(throttle) or 0, 0, 1)
+
+    superchargerState.psi = maxPSI * (speedRatio ^ pressureExp) * throttleLoad
+    superchargerState.boost = (superchargerState.psi + airPressure) / airPressure
+    return superchargerState
+end
+
+-- Combine forced-induction torque ratios, gauge boost PSI, and crankshaft parasitic drag (kN.m).
+-- Returns: inductionTorqueRatio, boostPSI, parasiticDragKNm, combinedBoostRatio, airPressure, turboBoostRatio
+function SimcadeEngine.computeInduction(cfg, tRes, sRes, rpm, throttle, running)
+    cfg = cfg or {}
+    local turboActive = cfg.Turbo == true
+    local superchargerActive = cfg.Supercharger == true
+    local turboBoostRatio = turboActive and math.max(1.0, tonumber(tRes and tRes.boost) or 1.0) or 1.0
+    local superchargerBoostRatio = superchargerActive and math.max(1.0, tonumber(sRes and sRes.boost) or 1.0) or 1.0
+    local combinedBoostRatio = turboBoostRatio * superchargerBoostRatio
+    local airPressure = SimcadeEngine.resolveAirPressure(
+        cfg,
+        turboActive and "Turbo_AirPressure" or (superchargerActive and "Supercharger_AirPressure" or nil)
+    )
+
+    local turboTorqueRatio = 1.0 + (turboBoostRatio - 1.0) * math.max(0, tonumber(cfg.Turbo_TorqueGain) or 1.0)
+    local superchargerTorqueRatio = 1.0 + (superchargerBoostRatio - 1.0) * math.max(0, tonumber(cfg.Supercharger_TorqueGain) or 1.0)
+    local parasiticDragKNm = 0
+
+    if superchargerActive then
+        local physicalLoss = (cfg.Supercharger_PhysicalLoss == true)
+        local engineRPM = running and math.max(0, tonumber(rpm) or 0) or 0
+        local ratedRPM = math.max(1000, tonumber(cfg.Supercharger_RatedRPM) or 6500)
+        local speedRatio = math.clamp(engineRPM / ratedRPM, 0, 1.25)
+
+        if physicalLoss then
+            -- Crankshaft compressor power loss replaces multiplier-based Supercharger_DriveLoss (no double-counting).
+            if running and engineRPM > 50 then
+                local liters = math.max(0.05, tonumber(cfg.DisplacementLiters) or 2.0)
+                local throttleLoad = math.clamp(tonumber(throttle) or 0, 0, 1)
+                local bypassScale = 0.10 + 0.90 * throttleLoad
+                -- 4-stroke displaced air mass flow (kg/s): V_m3 * (RPM / 120) * rho_air * VE
+                local massFlow = (liters * 0.001) * (engineRPM / 120.0) * 1.225 * 0.85 * bypassScale
+                local efficiency = math.clamp(tonumber(cfg.Supercharger_Efficiency) or 0.65, 0.25, 0.95)
+                -- Isentropic compression power: massFlow * cp(1005) * Tin(293.15) * (PR^((gamma-1)/gamma) - 1) / eff
+                local compPowerW = massFlow * 294615.75 * ((superchargerBoostRatio ^ 0.285714) - 1.0) / efficiency
+                local omega = math.max(50.0, engineRPM * 0.10471975512)
+                local compTorqueNm = math.max(0, compPowerW / omega)
+                local baseDragNm = math.max(0, tonumber(cfg.Supercharger_BaseDragNm) or 4.0)
+                local mechDragNm = baseDragNm * (0.45 + 0.55 * speedRatio)
+                parasiticDragKNm = (compTorqueNm + mechDragNm) * 0.001
+            end
+        else
+            local maxPSI = tonumber(cfg.Supercharger_MaxPSI) or 8
+            local superchargerBoostFrac = (maxPSI > 0)
+                and math.clamp((tonumber(sRes and sRes.psi) or 0) / maxPSI, 0, 1)
+                or 0
+            local driveLoss = math.clamp(tonumber(cfg.Supercharger_DriveLoss) or 0.08, 0, 0.75)
+            superchargerTorqueRatio = superchargerTorqueRatio * (1 - driveLoss * superchargerBoostFrac)
+            local baseDragNm = math.max(0, tonumber(cfg.Supercharger_BaseDragNm) or 0)
+            if running and baseDragNm > 0 and engineRPM > 50 then
+                parasiticDragKNm = (baseDragNm * (0.45 + 0.55 * speedRatio)) * 0.001
+            end
+        end
+    end
+
+    local inductionTorqueRatio = math.max(0, turboTorqueRatio * superchargerTorqueRatio)
+    local boostPSI = math.max(0, (combinedBoostRatio - 1.0) * airPressure)
+    return inductionTorqueRatio, boostPSI, parasiticDragKNm, combinedBoostRatio, airPressure, turboBoostRatio
+end
+
+-- Orifice-vs-pumping partial throttle progression:
+--   thr=0 -> 0, thr=1 -> 1 at every RPM (WOT unchanged).
+--   rpmScale > 0 gives stronger low-RPM tip-in and more progressive high-RPM modulation.
+function SimcadeEngine.throttleLoad(thr, rpm, redlineRPM, exp, rpmScale)
+    local t = math.clamp(tonumber(thr) or 0, 0, 1)
+    if t <= 0 then return 0 end
+    local a = (exp and exp ~= 1.0) and (t ^ exp) or t
+    if not rpmScale or rpmScale <= 0 then return a end
+    local r = math.clamp((tonumber(rpm) or 0) / math.max(1000, tonumber(redlineRPM) or 7000), 0.05, 1.0)
+    local s = rpmScale * r
+    return (a * (1.0 + s)) / (a + s)
+end
+
+-- P3 Optional Intake Manifold Pressure (MAP) state.
+-- Separates pre-throttle compressor pressure from post-throttle manifold absolute pressure.
+function SimcadeEngine.newManifoldState(cfg)
+    local atm = SimcadeEngine.resolveAirPressure(cfg)
+    return {
+        absPSI     = atm,
+        gaugePSI   = 0,
+        charge     = 0,
+        vacuumFrac = 0,
+    }
+end
+
+function SimcadeEngine.stepManifold(manifoldState, cfg, rpm, throttle, dt, combinedBoostRatio, inductionTorqueRatio, airPressure, running)
+    if not manifoldState then return nil end
+    cfg = cfg or {}
+    local isDiesel = SimcadeEngine.isDiesel(cfg)
+    local atm = max(1.0, airPressure or SimcadeEngine.resolveAirPressure(cfg))
+    local stepDt = clamp(dt or 0.015, 0, 0.1)
+    local tauBase = clamp(cfg.ManifoldTimeConstant or 0.06, 0.005, 0.50)
+
+    local idleRPM = max(isDiesel and 350 or 400, cfg.idleRPM or 800)
+    local redline = max(idleRPM + (isDiesel and 800 or 1500), cfg.redlineRPM or 7000)
+    local engineRPM = max(0, rpm or 0)
+    local rpmFrac = clamp(engineRPM / redline, 0, 1)
+
+    local preThrottleAbs = atm * max(1.0, combinedBoostRatio or 1.0)
+    if isDiesel then
+        -- Diesels have no throttle butterfly: intake stays unthrottled (>= atm, zero vacuum), fuel meters torque.
+        local targetAbs = running and preThrottleAbs or atm
+        local curAbs = max(atm, manifoldState.absPSI or atm)
+        local rpmRef = max(idleRPM, redline * 0.50)
+        local tauRPM = tauBase * clamp(rpmRef / max(idleRPM, engineRPM), 0.40, 2.50)
+        local tauEff = (targetAbs > curAbs) and (tauRPM * 0.75) or tauRPM
+        local alpha = 1.0 - exp(-stepDt / max(0.004, tauEff))
+        local nextAbs = clamp(curAbs + (targetAbs - curAbs) * alpha, atm, max(atm, preThrottleAbs) * 1.05)
+        manifoldState.absPSI = nextAbs
+        manifoldState.gaugePSI = max(0, nextAbs - atm)
+        manifoldState.vacuumFrac = 0
+        if not running then
+            manifoldState.charge = 0
+        else
+            local fuelDemand = clamp(throttle or 0, 0, 1)
+            local thrExp = clamp(cfg.ThrottleResponseExp or 1.0, 0.25, 4.0)
+            if fuelDemand > 0 and thrExp ~= 1.0 then fuelDemand = fuelDemand ^ thrExp end
+            local pr = nextAbs / atm
+            local cbr = max(1.0, combinedBoostRatio or 1.0)
+            local itr = max(0.0, inductionTorqueRatio or 1.0)
+            local effGain = (cbr > 1.0001) and ((itr - 1.0) / (cbr - 1.0)) or 1.0
+            local boostMult = max(0, 1.0 + (pr - 1.0) * effGain)
+            manifoldState.charge = fuelDemand * boostMult
+        end
+        return manifoldState
+    end
+
+    local baseVacAbs = clamp(cfg.ManifoldIdleAbsPSI or (atm * 0.34), 1.5, atm * 0.85)
+    -- Closed-throttle overrun at high RPM pulls slightly deeper vacuum than idle.
+    local vacFloorAbs = max(1.5, baseVacAbs * (1.0 - 0.25 * rpmFrac))
+
+    local targetAbs
+    if not running then
+        targetAbs = atm
+    else
+        local thrExp = clamp(cfg.ThrottleResponseExp or 1.0, 0.25, 4.0)
+        local rpmScale = cfg.ThrottleRPMScale
+        if rpmScale == nil or rpmScale <= 0 then rpmScale = 1.0 end
+        rpmScale = clamp(rpmScale, 0, 4.0)
+        local flowFrac = SimcadeEngine.throttleLoad(throttle, engineRPM, redline, thrExp, rpmScale)
+        targetAbs = vacFloorAbs + (preThrottleAbs - vacFloorAbs) * flowFrac
+    end
+
+    local curAbs = manifoldState.absPSI or atm
+    -- Plenum time constant scales inversely with engine pumping speed (nominal at 50% redline) and fills faster than it evacuates.
+    local rpmRef = max(idleRPM, redline * 0.50)
+    local tauRPM = tauBase * clamp(rpmRef / max(idleRPM, engineRPM), 0.40, 2.50)
+    local tauEff = (targetAbs > curAbs) and (tauRPM * 0.75) or tauRPM
+    local alpha = 1.0 - exp(-stepDt / max(0.004, tauEff))
+    local nextAbs = clamp(curAbs + (targetAbs - curAbs) * alpha, vacFloorAbs * 0.85, max(atm, preThrottleAbs) * 1.05)
+    manifoldState.absPSI = nextAbs
+    manifoldState.gaugePSI = nextAbs - atm
+
+    if not running then
+        manifoldState.charge = 0
+        manifoldState.vacuumFrac = 0
+    elseif nextAbs <= atm then
+        manifoldState.charge = clamp((nextAbs - vacFloorAbs) / max(0.5, atm - vacFloorAbs), 0, 1)
+        manifoldState.vacuumFrac = clamp((atm - nextAbs) / max(0.5, atm - vacFloorAbs), 0, 1)
+    else
+        local pr = nextAbs / atm
+        local cbr = max(1.0, combinedBoostRatio or 1.0)
+        local itr = max(0.0, inductionTorqueRatio or 1.0)
+        local effGain = (cbr > 1.0001) and ((itr - 1.0) / (cbr - 1.0)) or 1.0
+        manifoldState.charge = max(0, 1.0 + (pr - 1.0) * effGain)
+        manifoldState.vacuumFrac = 0
+    end
+    return manifoldState
+end

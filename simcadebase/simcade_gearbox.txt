@@ -41,12 +41,17 @@ function SimcadeGearbox.computeMasterClutch(params)
     return clamp(simClutch, 0, 1)
 end
 
--- Sim-Engine Fixed-Gearing Upshift & Downshift with Anti-Hunt, Slip & Over-Rev Guards
+-- Sim-Engine Fixed-Gearing Upshift & Downshift with Grade Logic, Anti-Hunt, Slip & Over-Rev Guards
 function SimcadeGearbox.evaluateAutoShift(car, dt)
     local d, c = car.dt, car.c
     if d.gear == 1 or d.shifting ~= 0 then
         car._upDwell = 0
         car._downDwell = 0
+        car.uphillHoldActive = false
+        if d.gear == 1 then
+            car._gradeHoldActive = false
+            car._gradeHuntHoldUntil = 0
+        end
         return nil
     end
 
@@ -56,6 +61,7 @@ function SimcadeGearbox.evaluateAutoShift(car, dt)
 
     local thr = (car.drv and car.drv.thr) or 0
     local brk = (car.drv and car.drv.brk) or 0
+    local idleRPM = math.max(300, c[124] or 800)
     local redline = math.max(1000, c[125] or c[126] or 8000)
     local rpmNow = car.eng.w * 9.54929676
     local rpmPct = (rpmNow / redline) * 100
@@ -104,10 +110,15 @@ function SimcadeGearbox.evaluateAutoShift(car, dt)
         car._pendingShiftCooldown = cd
         car._upDwell              = 0
         car._downDwell            = 0
+        car.uphillHoldActive      = false
+        car._gradeHoldActive      = false
         return targetGear
     end
 
     if d.gear <= 0 then
+        car.uphillHoldActive = false
+        car._gradeHoldActive = false
+        car._gradeHuntHoldUntil = 0
         local minGear = car.minGear or 0
         if minGear >= 0 or d.state ~= 3 then
             car._upDwell, car._downDwell = 0, 0
@@ -130,6 +141,7 @@ function SimcadeGearbox.evaluateAutoShift(car, dt)
         end
         return nil
     end
+
     local topGear = (car.top or 6) + 1
     local gearSpeeds = car.gearSpeeds
     local wRad = (car.wheels and car.wheels[2] and car.wheels[2].radius) or 0.34
@@ -152,22 +164,159 @@ function SimcadeGearbox.evaluateAutoShift(car, dt)
 
     local stopSpd = (car.stoppedPhaseBrakeSpeed or 5) + 3
     if d.gear > 2 and speedKmh <= stopSpd and (roadSyncRPM <= (redline * 0.40) or rpmNow <= (redline * 0.45)) then
+        car._gradeHuntHoldUntil = 0
         return commitShift(2, "down", 0.15)
     end
     if d.state ~= 3 then
         car._upDwell, car._downDwell = 0, 0
+        car.uphillHoldActive = false
         return nil
     end
+
+    -- Asymmetric road-grade filter: reacts immediately on hill entry, bridges brief
+    -- brush seams/bumps mid-climb, and releases cleanly after cresting onto flat ground.
+    local gradeLogicOn = (car.uphillGradeLogic ~= false)
+    local rawGradeSin = clamp(car.uphillSin or 0, 0, 0.95)
+    if rawGradeSin < 0.02 then
+        car._gradeFlatTime = (car._gradeFlatTime or 0) + stepDt
+    else
+        car._gradeFlatTime = 0
+    end
+    local filtGrade = car._gradeSinFiltered or rawGradeSin
+    local gradeRate = (rawGradeSin > filtGrade or car._gradeFlatTime >= 0.25) and 8.0 or 3.0
+    filtGrade = filtGrade + (rawGradeSin - filtGrade) * (1.0 - math.exp(-stepDt * gradeRate))
+    if filtGrade < 0.002 then filtGrade = 0 end
+    car._gradeSinFiltered = filtGrade
+    local effGradeSin = gradeLogicOn and math.max(rawGradeSin, filtGrade) or rawGradeSin
+
+    local split = (d.split ~= nil) and clamp(d.split, 0, 1) or clamp(car.rearDriveShare or 0.5, 0, 1)
+    local frontShare = 1.0 - split
+    local rearShare  = split
+    local frontRad = (car.wheels and car.wheels[0] and car.wheels[0].radius) or wRad
+    local rearRad  = (car.wheels and car.wheels[2] and car.wheels[2].radius) or wRad
+    local driveRad = math.max(0.20, frontRad * frontShare + rearRad * rearShare)
+    local frontFD  = math.abs(c[110] or finalDrive)
+    local rearFD   = math.abs(c[111] or finalDrive)
+    local effFD    = math.max(0.1, frontFD * frontShare + rearFD * rearShare)
+    local massT    = math.max(0.15, car.m or 1.2)
+    local gravMS2  = 9.81
+    local shiftTime = math.max(0.04, car.shiftDelay or 0.14)
+
+    -- Resistive road load (kN): Earth-calibrated slope gravity + live rolling resistance + aero drag.
+    local gradeForceKN = massT * gravMS2 * effGradeSin
+    local rrForceKN = 0
+    if car.wheels then
+        for wi = 0, 3 do
+            local W = car.wheels[wi]
+            if W then
+                rrForceKN = rrForceKN + math.abs(W.rrForce or 0)
+            end
+        end
+    end
+    if rrForceKN <= 0.0001 then
+        rrForceKN = massT * gravMS2 * 0.015
+    end
+    local aeroDragKN = (c[152] or 0) * roadMS * roadMS
+    local resistForceKN = gradeForceKN + rrForceKN + aeroDragKN
+    local decelMS2 = resistForceKN / massT
+
+    local function estimateWheelForceKN(gearRatioAbs, rpmAtWheel, allowSpoolLoss)
+        local tcMult = 1.0
+        local evalRPM = rpmAtWheel
+        if car.clutchType == "torque_converter" then
+            local stallRPM = math.max(1000, car.tcStallRPM or 2200)
+            local coupling = clamp(car.tcCouplingRatio or 0.85, 0.3, 0.98)
+            local maxMult  = math.max(1.0, car.tcMaxMult or 2.0)
+            if evalRPM < stallRPM then
+                local sr = clamp(evalRPM / stallRPM, 0, coupling)
+                tcMult = 1.0 + (maxMult - 1.0) * (1.0 - sr / coupling)
+                evalRPM = math.max(evalRPM, stallRPM * 0.85)
+            end
+        end
+        evalRPM = clamp(evalRPM, idleRPM, redline)
+        local baseTqKNm = (car.evalTorqueCurve and car:evalTorqueCurve(evalRPM))
+            or ((car.maxTorqueNm or 150) * 0.001 * 0.8)
+        local indRatio = math.max(1.0, (car.eng and car.eng.inductionTorqueRatio) or 1.0)
+        if allowSpoolLoss and car.turboEnabled and indRatio > 1.0 then
+            -- Account for partial turbo spool drop during the clutch-open shiftDelay window.
+            local spoolRetain = clamp(1.0 - shiftTime * 0.45, 0.55, 0.90)
+            indRatio = 1.0 + (indRatio - 1.0) * spoolRetain
+        end
+        local parasiticKNm = (car.eng and car.eng.parasiticDragKNm) or 0
+        local engTqKNm = math.max(0.001, baseTqKNm * indRatio - parasiticKNm)
+        local eff = car.drivetrainEff or 0.85
+        return (engTqKNm * tcMult * gearRatioAbs * effFD * eff) / driveRad
+    end
+
+    local onClimb = gradeLogicOn and (effGradeSin >= 0.03)
+    if (not gradeLogicOn) or effGradeSin < 0.025 or thr <= 0.05 then
+        car._gradeHuntHoldUntil = 0
+    end
+
+    local gradeInhibitUpshift = false
+    if onClimb then
+        if d.gear < topGear then
+            local nextRatio = math.abs(getRatio(d.gear + 1))
+            if nextRatio < 0.01 then nextRatio = curRatio end
+            local postShiftMS = math.max(0, roadMS - decelMS2 * shiftTime)
+            local postShiftNextRPM = (postShiftMS / driveRad) * effFD * nextRatio * 9.54929676
+            local nextWotForceKN = estimateWheelForceKN(nextRatio, postShiftNextRPM, true)
+
+            -- On moderate hills where the next gear can pull, bias shift points toward Sport
+            -- proportionally to how heavily loaded the next gear would be.
+            local loadRatio = clamp(resistForceKN / math.max(0.05, nextWotForceKN), 0, 1.5)
+            local gradeBias = clamp((loadRatio - 0.25) / 0.55, 0, 1)
+            upPct   = upPct   + (sportUp   - upPct)   * gradeBias
+            downPct = downPct + (sportDown - downPct) * gradeBias * 0.75
+
+            -- Tractive reserve check with hysteresis so borderline slopes never chatter.
+            local baseMargin = clamp(car.uphillShiftMargin or 1.20, 1.0, 2.5)
+            local reqMargin = car._gradeHoldActive and (baseMargin + 0.06) or baseMargin
+            local lacksClimbReserve = nextWotForceKN < (resistForceKN * reqMargin)
+            local lacksPedalReserve = (thr > 0.20 and thr < 0.85)
+                and (nextWotForceKN * math.min(1.0, thr + 0.25) < resistForceKN * math.min(reqMargin, 1.08))
+            local minClimbRPM = math.max(idleRPM * 1.15, (car.stallRPM or 450) * 1.5)
+            local wouldBogOnShift = (car.clutchType ~= "torque_converter") and (postShiftNextRPM < minClimbRPM)
+            local huntLatched = (now < (car._gradeHuntHoldUntil or 0))
+                and (d.gear == car._gradeHuntGear)
+                and (thr > 0.15)
+                and (effGradeSin >= (car._gradeHuntSin or 0) * 0.70)
+
+            gradeInhibitUpshift = lacksClimbReserve or lacksPedalReserve or wouldBogOnShift or huntLatched
+        end
+
+        -- Proactive hill downshift: if the current gear is overloaded on a climb under throttle,
+        -- raise the downshift point so the box kicks down before bogging.
+        if d.gear > 2 and thr > 0.35 then
+            local curWotForceKN = estimateWheelForceKN(curRatio, math.max(rpmNow, roadSyncRPM), false)
+            if resistForceKN > curWotForceKN * 0.85 then
+                local overloadFrac = clamp((resistForceKN / math.max(0.05, curWotForceKN) - 0.85) / 0.30, 0, 1)
+                local hillDownTarget = math.min(sportDown + 12, upPct - 18)
+                if hillDownTarget > downPct then
+                    downPct = downPct + (hillDownTarget - downPct) * overloadFrac
+                end
+            end
+        end
+
+        upRPM   = redline * (upPct / 100)
+        downRPM = redline * (downPct / 100)
+    end
+
+    car._gradeHoldActive = gradeInhibitUpshift and (rpmPct >= upPct * 0.92)
+    car.uphillHoldActive = gradeInhibitUpshift and (thr > 0.05)
 
     -- Maximum RPM allowed immediately after a downshift so the lower gear has
     -- a real hysteresis buffer below the upshift point (prevents 1-2 / 2-3 hunting).
     local downshiftLandingCap = math.min(redline * 0.90, upRPM * 0.82)
 
-    -- Upshift guard: anti-loop (next gear must land well above its effective downshift threshold),
-    -- wheelspin, min speed, and short dwell timer (bypassed near redline).
+    -- Upshift guard: grade feasibility, anti-loop (next gear must land well above its effective
+    -- downshift threshold), wheelspin, min speed, and short dwell timer (bypassed near redline).
     local wantsUpshift = false
-    local mustUpshift = (rpmNow >= redline * 0.97)
-    if d.gear < topGear and rpmPct >= upPct and thr > 0.05 and not isWheelSpinning then
+    local redlineMode = car.uphillRedlineHold or "redline"
+    local allowRedlineOverride = (not gradeInhibitUpshift) or (redlineMode == "upshift")
+    local mustUpshift = (rpmNow >= redline * 0.97) and allowRedlineOverride
+    local canClimbUpshift = (not gradeInhibitUpshift) or (mustUpshift and redlineMode == "upshift")
+    if canClimbUpshift and d.gear < topGear and rpmPct >= upPct and thr > 0.05 and not isWheelSpinning then
         if mustUpshift or car.lastShiftDir ~= "down" or sinceLastShift >= antiHuntCooldown then
             local nextRatio = math.abs(getRatio(d.gear + 1))
             if nextRatio < 0.01 then nextRatio = curRatio end
@@ -182,7 +331,7 @@ function SimcadeGearbox.evaluateAutoShift(car, dt)
             -- On a climb, allow for the speed lost while the clutch is open.
             -- A short crawler gear can otherwise upshift directly into the
             -- near-stop downshift window and repeat the shift under load.
-            local shiftLossKmh = (car.uphillSin or 0) * 15.24 * 3.6 * (car.shiftDelay or 0.14)
+            local shiftLossKmh = (effGradeSin > 0) and ((gradeLogicOn and decelMS2 or (rawGradeSin * gravMS2)) * 3.6 * shiftTime) or 0
             local entryKmh = minUpshiftKmh
             if shiftLossKmh > 0 then entryKmh = math.max(entryKmh, stopSpd + 1) + shiftLossKmh end
             if (safeToUpshift or mustUpshift) and speedKmh >= entryKmh then
@@ -225,7 +374,15 @@ function SimcadeGearbox.evaluateAutoShift(car, dt)
         car._downDwell = (car._downDwell or 0) + stepDt
         local downDwellReq = (brk > 0.15) and 0.08 or 0.18
         if car._downDwell >= downDwellReq then
-            return commitShift(d.gear - 1, "down")
+            local prevDir = car.lastShiftDir
+            local prevSince = sinceLastShift
+            local targetG = commitShift(d.gear - 1, "down")
+            if onClimb and prevDir == "up" and prevSince <= 3.5 and thr > 0.25 then
+                car._gradeHuntHoldUntil = now + math.max(2.5, antiHuntCooldown * 2.0)
+                car._gradeHuntGear = targetG
+                car._gradeHuntSin = effGradeSin
+            end
+            return targetG
         end
     else
         car._downDwell = 0

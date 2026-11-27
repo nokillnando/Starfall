@@ -1,0 +1,190 @@
+--@name Simcade Wiremod & Net Sync Module
+--@shared
+
+SimcadeWire = SimcadeWire or {}
+if CLIENT then return end
+
+local solverSlotsInWireOrder = { 0, 1, 3, 2 } -- FL, FR, RL, RR
+local detailedWheelOutputs = false
+local lastOutputs = {}
+local floor = math.floor
+local deg = math.deg
+local tonumber = tonumber
+local tostring = tostring
+
+local function writePort(name, val)
+    if lastOutputs[name] ~= val then
+        lastOutputs[name] = val
+        wire.ports[name] = val
+    end
+end
+
+function SimcadeWire.initPorts(VEHICLE_CFG, WHEELS, extraInputs, extraOutputs)
+    local inNames = { "Pod", "Base", "EngineSound", "ExtraFilterStatic", "ExtraFilterSemiDynamic" }
+    local inTypes = { "Entity", "Entity", "Entity", "Array", "Array" }
+
+    if VEHICLE_CFG and VEHICLE_CFG.enableExternalWireOverrides then
+        local extNames = { "Active", "FrontWheels", "RearWheels", "EngineThrottle", "EngineBrake", "Handbrake", "Clutch", "GearUp", "GearDown", "Ignition", "TrailerMode" }
+        local extTypes = { "Number", "Array", "Array", "Number", "Number", "Number", "Number", "Number", "Number", "Number", "Number" }
+        for i = 1, #extNames do
+            table.insert(inNames, extNames[i])
+            table.insert(inTypes, extTypes[i])
+        end
+    end
+    if type(extraInputs) == "table" then
+        for _, inp in ipairs(extraInputs) do
+            if inp.name then
+                table.insert(inNames, inp.name)
+                table.insert(inTypes, inp.type or "Number")
+            end
+        end
+    end
+    wire.adjustInputs(inNames, inTypes)
+
+    local outNames = {
+        "SpeedKMH", "SpeedMPH",
+        "Throttle", "Brake", "Handbrake", "Ignition", "Active",
+        "RPM", "FlywheelRPM", "Gear", "GearName", "Clutch",
+        "Torque", "MaxTorque", "EngineLoad", "BoostPSI", "TurboPSI",
+        "SlipAngle", "LongSlipRatio", "IsDrifting", "IsSlipping",
+        "ActiveCompound", "AppliedForce",
+        "FrontDiffLocked", "RearDiffLocked", "AllDiffLocked", "FrontActiveLockPct", "RearActiveLockPct", "ABSActive",
+        "JakeBrakeStage", "JakeBrakeActive",
+        "FL_Load", "FR_Load", "RL_Load", "RR_Load",
+        "GroundedCount", "TotalMass",
+        "SteeringAngleDeg", "FrontAxle", "RearAxle"
+    }
+    local outTypes = {
+        "Number", "Number",
+        "Number", "Number", "Number", "Number", "Number",
+        "Number", "Number", "Number", "String", "Number",
+        "Number", "Number", "Number", "Number", "Number",
+        "Number", "Number", "Number", "Number",
+        "String", "Number",
+        "Number", "Number", "Number", "Number", "Number", "Number",
+        "Number", "Number",
+        "Number", "Number", "Number", "Number",
+        "Number", "Number",
+        "Number", "Entity", "Entity"
+    }
+    detailedWheelOutputs = VEHICLE_CFG and VEHICLE_CFG.detailedWheelWireOutputs == true
+    if detailedWheelOutputs then
+        for _, name in ipairs({ "SteeringInput", "FL_SteerDeg", "FR_SteerDeg" }) do
+            table.insert(outNames, name)
+            table.insert(outTypes, "Number")
+        end
+        for _, name in ipairs({ "WheelCamberDeg", "WheelCamberThrustKN", "WheelLateralForceKN", "WheelSlipAngleDeg", "WheelGrounded" }) do
+            table.insert(outNames, name)
+            table.insert(outTypes, "Array")
+        end
+    end
+    local wheelPortNames = {}
+    if type(WHEELS) == "table" and #WHEELS > 0 then
+        for i, w in ipairs(WHEELS) do
+            local pName = (type(w) == "table" and w.name and w.name ~= "")
+                and ("Wheel_" .. tostring(w.name):gsub("%W+", "_"))
+                or ("Wheel" .. i)
+            wheelPortNames[i] = pName
+            table.insert(outNames, pName)
+            table.insert(outTypes, "Entity")
+        end
+    else
+        for i = 1, 4 do
+            local pName = "Wheel" .. i
+            wheelPortNames[i] = pName
+            table.insert(outNames, pName)
+            table.insert(outTypes, "Entity")
+        end
+    end
+    SimcadeWire._wheelPortNames = wheelPortNames
+    if type(extraOutputs) == "table" then
+        for _, outp in ipairs(extraOutputs) do
+            if outp.name then
+                table.insert(outNames, outp.name)
+                table.insert(outTypes, outp.type or "Number")
+            end
+        end
+    end
+    lastOutputs = {}
+    wire.adjustOutputs(outNames, outTypes)
+    return inNames
+end
+
+function SimcadeWire.writeOutputs(data)
+    local ports = wire.ports
+    local last = lastOutputs
+    local v
+    v = data.kmh or 0; if last.SpeedKMH ~= v then last.SpeedKMH = v; ports.SpeedKMH = v end
+    v = data.mph or 0; if last.SpeedMPH ~= v then last.SpeedMPH = v; ports.SpeedMPH = v end
+    v = floor((data.throttle or 0) * 1000 + 0.5) * 0.001; if last.Throttle ~= v then last.Throttle = v; ports.Throttle = v end
+    v = floor((data.brake or 0) * 1000 + 0.5) * 0.001; if last.Brake ~= v then last.Brake = v; ports.Brake = v end
+    v = floor((data.handbrake or 0) * 1000 + 0.5) * 0.001; if last.Handbrake ~= v then last.Handbrake = v; ports.Handbrake = v end
+    v = data.ignitionMode or data.ignitionState or 0; if last.Ignition ~= v then last.Ignition = v; ports.Ignition = v end
+    v = data.engineRunning and 1 or 0; if last.Active ~= v then last.Active = v; ports.Active = v end
+    v = floor((data.rpm or 0) + 0.5); if last.RPM ~= v then last.RPM = v; ports.RPM = v end
+    v = floor((data.flywheelRPM or 0) + 0.5); if last.FlywheelRPM ~= v then last.FlywheelRPM = v; ports.FlywheelRPM = v end
+    v = tonumber(data.gearNumber) or 0; if last.Gear ~= v then last.Gear = v; ports.Gear = v end
+    v = data.gearName or "N"; if type(v) ~= "string" then v = tostring(v) end; if last.GearName ~= v then last.GearName = v; ports.GearName = v end
+    v = floor((data.clutch or 0) * 100 + 0.5) * 0.01; if last.Clutch ~= v then last.Clutch = v; ports.Clutch = v end
+    v = floor((data.torqueNm or 0) + 0.5); if last.Torque ~= v then last.Torque = v; ports.Torque = v end
+    v = floor((data.maxTorque or data.maxTorqueNm or 0) + 0.5); if last.MaxTorque ~= v then last.MaxTorque = v; ports.MaxTorque = v end
+    v = floor((data.engineLoad or 0) * 1000 + 0.5) * 0.001; if last.EngineLoad ~= v then last.EngineLoad = v; ports.EngineLoad = v end
+    v = data.boostPSI or data.turboPSI or 0; if last.BoostPSI ~= v then last.BoostPSI = v; ports.BoostPSI = v end
+    v = data.turboPSI or data.boostPSI or 0; if last.TurboPSI ~= v then last.TurboPSI = v; ports.TurboPSI = v end
+    v = floor((data.slipAngleDeg or 0) * 10 + 0.5) * 0.1; if last.SlipAngle ~= v then last.SlipAngle = v; ports.SlipAngle = v end
+    v = floor((data.longSlipPct or 0) * 10 + 0.5) * 0.1; if last.LongSlipRatio ~= v then last.LongSlipRatio = v; ports.LongSlipRatio = v end
+    v = data.isDrifting and 1 or 0; if last.IsDrifting ~= v then last.IsDrifting = v; ports.IsDrifting = v end
+    v = data.isSlipping and 1 or 0; if last.IsSlipping ~= v then last.IsSlipping = v; ports.IsSlipping = v end
+    v = data.activeCompound or "Sport"; if type(v) ~= "string" then v = tostring(v) end; if last.ActiveCompound ~= v then last.ActiveCompound = v; ports.ActiveCompound = v end
+    v = tonumber(data.jakeBrakeStage) or 0; if last.JakeBrakeStage ~= v then last.JakeBrakeStage = v; ports.JakeBrakeStage = v end
+    v = data.jakeBrakeActive and 1 or 0; if last.JakeBrakeActive ~= v then last.JakeBrakeActive = v; ports.JakeBrakeActive = v end
+    v = floor((data.appliedForce or 0) + 0.5); if last.AppliedForce ~= v then last.AppliedForce = v; ports.AppliedForce = v end
+    v = data.frontDiffLocked and 1 or 0; if last.FrontDiffLocked ~= v then last.FrontDiffLocked = v; ports.FrontDiffLocked = v end
+    v = data.rearDiffLocked and 1 or 0; if last.RearDiffLocked ~= v then last.RearDiffLocked = v; ports.RearDiffLocked = v end
+    v = data.allDiffLocked and 1 or 0; if last.AllDiffLocked ~= v then last.AllDiffLocked = v; ports.AllDiffLocked = v end
+    v = floor((data.frontActiveLockPct or 0) * 10 + 0.5) * 0.1; if last.FrontActiveLockPct ~= v then last.FrontActiveLockPct = v; ports.FrontActiveLockPct = v end
+    v = floor((data.rearActiveLockPct or 0) * 10 + 0.5) * 0.1; if last.RearActiveLockPct ~= v then last.RearActiveLockPct = v; ports.RearActiveLockPct = v end
+    v = data.absActive and 1 or 0; if last.ABSActive ~= v then last.ABSActive = v; ports.ABSActive = v end
+    v = floor((data.flLoad or 0) + 0.5); if last.FL_Load ~= v then last.FL_Load = v; ports.FL_Load = v end
+    v = floor((data.frLoad or 0) + 0.5); if last.FR_Load ~= v then last.FR_Load = v; ports.FR_Load = v end
+    v = floor((data.rlLoad or 0) + 0.5); if last.RL_Load ~= v then last.RL_Load = v; ports.RL_Load = v end
+    v = floor((data.rrLoad or 0) + 0.5); if last.RR_Load ~= v then last.RR_Load = v; ports.RR_Load = v end
+    v = data.groundedCount or 0; if last.GroundedCount ~= v then last.GroundedCount = v; ports.GroundedCount = v end
+    v = floor((data.totalMass or 0) + 0.5); if last.TotalMass ~= v then last.TotalMass = v; ports.TotalMass = v end
+    v = floor((data.steerDeg or 0) * 100 + 0.5) * 0.01; if last.SteeringAngleDeg ~= v then last.SteeringAngleDeg = v; ports.SteeringAngleDeg = v end
+    if detailedWheelOutputs then
+        writePort("SteeringInput", data.steerInput or 0)
+        writePort("FL_SteerDeg", floor(deg(data.frontLeftSteerRad or 0) * 100 + 0.5) * 0.01)
+        writePort("FR_SteerDeg", floor(deg(data.frontRightSteerRad or 0) * 100 + 0.5) * 0.01)
+        -- Wire arrays use vehicle corner order FL, FR, RL, RR. Solver slots are FL, FR, RR, RL.
+        local camber, thrust, lateral, slip, contact = {}, {}, {}, {}, {}
+        for corner = 1, 4 do
+            local slot = solverSlotsInWireOrder[corner]
+            local w = data.solverWheels and data.solverWheels[slot]
+            local grounded = w and w.alignment and w.alignment.isGrounded
+            contact[corner] = grounded and 1 or 0
+            camber[corner] = grounded and deg(w.roadCamberRad or 0) or 0
+            thrust[corner] = grounded and w.camberFy or 0
+            lateral[corner] = grounded and w.Fy or 0
+            slip[corner] = grounded and deg(w.slipAngleRad or 0) or 0
+        end
+        ports.WheelCamberDeg = camber
+        ports.WheelCamberThrustKN = thrust
+        ports.WheelLateralForceKN = lateral
+        ports.WheelSlipAngleDeg = slip
+        ports.WheelGrounded = contact
+    end
+    local wEnts = data.wheelEntities
+    if type(wEnts) == "table" then
+        local names = SimcadeWire._wheelPortNames or {}
+        for i = 1, #wEnts do
+            local pName = names[i] or ("Wheel" .. i)
+            local ent = wEnts[i]
+            if last[pName] ~= ent then
+                last[pName] = ent
+                ports[pName] = ent
+            end
+        end
+    end
+end
+

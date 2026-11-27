@@ -76,7 +76,7 @@ def main():
     root = Path(__file__).resolve().parent
     default_output = root / "releases"
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("revision", nargs="?", type=int, help="override the next release number or start a fresh release folder")
+    parser.add_argument("revision", nargs="?", type=int, help="build a specific release number (overrides auto-detected version)")
     parser.add_argument("output", nargs="?", type=Path, default=default_output,
                         help="release hosting directory ('release' and 'releases' use simcadebase/releases)")
     parser.add_argument("--keep-local", action="store_true",
@@ -86,7 +86,7 @@ def main():
     parser.add_argument("--source-only", action="store_true",
                         help="publish individual core files without a core.bin")
     parser.add_argument("--overwrite", action="store_true",
-                        help="rebuild the latest unpublished release in place")
+                        help="replace an existing release in place (defaults to the latest release)")
     parser.add_argument("--share", nargs="?", type=Path, const=root / "simcade_vehicle_config.txt",
                         metavar="CONFIG", help="export a shareable config, loader and offline bundle")
     parser.add_argument("--offline", action="store_true",
@@ -121,26 +121,42 @@ def main():
     numbered_folders = [int(path.name) for path in output.iterdir()
                         if path.is_dir() and re.fullmatch(r"[1-9][0-9]{0,8}", path.name)]
     newest_release = max(previous, max(numbered_folders, default=0))
-    newest = max(newest_release, int(local_revision[1]))
+    local_rev_num = int(local_revision[1])
+    newest = max(newest_release, local_rev_num)
     default_revision = previous if args.overwrite else newest + 1
     revision = default_revision if args.revision is None else args.revision
+    if not 1 <= revision <= 999999999:
+        parser.error("revision must be a positive integer of at most nine digits")
     destination = output / str(revision)
     existing_bundle = (destination / "core.bin").is_file()
     existing_index = (destination / "sources.txt").is_file()
-    if args.overwrite and (revision != previous or revision != newest_release or not (existing_bundle or existing_index)):
-        parser.error("--overwrite requires the latest existing release in this folder")
-    if not 1 <= revision <= 999999999:
-        parser.error("revision must be a positive integer of at most nine digits")
-    if not args.overwrite and (revision <= newest_release or destination.exists()):
-        parser.error("choose a revision newer than the published release")
+    existing_release = existing_bundle or existing_index
+    replacing = destination.exists()
+    if args.revision is None:
+        if args.overwrite and (revision != previous or revision != newest_release or not existing_release):
+            parser.error("--overwrite requires the latest existing release in this folder")
+    else:
+        if replacing and not args.overwrite:
+            parser.error(f"release {revision} already exists; pass --overwrite to replace it")
+        if replacing and not existing_release:
+            parser.error(f"{destination} exists and is not a Simcade release")
     stamp_local = not args.keep_local and output == default_output
-    local_floor = int(local_revision[1]) + (0 if args.overwrite else 1)
-    if stamp_local and newest_release and revision < local_floor:
-        parser.error("choose a revision newer than the bundled core")
+    if args.revision is None and stamp_local and newest_release:
+        local_floor = local_rev_num + (0 if args.overwrite else 1)
+        if revision < local_floor:
+            parser.error("choose a revision newer than the bundled core")
+    if args.revision is not None:
+        newer_folders = sorted(n for n in numbered_folders if n > revision)
+        if newer_folders:
+            print(f"Warning: newer release folder(s) exist in {output}: {', '.join(map(str, newer_folders))}", file=sys.stderr)
+        if previous > revision:
+            print(f"Warning: setting latest.txt from r{previous} to r{revision}.", file=sys.stderr)
+        if stamp_local and local_rev_num > revision:
+            print(f"Warning: lowering bundled LOCAL_REVISION from r{local_rev_num} to r{revision}.", file=sys.stderr)
     include_source = args.include_source or args.source_only or (
-        args.overwrite and (existing_index or (destination / "simcadebase").is_dir())
+        replacing and (existing_index or (destination / "simcadebase").is_dir())
     )
-    include_bundle = not args.source_only and (not args.overwrite or existing_bundle or args.include_source)
+    include_bundle = not args.source_only and (not replacing or existing_bundle or args.include_source)
     # Published files must inherit the release directory's Windows permissions.
     staging = output / f".build-{uuid.uuid4().hex}"
     staging.mkdir()
@@ -179,7 +195,7 @@ def main():
                 blob.replace(source_directory / blob.name)
         manifest = staging / "latest.txt"
         manifest.write_bytes(f"{revision} {hashlib.sha256(package).hexdigest()} {schema[1]}\n".encode())
-        if args.overwrite:
+        if replacing:
             backup = destination.rename(output / f".backup-{uuid.uuid4().hex}")
             try:
                 release.rename(destination)

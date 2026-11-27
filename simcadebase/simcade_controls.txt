@@ -52,18 +52,19 @@ function SimcadeControls.pollInputs(Driver, hasDriver, wireInputs, physicsCar, p
     prevState.gearUp   = gearUpIn
     prevState.gearDown = gearDownIn
 
-    return {
-        wKey = wKey, sKey = sKey, aKey = aKey, dKey = dKey,
-        spaceKey = spaceKey, shiftKey = shiftKey, altKey = altKey, rKey = rKey, fKey = fKey,
-        isActive = isActive,
-        rawThrottle = clamp(rawThrottle, 0, 1),
-        rawReverseThrottle = clamp(rawReverseThrottle, 0, 1),
-        halfThrottleActive = halfThrottleActive,
-        reverseHalfThrottleActive = reverseHalfThrottleActive,
-        rawBrake = clamp(rawBrake, 0, 1),
-        rawHandbrake = clamp(rawHandbrake, 0, 1),
-        clutchDown = clutchDown,
-        steerTarget = aKey - dKey,
-    }
+    local out = (prevState and prevState._reusePollOut) and (prevState._pollOut or {}) or {}
+    if prevState and prevState._reusePollOut then prevState._pollOut = out end
+    out.wKey = wKey; out.sKey = sKey; out.aKey = aKey; out.dKey = dKey
+    out.spaceKey = spaceKey; out.shiftKey = shiftKey; out.altKey = altKey; out.rKey = rKey; out.fKey = fKey
+    out.isActive = isActive
+    out.rawThrottle = clamp(rawThrottle, 0, 1)
+    out.rawReverseThrottle = clamp(rawReverseThrottle, 0, 1)
+    out.halfThrottleActive = halfThrottleActive
+    out.reverseHalfThrottleActive = reverseHalfThrottleActive
+    out.rawBrake = clamp(rawBrake, 0, 1)
+    out.rawHandbrake = clamp(rawHandbrake, 0, 1)
+    out.clutchDown = clutchDown
+    out.steerTarget = aKey - dKey
+    return out
 end
 
